@@ -40,6 +40,47 @@ MAX_RETRY_MULTIPLIER = 4
 
 _NUMBERED_RE = re.compile(r"^\s*(\d{1,3})\s*[.、)．:：]\s*(.*)$")
 
+# 我们自己提示词里的标记。译文里出现这些，说明模型把提示词原样吐回来了。
+#
+# ⚠️ 实测事故：sakura-galtransl-7b 是**微调过的翻译模型**（不是指令模型），
+# 喂给它带【前文】【术语表】的指令式 prompt，它会把整段 prompt 当正文"翻译"回来。
+# 更糟的是这段垃圾被写进上下文后，会污染后续所有请求，形成恶性循环。
+# 所以必须在这里拦下：既不能上屏，也不能进缓存和上下文。
+_PROMPT_MARKERS = (
+    "【待翻译", "【前文", "【术语表", "【待翻译（共",
+    "请按相同编号", "硬性要求", "只输出译文本身", "不要复述原文",
+)
+
+
+def looks_like_echo(text: str) -> bool:
+    """判断输出是不是把我们的提示词原样返回了。"""
+    if not text:
+        return False
+    return any(m in text for m in _PROMPT_MARKERS)
+
+
+def parse_lines(text: str, expected: int) -> dict[int, str] | None:
+    """按行解析（prompt_style=plain 的批量模式用）。
+
+    纯翻译模型不吃"编号"那套，只按行对应。
+    """
+    if not text:
+        return None
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if len(lines) != expected:
+        return None
+    return {i + 1: ln for i, ln in enumerate(lines)}
+
+
+# 已知需要"纯文本输入"的模型（微调翻译模型，不是指令模型）。
+# 用户仍可在配置里用 prompt_style 覆盖。
+_PLAIN_STYLE_HINTS = ("sakura", "galtransl", "jparacrawl", "opus-mt", "m2m100", "nllb")
+
+
+def guess_prompt_style(model: str) -> str:
+    name = (model or "").lower()
+    return "plain" if any(h in name for h in _PLAIN_STYLE_HINTS) else "chat"
+
 
 def is_local_url(url: str) -> bool:
     try:
@@ -170,6 +211,7 @@ class OpenAICompatTranslator:
         batch_size: int = DEFAULT_BATCH_SIZE,
         disable_thinking: bool = True,
         verify_glossary: bool = True,
+        prompt_style: str = "",
         name: str = "llm",
     ) -> None:
         self.base_url = base_url.rstrip("/")
@@ -181,6 +223,8 @@ class OpenAICompatTranslator:
         self.batch_size = max(1, batch_size)
         self.disable_thinking = disable_thinking
         self.verify_glossary = verify_glossary
+        # "chat" = 指令模型（走完整模板）；"plain" = 微调翻译模型（只喂原文）
+        self.prompt_style = prompt_style or guess_prompt_style(model)
         self.name = name
         self.stats = TranslatorStats()
 
@@ -272,7 +316,11 @@ class OpenAICompatTranslator:
             if len(batch) == 1:
                 out.translations[batch[0].id] = content.strip()
             else:
-                parsed = parse_numbered(content, len(batch))
+                parsed = (
+                    parse_lines(content, len(batch))
+                    if self.prompt_style == "plain"
+                    else parse_numbered(content, len(batch))
+                )
                 if parsed:
                     for idx, seg in enumerate(batch, start=1):
                         out.translations[seg.id] = parsed[idx]
@@ -383,8 +431,16 @@ class OpenAICompatTranslator:
 
         Returns:
             (正文, usage, 是否被截断)
+
+        ``prompt_style="plain"`` 时**只把原文发给模型**，不带任何指令——
+        因为 sakura 这类微调翻译模型会把指令式 prompt 当成正文翻译回来。
         """
-        messages = build_messages(request)
+        if self.prompt_style == "plain":
+            joined = "\n".join(seg.text for seg in request.segments)
+            messages = [{"role": "user", "content": joined}]
+        else:
+            messages = build_messages(request)
+
         payload: dict = {
             "model": self.model,
             "messages": messages,
@@ -392,9 +448,9 @@ class OpenAICompatTranslator:
             "max_tokens": max_tokens,
             "stream": False,
         }
-        if self.disable_thinking:
+        if self.disable_thinking and self.prompt_style != "plain":
             # 实测：对 LM Studio 里的 qwen3.8 无效，但对其他服务端可能有效，
-            # 所以照发；真正的兜底是上面的"空译文重试"逻辑。
+            # 所以照发；真正的兜底是"空译文重试"逻辑。
             payload["chat_template_kwargs"] = {"enable_thinking": False}
 
         r = self._client.post(f"{self.base_url}/chat/completions", json=payload)
@@ -406,6 +462,15 @@ class OpenAICompatTranslator:
         content = (msg.get("content") or "").strip()
         usage = data.get("usage") or {}
         truncated = choice.get("finish_reason") == "length"
+
+        # ⚠️ 回显检测：译文里出现我们的提示词标记 ⇒ 模型没在翻译。
+        # 必须在这里拦死：垃圾一旦进缓存/上下文，会污染后续所有请求。
+        if content and looks_like_echo(content):
+            log.warning(
+                "模型把提示词原样返回（疑似不是指令模型）。"
+                "该模型可能需要 prompt_style=plain，请检查设置。"
+            )
+            return "", usage, truncated
 
         if not content:
             reasoning = (msg.get("reasoning_content") or "").strip()

@@ -123,19 +123,24 @@ class SubtitlePipeline(QObject):
                 self.hub.register(t, priority=10)
                 ok, msg = t.ping()
                 notes.append(f"LLM({llm.model}): {msg}")
-        elif provider in ("baidu", "youdao", "azure", "google", "deepl"):
-            from app.translate.traditional.providers import build_provider
+        elif provider != "none":
+            from app.translate.traditional.providers import ALL_PROVIDERS, build_provider
 
-            creds = cfg.translate.providers.get(provider, {})
-            t = build_provider(provider, creds, proxy=cfg.proxy, qps_limit=cfg.translate.qps_limit)
-            if t is None:
+            if provider not in ALL_PROVIDERS:
                 notes.append(f"未知通道: {provider}")
             else:
-                self.hub.register(t, priority=10)
-                ok, msg = t.ping()
-                notes.append(f"{provider}: {msg}")
-        elif provider != "none":
-            notes.append(f"未知通道: {provider}")
+                # web_* 是免 key 的网页版内部接口（非官方，可能失效）
+                creds = cfg.translate.providers.get(provider, {})
+                t = build_provider(
+                    provider, creds, proxy=cfg.proxy, qps_limit=cfg.translate.qps_limit
+                )
+                if t is None:
+                    notes.append(f"无法构造通道: {provider}")
+                else:
+                    self.hub.register(t, priority=20 if provider.startswith("web_") else 10)
+                    ok, msg = t.ping()
+                    tag = "（非官方接口，可能失效）" if provider.startswith("web_") else ""
+                    notes.append(f"{provider}{tag}: {msg}")
 
         # 识别路由器
         self.router = LanguageRouter(

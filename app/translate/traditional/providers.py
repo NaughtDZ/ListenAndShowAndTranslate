@@ -312,6 +312,25 @@ PROVIDERS: dict[str, type[TraditionalTranslatorBase]] = {
     "deepl": DeepLTranslator,
 }
 
+#: 免 key 的"网页版内部接口"通道（见 web.py 的实测说明）。
+#: 单独一张表：它们不是官方 API，设置界面要明确标注"非官方、可能失效"。
+WEB_PROVIDERS: dict[str, type[TraditionalTranslatorBase]] = {}
+
+
+def _register_web_providers() -> None:
+    try:
+        from app.translate.traditional.web import GoogleWebTranslator
+
+        WEB_PROVIDERS["web_google"] = GoogleWebTranslator
+    except Exception as exc:  # noqa: BLE001
+        log.debug("加载网页版翻译通道失败: %s", exc)
+
+
+_register_web_providers()
+
+#: 所有可构造的通道
+ALL_PROVIDERS: dict[str, type[TraditionalTranslatorBase]] = {**PROVIDERS, **WEB_PROVIDERS}
+
 
 def build_provider(provider_id: str, credentials: dict, **kw) -> TraditionalTranslatorBase | None:
     """按配置里的凭据字典构造通道。
@@ -319,7 +338,7 @@ def build_provider(provider_id: str, credentials: dict, **kw) -> TraditionalTran
     凭据键名故意和各家文档一致（``app_id`` / ``secret_key`` / ``app_key`` ...），
     这样用户对着文档填就行，不用记我们自创的名字。
     """
-    cls = PROVIDERS.get(provider_id)
+    cls = ALL_PROVIDERS.get(provider_id)
     if cls is None:
         return None
     creds = {k: v for k, v in (credentials or {}).items() if v}
