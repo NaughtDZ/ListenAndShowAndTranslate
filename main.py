@@ -256,6 +256,115 @@ def capture_target(args) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# 模型管理
+# --------------------------------------------------------------------------- #
+def models_command(args) -> int:
+    from app.models.downloader import ModelDownloader
+    from app.models.registry import (
+        MODELS,
+        PACKS,
+        default_pack_ids,
+        human_size,
+        models_for_packs,
+        total_bytes_for_packs,
+    )
+
+    action = args.models
+    cfg = AppConfig.load()
+    downloader = ModelDownloader(proxy=cfg.proxy)
+
+    if action == "list":
+        print("\n=== 语言包（按包下载，也可单独装模型）===\n")
+        for pack in PACKS.values():
+            mark = "★推荐 " if pack.recommended else "      "
+            print(f"  {mark}{pack.id:<14} {pack.display_name:<22} "
+                  f"{human_size(pack.total_bytes):>10}   {pack.description}")
+        selected = default_pack_ids()
+        print(f"\n  默认勾选合计: {human_size(total_bytes_for_packs(selected))}")
+        print(f"  全部语言包合计: {human_size(total_bytes_for_packs(list(PACKS)))}\n")
+
+        print("=== 模型明细 ===\n")
+        for m in MODELS.values():
+            print(f"  {m.id:<22} {m.display_name:<34} {human_size(m.total_bytes):>10}")
+            print(f"      引擎={m.engine:<15} 语言={'/'.join(m.languages)}")
+            if m.note:
+                print(f"      {m.note}")
+        print()
+        return 0
+
+    if action == "status":
+        print("\n=== 模型安装状态 ===\n")
+        total_installed = 0
+        for m in MODELS.values():
+            st = downloader.status(m.id)
+            got = downloader.installed_bytes(m.id)
+            total_installed += got
+            icon = {"installed": "✓", "partial": "~", "missing": "·"}[st]
+            pct = (got / m.total_bytes * 100) if m.total_bytes else 0
+            print(f"  [{icon}] {m.id:<22} {st:<10} "
+                  f"{human_size(got):>10} / {human_size(m.total_bytes):>10} ({pct:5.1f}%)")
+        print(f"\n  合计占用: {human_size(total_installed)}")
+        print(f"  模型目录: {downloader.models_dir}\n")
+        return 0
+
+    if action in ("install", "uninstall"):
+        raw = (args.packs or "default").strip()
+        if raw == "all":
+            pack_ids = list(PACKS)
+        elif raw == "default":
+            pack_ids = default_pack_ids()
+        else:
+            pack_ids = [x.strip() for x in raw.split(",") if x.strip()]
+
+        unknown = [p for p in pack_ids if p not in PACKS]
+        if unknown:
+            print(f"未知语言包: {unknown}")
+            print(f"可用: {', '.join(PACKS)} 或 all / default")
+            return 2
+
+        model_ids = models_for_packs(pack_ids)
+        total = total_bytes_for_packs(pack_ids)
+
+        if action == "uninstall":
+            print(f"\n将删除 {len(model_ids)} 个模型（{human_size(total)}）")
+            for mid in model_ids:
+                ok = downloader.uninstall(mid)
+                print(f"  {'已删除' if ok else '本就不存在'} {mid}")
+            return 0
+
+        print(f"\n即将下载 {len(model_ids)} 个模型，共 {human_size(total)}")
+        print(f"语言包: {', '.join(pack_ids)}")
+        print(f"目标目录: {downloader.models_dir}")
+        if cfg.proxy:
+            print(f"代理: {cfg.proxy}")
+        print("（支持断点续传，中断后重跑本命令可接着下）\n")
+
+        last_line = {"len": 0}
+
+        def on_progress(p) -> None:
+            line = "  " + p.describe()
+            pad = max(0, last_line["len"] - len(line))
+            print("\r" + line + " " * pad, end="", flush=True)
+            last_line["len"] = len(line)
+
+        def on_log(msg: str) -> None:
+            print("\r" + " " * (last_line["len"] + 2) + "\r" + msg)
+
+        results = downloader.install_many(model_ids, on_progress=on_progress, on_log=on_log)
+
+        ok_count = sum(1 for v in results.values() if v)
+        print(f"\n完成：{ok_count}/{len(results)} 个模型就绪")
+        failed = [k for k, v in results.items() if not v]
+        if failed:
+            print(f"失败: {', '.join(failed)}")
+            return 1
+        return 0
+
+    print(f"未知的 --models 动作: {action}")
+    return 2
+
+
+# --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
 def build_parser() -> argparse.ArgumentParser:
@@ -268,6 +377,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--list-audio", action="store_true", help="列出当前正在发声的进程")
     p.add_argument("--capture", metavar="PID|进程名", help="采集目标音频并显示实时电平")
     p.add_argument("--meter", metavar="PID", help="打开电平表悬浮窗（RMS/PEAK 条 + 可调阈值）")
+    p.add_argument(
+        "--models",
+        choices=["list", "status", "install", "uninstall"],
+        help="模型管理：list 看清单、status 看状态、install/uninstall 装或删",
+    )
+    p.add_argument(
+        "--packs",
+        metavar="PACKS",
+        default="default",
+        help="语言包，逗号分隔（zh,zh-en,en,ja-ko-yue,multilingual,lid,core）或 all / default",
+    )
     p.add_argument(
         "--threshold-db",
         type=float,
@@ -296,6 +416,8 @@ def main(argv: list[str] | None = None) -> int:
         return selftest()
     if args.list_audio:
         return list_audio_processes()
+    if args.models:
+        return models_command(args)
     if args.meter:
         from app.ui.meter import run_meter
 
@@ -310,6 +432,8 @@ def main(argv: list[str] | None = None) -> int:
     print("  python main.py --list-audio           列出正在发声的进程")
     print("  python main.py --capture <PID|名字>   采集目标音频并显示实时电平")
     print("  python main.py --meter <PID>          打开电平表悬浮窗（RMS/PEAK，阈值可调）")
+    print("  python main.py --models list          查看语言包与模型清单")
+    print("  python main.py --models install --packs all")
     print("  python main.py --capture 1234 --record out.wav --seconds 5")
     return selftest()
 

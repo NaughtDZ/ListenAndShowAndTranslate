@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import shutil
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
@@ -75,13 +76,120 @@ class AudioConfig(BaseModel):
 # 语音识别
 # --------------------------------------------------------------------------- #
 class VADConfig(BaseModel):
+    """语音活动检测（VAD）——**分块识别的延迟几乎完全由这几个参数决定**。
+
+    每个参数"调大/调小各有什么后果"见 ``LATENCY_KNOBS`` 与 ``docs/延迟调节.md``。
+    """
+
     enabled: bool = True
     threshold: float = Field(default=0.5, ge=0.0, le=1.0)
+    """VAD 判定"这是人声"的置信度阈值。调低更灵敏（小声也算），但可能把音乐/音效当人声。"""
+
     min_speech_ms: int = Field(default=250, ge=50, le=3000)
-    min_silence_ms: int = Field(default=300, ge=50, le=5000)
-    """静音多久判定一句结束——直接决定字幕断句与延迟。"""
+    """短于此长度的声音直接丢弃（滤掉咳嗽、键盘声等瞬态噪声）。"""
+
+    min_silence_ms: int = Field(default=350, ge=100, le=5000)
+    """**延迟最大的一颗旋钮**：说话停止后，要静多久才认定"这句话说完了"。
+
+    调小 → 字幕更快出，但句子容易被切成碎片；
+    调大 → 断句更完整、翻译上下文更好，但字幕延迟明显增加。
+    """
 
     speech_pad_ms: int = Field(default=120, ge=0, le=1000)
+    """在语音段前后各留一点余量，避免首尾字被切掉。调大会略微增加延迟与算力。"""
+
+    max_segment_ms: int = Field(default=8000, ge=1000, le=60000)
+    """**强制断句上限**：有人不停地说（或有持续音乐）时，最长憋到多久就强制切一刀。
+
+    调小 → 长句延迟有上限，但可能在词中间被切断；
+    调大 → 长句更完整，但连续说话时字幕会长时间不刷新。
+    """
+
+
+# --------------------------------------------------------------------------- #
+# 延迟档位（用户可调，且必须让用户看懂每个参数的作用）
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class LatencyKnob:
+    """一个影响延迟的参数，附带"调它会发生什么"的说明。UI 直接展示这些文字。"""
+
+    key: str
+    label: str
+    unit: str
+    field: str
+    smaller: str
+    larger: str
+    section: str = "vad"
+
+
+LATENCY_KNOBS: tuple[LatencyKnob, ...] = (
+    LatencyKnob(
+        key="min_silence_ms",
+        label="断句静音时长",
+        unit="ms",
+        field="min_silence_ms",
+        smaller="字幕更快出来，但一句话容易被切成好几段（翻译会失去上下文）",
+        larger="断句更完整、翻译更通顺，但字幕要等更久才出现",
+    ),
+    LatencyKnob(
+        key="max_segment_ms",
+        label="最长憋句时间",
+        unit="ms",
+        field="max_segment_ms",
+        smaller="连续说话时字幕更新更勤，但可能在词中间被切断",
+        larger="长句更完整，但一直不停说话时字幕会长时间不刷新",
+    ),
+    LatencyKnob(
+        key="speech_pad_ms",
+        label="语音段前后留白",
+        unit="ms",
+        field="speech_pad_ms",
+        smaller="延迟略降，但句首句尾的字可能被切掉",
+        larger="首尾更完整，延迟与算力略增",
+    ),
+    LatencyKnob(
+        key="min_speech_ms",
+        label="最短语音长度",
+        unit="ms",
+        field="min_speech_ms",
+        smaller="能识别更短的气声与短词，但容易把噪声当人声",
+        larger="能滤掉咳嗽/键盘等瞬态噪声，但很短的应答词会被丢掉",
+    ),
+    LatencyKnob(
+        key="partial_interval_ms",
+        label="中间结果刷新间隔",
+        unit="ms",
+        field="partial_interval_ms",
+        section="asr",
+        smaller="字幕更跟手、滚动更顺，但 CPU 占用略增（仅流式引擎有效）",
+        larger="更省 CPU，但字幕会一跳一跳地更新",
+    ),
+)
+
+
+LATENCY_PRESETS: dict[str, dict[str, int]] = {
+    "realtime": {
+        "min_silence_ms": 200,
+        "max_segment_ms": 4000,
+        "speech_pad_ms": 60,
+        "min_speech_ms": 200,
+        "partial_interval_ms": 150,
+    },
+    "balanced": {
+        "min_silence_ms": 350,
+        "max_segment_ms": 8000,
+        "speech_pad_ms": 120,
+        "min_speech_ms": 250,
+        "partial_interval_ms": 200,
+    },
+    "accurate": {
+        "min_silence_ms": 600,
+        "max_segment_ms": 15000,
+        "speech_pad_ms": 200,
+        "min_speech_ms": 300,
+        "partial_interval_ms": 300,
+    },
+}
 
 
 # 支持的源语言（"auto" = 自动识别；"zh-en" = 中文里夹英文词）
@@ -197,6 +305,43 @@ class ASRConfig(BaseModel):
     provider: Literal["auto", "cpu", "cuda", "directml", "vulkan"] = "auto"
     partial_interval_ms: int = Field(default=200, ge=50, le=2000)
     """中间结果刷新间隔，越小字幕越"跳动"但越及时。"""
+
+    latency_preset: Literal["realtime", "balanced", "accurate", "custom"] = "balanced"
+    """延迟档位：``realtime`` 最低延迟 / ``balanced`` 平衡 / ``accurate`` 最准。
+
+    选档会一次性写入 ``vad`` 与 ``partial_interval_ms``；
+    用户手动改过任一参数后应设为 ``custom``（:meth:`apply_latency_preset` 会自动处理）。
+    """
+
+    def apply_latency_preset(self, preset: str) -> None:
+        """把档位值写到具体参数上。"""
+        if preset not in LATENCY_PRESETS:
+            raise ValueError(f"未知延迟档位: {preset}（可选 {list(LATENCY_PRESETS)}）")
+        values = LATENCY_PRESETS[preset]
+        self.vad.min_silence_ms = values["min_silence_ms"]
+        self.vad.max_segment_ms = values["max_segment_ms"]
+        self.vad.speech_pad_ms = values["speech_pad_ms"]
+        self.vad.min_speech_ms = values["min_speech_ms"]
+        self.partial_interval_ms = values["partial_interval_ms"]
+        self.latency_preset = preset  # type: ignore[assignment]
+
+    def detect_preset(self) -> str:
+        """反查当前参数更接近哪个档位（参数被手改过则返回 ``custom``）。"""
+        for name, values in LATENCY_PRESETS.items():
+            if (
+                self.vad.min_silence_ms == values["min_silence_ms"]
+                and self.vad.max_segment_ms == values["max_segment_ms"]
+                and self.vad.speech_pad_ms == values["speech_pad_ms"]
+                and self.vad.min_speech_ms == values["min_speech_ms"]
+                and self.partial_interval_ms == values["partial_interval_ms"]
+            ):
+                return name
+        return "custom"
+
+    @staticmethod
+    def latency_knobs() -> tuple[LatencyKnob, ...]:
+        """供 UI 渲染"这个滑杆是干什么的"。"""
+        return LATENCY_KNOBS
 
     vad: VADConfig = Field(default_factory=VADConfig)
 
