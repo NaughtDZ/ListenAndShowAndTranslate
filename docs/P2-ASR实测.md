@@ -1,0 +1,143 @@
+# P2 ASR 实测记录（多语言）
+
+> 记录日期：2026-02-21
+> 复现：`scripts/gen_test_speech.py` + `scripts/transcribe_wav.py`
+
+---
+
+## 1. 测试方法（为什么可信）
+
+**自己合成语音 → 因此知道正确文本 → 能算真实字准率**，而不是"听起来差不多"。
+
+```
+scripts/gen_test_speech.py   # Windows SAPI 合成 16k/16bit/单声道，中英日各若干句
+   ↓ data/test_speech/*.wav + manifest.tsv（含正确文本）
+scripts/transcribe_wav.py    # 送 ASR，与正确文本算 CER（去掉标点空白后按字符编辑距离）
+```
+
+生成语音时用的音色：中文 Huihui / Kangkang，英文 Zira，日文 Haruka。
+
+> ⚠️ 踩坑：`gen_test_speech.py` 生成的 `.ps1` **必须带 UTF-8 BOM**，
+> 否则 Windows PowerShell 5.1 会按 GBK 解码，中文日文全变乱码。
+> 同时优先用 PowerShell 7（`pwsh`）。
+
+---
+
+## 2. 核心结论表
+
+| 模型 | 日语 | 中文 | 英文 | RTF（越低越快） | 流式 | 标点 |
+|---|---|---|---|---|---|---|
+| `zipformer-zh-int8`（流式） | — | **97.3%** | — | 0.047 | ✅ | ❌ |
+| `zipformer-en-int8`（流式） | — | — | **96.6%** | 0.028 | ✅ | ❌ |
+| **`sensevoice-int8`（2024-07-17）** | **90.6%** | 97.3%* | 95.5%* | **0.015** | ❌ | ✅ |
+| `sensevoice`（2025-09-09 int8） | **17.0%** ❌ | 91.9% | 94.4% | 0.017 | ❌ | ✅ |
+| `whisper-turbo-int8` | 75.5% | — | — | 0.443 | ❌ | ✅ |
+
+\* 单句直测（无 VAD 切分）的分数；经 VAD 分句后整体为 91.9% / 93.3%。
+RTF 0.015 = 比实时快约 66 倍；0.443 = 比实时快约 2.3 倍。
+测试机：Ryzen 9 9950X，CPU 2 线程，provider=cpu。
+
+---
+
+## 3. ⚠️ 最重要发现：**新版本反而更差，而且差得离谱**
+
+**SenseVoice 2025-09-09 int8 版本的日语完全不可用。**
+
+同一段日语音频：
+
+| 版本 | 字准率 | 输出 |
+|---|---|---|
+| 2024-07-17 | **90.6%** | 第 印象、夜 の 列車、凛ン ファン は 手 の 中 の 聖堂 の 鍵 を 強く 握りしめ… |
+| 2025-09-09 | **17.0%** | 大印象夜列车手中声堂嗅握今度失望小 |
+
+根因线索：把 2025 版的 `result.lang` 打出来，**中/英/日三种输入全部返回 `<|yue|>`（粤语）**，
+无论 `language` 传 `ja`、`zh`、`en` 还是 `auto` 都一样
+（传 `<|ja|>` 时 sherpa-onnx 直接回：`Unknown language: <|ja|>. Use 0 instead.`）。
+
+即：**该次导出把语言提示固定成了粤语**。中文英文因为字符集重叠碰巧还能出正确结果，
+日语被按粤语解码就成了垃圾。
+
+**行动**：注册表已把 `sensevoice-int8` 指向 **2024-07-17** 版本，并在 `note` 里写明不要换回 2025 版。
+
+**教训**：模型版本号更大 ≠ 更好。**必须用带正确文本的测试集实测**，
+凭"新版本应该更好"去选模型，日语功能会直接不可用，而且从中文测试里完全看不出来。
+
+---
+
+## 4. 标点与大小写：影响字幕可读性与翻译质量
+
+| 模型 | 标点 | 英文大小写 | 说明 |
+|---|---|---|---|
+| SenseVoice 2024 | ✅ 自带 `，。、` | ✅ `Chapter 1.` | 可直接上屏 |
+| 流式 zipformer（zh/en） | ❌ | ❌ **全大写无空格** | `CHAPTER ONETHE NIGHT TRAIN…`、`NOTE BOOK` |
+| Whisper | ✅ | ✅ | |
+
+**两个直接后果**：
+
+1. **流式引擎的英文字幕必须做后处理**，否则用户看到的是
+   `CHAPTER ONETHE NIGHT TRAIN PULLED OUT OF THE STATION` 这种全大写且词间粘连的文本。
+2. **中文流式引擎没有标点** → 字幕是一整片文字墙，
+   **而且会显著拖累翻译**（翻译模型依赖句子边界）。
+
+因此存在一个真实的取舍：
+
+| 中文用哪个 | 准确率 | 延迟 | 标点 |
+|---|---|---|---|
+| 流式 zipformer | 97.3% | 低（有中间结果，边听边出） | ❌ |
+| SenseVoice 2024 | 97.3% | 高（整句说完才出） | ✅ |
+
+考虑到用户明确表示"不是看视频、有延迟无所谓"，
+**SenseVoice 在中文上可能是更好的默认选择**（标点对翻译质量的价值很大）。
+
+进一步的方案（未实现，记在计划里）：**双引擎融合**——
+流式引擎出即时草稿字幕，SenseVoice 出带标点的定稿替换。
+两者 RTF 合计仅 0.06，在本机算力下完全跑得动。
+
+---
+
+## 5. 按本次实测修正后的语言路由
+
+| 语言 | 引擎 | 模型 | 实测 | 理由 |
+|---|---|---|---|---|
+| 中文 | `sherpa_stream` | zipformer-zh-int8 | 97.3% | 真流式，最低延迟 |
+| 中英混说 | `sherpa_stream` | zipformer-zh-en-int8 | — | 夹英文词更稳 |
+| 英文 | `sherpa_stream` | zipformer-en-int8 | 96.6% | 真流式 |
+| **日语** | `sherpa_offline` | **sensevoice-int8（2024）** | **90.6%** | 官方无日语流式模型；SenseVoice 比 Whisper 快 30 倍且更准 |
+| 韩语 / 粤语 | `sherpa_offline` | sensevoice-int8 | — | 同一模型 |
+| 小语种 | `whispercpp` | whisper-turbo-int8 | — | 99 语言兜底 |
+
+> 日语用 Whisper 只有 75.5%，**已被 SenseVoice 取代**。
+> 这条修正直接来自实测，计划书原来的"SenseVoice 或 Whisper 都行"是不够准确的。
+
+---
+
+## 6. 已知问题（待办）
+
+| # | 问题 | 影响 | 计划 |
+|---|---|---|---|
+| 1 | 流式引擎英文输出全大写、词间粘连 | 字幕可读性差 | 加文本后处理（句子首字母大写 + 空格规整） |
+| 2 | 流式引擎无标点 | 中文可读性与翻译质量 | 接标点模型，或中文默认改用 SenseVoice |
+| 3 | 专有名词同音字错（林凡→林繁、リンファン→リンァン） | 人名/术语错 | 接 sherpa-onnx hotwords（热词偏置）+ 翻译层术语表 |
+| 4 | 数字 ITN：三千二百 → 3200 | 与"期望文本"比对时显得不准，实际是**正确行为** | 评测脚本需做数字归一 |
+| 5 | 日文分词间被插入空格（`誰 も 失望 させ`） | 显示略有瑕疵 | 日文后处理去掉多余空格 |
+| 6 | 分块引擎无中间结果 | 日语字幕整句才出现 | 已知取舍，UI 上需说明（见 `docs/延迟调节.md` 第 3.5 节） |
+
+---
+
+## 7. 复现命令
+
+```powershell
+# 1) 生成多语言测试语音（需要 Windows 中文/日文语音包）
+.venv\Scripts\python.exe scripts\gen_test_speech.py
+
+# 2) 逐语言验证
+.venv\Scripts\python.exe scripts\transcribe_wav.py data\test_speech\zh_00.wav --model zipformer-zh-int8
+.venv\Scripts\python.exe scripts\transcribe_wav.py data\test_speech\en_02.wav --model zipformer-en-int8
+.venv\Scripts\python.exe scripts\transcribe_wav.py data\test_speech\ja_03.wav --model sensevoice-int8 --language ja
+
+# 3) 一次跑全部（SenseVoice 覆盖中英日）
+.venv\Scripts\python.exe scripts\transcribe_wav.py --all --model sensevoice-int8 --language auto
+
+# 4) 按真实速度喂入，测实际字幕延迟
+.venv\Scripts\python.exe scripts\transcribe_wav.py data\test_speech\zh_00.wav --model zipformer-zh-int8 --realtime
+```
