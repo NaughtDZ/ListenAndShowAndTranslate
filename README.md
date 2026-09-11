@@ -60,6 +60,13 @@ uv pip install --python .venv\Scripts\python.exe -r requirements.txt
 # 列出当前正在发声的进程（= UI 里"选择音频来源"的数据源）
 .venv\Scripts\python.exe main.py --list-audio
 
+# 采集目标程序的音频，实时电平表
+.venv\Scripts\python.exe main.py --capture 43052 --seconds 10
+.venv\Scripts\python.exe main.py --capture 喜马拉雅.exe --seconds 10
+
+# 录一段成 16k 单声道 WAV（录的是 3 秒音频，不是墙钟 3 秒）
+.venv\Scripts\python.exe main.py --capture 43052 --record test.wav --seconds 3
+
 # 或直接双击
 start.bat --list-audio
 ```
@@ -73,6 +80,31 @@ start.bat --list-audio
    23784  msedge.exe
 
 共 2 个进程在发声。
+```
+
+`--capture` 实时电平示例（真实运行结果）：
+
+```
+目标: python.exe  (PID 45008)
+可执行文件: ...\python.exe
+开始采集，实时电平:
+
+  [################################········] rms=0.2831 peak=0.400 采集中 有声 块=341 pid=45008
+共 342 块，输出 54316 样本 @16k
+峰值 0.4000，末次 RMS 0.2810，重连 0 次
+```
+
+### 验收脚本
+
+```powershell
+# 隔离性：验证不会混入其他程序的声音
+.venv\Scripts\python.exe scripts\verify_process_isolation.py
+
+# 保真性：验证采集→降混→16k 整条链路不破坏声音
+.venv\Scripts\python.exe scripts\verify_capture_e2e.py
+
+# 单元测试
+.venv\Scripts\python.exe -m pytest -q
 ```
 
 ---

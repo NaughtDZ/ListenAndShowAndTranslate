@@ -167,6 +167,95 @@ def list_audio_processes() -> int:
 
 
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# 采集目标音频
+# --------------------------------------------------------------------------- #
+def _parse_target(text: str):
+    """把命令行参数解析成 TargetSpec：纯数字当 PID，否则当进程名。"""
+    from app.audio.capture import TargetSpec
+
+    text = text.strip()
+    try:
+        return TargetSpec(pid=int(text))
+    except ValueError:
+        return TargetSpec(process_name=text)
+
+
+def _rms_bar(rms: float, width: int = 40) -> str:
+    """把 RMS 画成一根电平条，直观看出"目标到底有没有在出声"。"""
+    import math
+
+    if rms <= 0:
+        return "·" * width
+    db = 20 * math.log10(max(rms, 1e-6))
+    level = int(max(0.0, min(1.0, (db + 60) / 60)) * width)
+    return "#" * level + "·" * (width - level)
+
+
+def capture_target(args) -> int:
+    """采集指定进程的音频，打印实时电平；可选落盘 WAV。"""
+    import time as _time
+
+    from app.audio.capture import CaptureWorker, record_to_wav, resolve_target
+
+    spec = _parse_target(args.capture)
+    target = resolve_target(spec)
+    if target is None:
+        print(f"未找到活跃音频会话: {spec.describe()}")
+        print("提示：先运行 `python main.py --list-audio` 查看当前正在发声的进程与 PID。")
+        print("      注意：只有真正在输出声音的进程才有活跃音频会话。")
+        return 2
+
+    print(f"\n目标: {target.display_label}")
+    print(f"可执行文件: {target.executable}")
+
+    if args.record:
+        print(f"录制 {args.seconds:.1f} 秒到 {args.record} ...")
+        stats = record_to_wav(spec, args.record, args.seconds)
+        print(
+            f"\n完成：{stats.chunks} 块 / 输入 {stats.bytes_in / 1024:.0f} KiB / "
+            f"输出 {stats.samples_out} 样本 @16k（{stats.samples_out / 16000:.2f} 秒）"
+        )
+        print(f"峰值幅度: {stats.peak:.4f}")
+        if stats.peak <= 0.001:
+            print("⚠️ 峰值接近 0：目标进程当时没有真正在放音（这是正常的静音流，不是采集失败）")
+        return 0
+
+    print("开始采集，实时电平:\n")
+    worker = CaptureWorker(spec, follow=not args.no_follow)
+    worker.start()
+
+    t0 = _time.time()
+    try:
+        while _time.time() - t0 < args.seconds:
+            _time.sleep(0.2)
+            st = worker.snapshot()
+            status = "采集中" if st.running else "未连接"
+            silent = f"静音 {st.silent_seconds:.1f}s" if st.silent_seconds > 0.5 else "有声"
+            print(
+                f"\r  [{_rms_bar(st.last_rms)}] rms={st.last_rms:.4f} "
+                f"peak={st.peak:.3f} {status} {silent} "
+                f"块={st.chunks} pid={st.target_pid}   ",
+                end="",
+                flush=True,
+            )
+    except KeyboardInterrupt:
+        pass
+    finally:
+        worker.stop()
+
+    st = worker.snapshot()
+    print("\n")
+    print(f"共 {st.chunks} 块，输出 {st.samples_out} 样本 @16k")
+    print(f"峰值 {st.peak:.4f}，末次 RMS {st.last_rms:.4f}，重连 {st.reconnects} 次")
+    if st.last_error:
+        print(f"最后错误: {st.last_error}")
+    if st.peak <= 0.001:
+        print("⚠️ 全程静音：目标进程当时没有真正在放音。")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
 def build_parser() -> argparse.ArgumentParser:
@@ -177,6 +266,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     p.add_argument("--selftest", action="store_true", help="环境自检并退出")
     p.add_argument("--list-audio", action="store_true", help="列出当前正在发声的进程")
+    p.add_argument("--capture", metavar="PID|进程名", help="采集目标音频并显示实时电平")
+    p.add_argument("--seconds", type=float, default=10.0, help="采集时长（默认 10 秒）")
+    p.add_argument("--record", metavar="WAV", help="把采集结果写成 16k 单声道 WAV")
+    p.add_argument("--no-follow", action="store_true", help="目标消失后不自动重连")
     p.add_argument("--config", metavar="PATH", help="使用指定配置文件")
     return p
 
@@ -196,12 +289,16 @@ def main(argv: list[str] | None = None) -> int:
         return selftest()
     if args.list_audio:
         return list_audio_processes()
+    if args.capture:
+        return capture_target(args)
 
     # 无参数：P0 阶段先做自检；P3 起换成启动 GUI
     print(f"ListenAndShowAndTranslate v{__version__}")
     print("GUI 尚未实现（计划书 P3 阶段）。当前可用：")
-    print("  python main.py --selftest    环境自检")
-    print("  python main.py --list-audio  列出正在发声的进程")
+    print("  python main.py --selftest            环境自检")
+    print("  python main.py --list-audio          列出正在发声的进程")
+    print("  python main.py --capture <PID|名字>   采集目标音频并显示实时电平")
+    print("  python main.py --capture 1234 --record out.wav --seconds 5")
     return selftest()
 
 
