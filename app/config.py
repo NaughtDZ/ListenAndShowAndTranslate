@@ -388,8 +388,14 @@ class TranslateConfig(BaseModel):
     custom_prompt: str = ""
     """非空时覆盖内置模板。"""
 
-    context_lines: int = Field(default=3, ge=0, le=20)
-    """把前 N 句原文+译文一起送进 prompt，保证称谓/语气连贯。"""
+    context_lines: int = Field(default=20, ge=0, le=200)
+    """把前 N 句原文+译文一起送进 prompt，保证称谓/语气连贯。
+
+    默认 20 是**实测标定**出来的（docs/P4-翻译实测.md）：
+    每行前文约 31 tokens，20 行约 786 tokens，仅占 8192 窗口的 9.7%，
+    而上下文对小说翻译的人名、称谓、语气一致性帮助极大（旧默认只给了 3 行，浪费了窗口）。
+    上限 200 行时会占到窗口 78%，已接近极限。
+    """
 
     glossary: dict[str, str] = Field(default_factory=dict)
     """术语强制映射：人名/地名/功法名。小说场景刚需。"""
