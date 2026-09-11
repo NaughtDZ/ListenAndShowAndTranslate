@@ -384,7 +384,11 @@ def run_meter(pid: int, threshold_db: float | None = None) -> int:
         print("提示：先运行 `python main.py --list-audio` 查看正在发声的进程与 PID。")
         return 2
 
-    win32.enable_dpi_awareness()
+    # 注意：**不要**在这里调用 win32.enable_dpi_awareness()。
+    # 进程 DPI 感知只能设置一次；本模块在顶部就 import 了 PySide6，
+    # Qt 初始化时会自己设成默认的 PerMonitorV2。我们先设一遍会让 Qt 设置失败
+    # 并打印 "SetProcessDpiAwarenessContext() failed: 拒绝访问"。
+    # Qt6 的默认值已经是我们想要的，交给它即可。
     app = QApplication.instance() or QApplication([])
 
     meter_window = LevelMeterWindow()

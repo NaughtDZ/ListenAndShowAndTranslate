@@ -131,9 +131,14 @@ def set_taskbar_visible(hwnd: int, visible: bool) -> bool:
 
 
 def enable_dpi_awareness() -> bool:
-    """开启 per-monitor DPI 感知，否则多屏/缩放下悬浮窗会发虚或错位。
+    """开启 per-monitor DPI 感知。
 
-    必须在创建 QApplication 之前调用。
+    ⚠️ 进程 DPI 感知**只能设置一次**，而且必须在导入 PySide6 **之前**调用。
+    如果已经在用 PySide6，**不要调用本函数**——Qt6 初始化时会自己设成
+    PerMonitorV2（正是我们想要的），我们先设一遍反而会让 Qt 设置失败并报
+    "SetProcessDpiAwarenessContext() failed: 拒绝访问"。
+
+    保留此函数仅供非 Qt 的上下文（如纯命令行工具）在导入 Qt 前使用。
     """
     if not IS_WINDOWS:
         return False
