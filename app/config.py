@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from app import paths
 from app.utils.log import get_logger
@@ -84,17 +84,110 @@ class VADConfig(BaseModel):
     speech_pad_ms: int = Field(default=120, ge=0, le=1000)
 
 
+# 支持的源语言（"auto" = 自动识别；"zh-en" = 中文里夹英文词）
+SUPPORTED_LANGUAGES = (
+    "auto", "zh", "zh-en", "en", "ja", "ko", "yue",
+    "fr", "de", "es", "ru", "it", "pt", "ar", "th", "vi", "id", "tr",
+)
+
+
+class LanguageRoute(BaseModel):
+    """某一种语言用哪个引擎、哪个模型。
+
+    用户可覆盖——这是"多语言"能落地的前提：不同语言的可用模型差别很大
+    （例如日语没有流式模型，只能走分块引擎，见计划书 12.3）。
+    """
+
+    engine: Literal[
+        "sherpa_stream", "sherpa_offline", "whispercpp", "faster_whisper", "livecaptions"
+    ] = "sherpa_stream"
+    model: str = ""
+    """模型标识（相对 data/models 的目录名或注册表键），留空表示用该引擎默认值。"""
+
+    streaming: bool = True
+    """该路线是否真流式。False 表示分块识别（延迟更高）。"""
+
+
+def _default_routing() -> dict[str, LanguageRoute]:
+    """默认语言路由（依据 sherpa-onnx 官方模型可用性，见计划书 12.2）。
+
+    实测结论：官方**没有日语流式模型**，所以 ja 只能走分块引擎；
+    韩语/粤语与日语共用同一个 SenseVoice 模型（一个模型覆盖 5 种语言）。
+    """
+    sense = "sense-voice-zh-en-ja-ko-yue-int8"
+    return {
+        "zh": LanguageRoute(engine="sherpa_stream", model="streaming-zipformer-zh-int8", streaming=True),
+        "zh-en": LanguageRoute(engine="sherpa_stream", model="streaming-zipformer-bilingual-zh-en", streaming=True),
+        "en": LanguageRoute(engine="sherpa_stream", model="streaming-zipformer-en", streaming=True),
+        "ja": LanguageRoute(engine="sherpa_offline", model=sense, streaming=False),
+        "ko": LanguageRoute(engine="sherpa_offline", model=sense, streaming=False),
+        "yue": LanguageRoute(engine="sherpa_offline", model=sense, streaming=False),
+        # 通配：小语种兜底走 Whisper（99 语言）
+        "*": LanguageRoute(engine="whispercpp", model="whisper-turbo-int8", streaming=False),
+    }
+
+
 class ASRConfig(BaseModel):
     engine: Literal[
-        "sherpa_stream",      # P2 首选：低延迟真流式
-        "sherpa_offline",     # SenseVoice / Paraformer 分块
-        "whispercpp",         # 高端档，Vulkan/CUDA
+        "sherpa_stream",      # 流式：低延迟（中/英/韩/法有官方流式模型）
+        "sherpa_offline",     # 分块：SenseVoice（中日英韩粤一个模型）/ Paraformer
+        "whispercpp",         # 分块：Whisper 多语言兜底，Vulkan/CUDA
         "faster_whisper",     # 仅 NVIDIA
         "livecaptions",       # 零安装兜底
     ] = "sherpa_stream"
 
     preset: Literal["auto", "low", "mid", "high", "custom"] = "auto"
-    language: Literal["auto", "zh", "en"] = "auto"
+
+    language: str = "auto"
+    """源语言：``auto`` 或 SUPPORTED_LANGUAGES 之一。
+
+    设成具体语言会跳过语种识别（更快、更准）；``auto`` 会启用 LID。"""
+
+    language_detection: bool = True
+    """``language == "auto"`` 时是否启用语种识别（Whisper-tiny LID）。"""
+
+    lid_model_dir: str = ""
+    """语种识别模型目录，留空用内置默认位置。"""
+
+    language_switch_min_confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    """LID 置信度低于此值时不切换语言，避免在句中断句处来回跳。"""
+
+    routing: dict[str, LanguageRoute] = Field(default_factory=_default_routing)
+    """语言 → 引擎/模型 路由表，用户可覆盖。键 ``"*"`` 为兜底。
+
+    ⚠️ 注意：pydantic **不会**校验 ``routing["ja"] = {...}`` 这种**字典项赋值**，
+    那样会留下一个裸 dict，之后访问 ``.engine`` 就会 AttributeError。
+    要改路由请用 :meth:`set_route`，或整体用 ``model_validate`` 重新载入。
+    """
+
+    @field_validator("routing", mode="before")
+    @classmethod
+    def _coerce_routing(cls, value: Any) -> Any:
+        """把 ``{"zh": {...}}`` 这种裸 dict 统一转成 LanguageRoute。"""
+        if isinstance(value, dict):
+            return {
+                k: (v if isinstance(v, LanguageRoute) else LanguageRoute.model_validate(v))
+                for k, v in value.items()
+            }
+        return value
+
+    def set_route(self, language: str, route: LanguageRoute | dict[str, Any]) -> None:
+        """安全地修改一条语言路由（会走校验）。"""
+        self.routing[language] = (
+            route if isinstance(route, LanguageRoute) else LanguageRoute.model_validate(route)
+        )
+
+    def route_for(self, language: str) -> LanguageRoute:
+        """取某语言的路由，找不到就用 ``"*"`` 兜底。"""
+        if language in self.routing:
+            return self.routing[language]
+        if "*" in self.routing:
+            return self.routing["*"]
+        return LanguageRoute(engine=self.engine, model="", streaming=(self.engine == "sherpa_stream"))
+
+    fallback_engine: Literal["sherpa_offline", "whispercpp", "none"] = "sherpa_offline"
+    """目标语言模型缺失/加载失败时的降级方向。"""
+
     model_dir: str = ""
     """留空 = 使用 data/models/<engine>/。"""
 
@@ -130,6 +223,13 @@ class TranslateConfig(BaseModel):
     provider: str = "none"
     """当前生效的翻译通道 id，如 "baidu" / "youdao" / "azure" / "google" /
     "deepl" / "llm" / "none"。"""
+
+    source_language: str = "auto"
+    """源语言。``auto`` 表示用 ASR 判定的语种（推荐）。
+
+    多语言场景下必须把源语言传给传统翻译 API——
+    百度/有道/微软/DeepL 都支持 ja→zh、ko→zh 等，但部分免费额度
+    只接受 ``auto`` 或要求英中转，需在适配器里降级。"""
 
     target_language: str = "zh"
     display_mode: Literal["source", "target", "bilingual"] = "bilingual"
