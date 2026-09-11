@@ -267,6 +267,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--selftest", action="store_true", help="环境自检并退出")
     p.add_argument("--list-audio", action="store_true", help="列出当前正在发声的进程")
     p.add_argument("--capture", metavar="PID|进程名", help="采集目标音频并显示实时电平")
+    p.add_argument("--meter", metavar="PID", help="打开电平表悬浮窗（RMS/PEAK 条 + 可调阈值）")
+    p.add_argument(
+        "--threshold-db",
+        type=float,
+        default=None,
+        help="静音阈值 dBFS（默认 -80；越小越灵敏）",
+    )
     p.add_argument("--seconds", type=float, default=10.0, help="采集时长（默认 10 秒）")
     p.add_argument("--record", metavar="WAV", help="把采集结果写成 16k 单声道 WAV")
     p.add_argument("--no-follow", action="store_true", help="目标消失后不自动重连")
@@ -289,15 +296,20 @@ def main(argv: list[str] | None = None) -> int:
         return selftest()
     if args.list_audio:
         return list_audio_processes()
+    if args.meter:
+        from app.ui.meter import run_meter
+
+        return run_meter(int(args.meter), args.threshold_db)
     if args.capture:
         return capture_target(args)
 
     # 无参数：P0 阶段先做自检；P3 起换成启动 GUI
     print(f"ListenAndShowAndTranslate v{__version__}")
     print("GUI 尚未实现（计划书 P3 阶段）。当前可用：")
-    print("  python main.py --selftest            环境自检")
-    print("  python main.py --list-audio          列出正在发声的进程")
+    print("  python main.py --selftest             环境自检")
+    print("  python main.py --list-audio           列出正在发声的进程")
     print("  python main.py --capture <PID|名字>   采集目标音频并显示实时电平")
+    print("  python main.py --meter <PID>          打开电平表悬浮窗（RMS/PEAK，阈值可调）")
     print("  python main.py --capture 1234 --record out.wav --seconds 5")
     return selftest()
 

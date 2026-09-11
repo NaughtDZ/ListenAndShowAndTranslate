@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import ctypes
+import os
 from ctypes import wintypes
 from dataclasses import dataclass, field
 
@@ -125,6 +126,7 @@ def enumerate_audio_processes(
     include_inactive: bool = False,
     all_devices: bool = False,
     with_window_title: bool = True,
+    exclude_pids: set[int] | None = None,
 ) -> list[AudioProcess]:
     """列出正在输出音频的进程。
 
@@ -133,10 +135,16 @@ def enumerate_audio_processes(
             （UI 里可以让用户看到"已打开但静音中"的程序）。
         all_devices: 是否枚举所有播放设备（否则只枚举默认设备）。
         with_window_title: 是否解析窗口标题（略慢，但能区分同名多实例）。
+        exclude_pids: 要排除的 PID。默认为 **本进程**——
+            实测发现：我们自己对目标做进程回环采集时，**本进程也会在音频会话里
+            出现并显示为 Active**（音量合成器里能看到它，标题是窗口标题）。
+            不排除的话，它就会污染"选择音频来源"下拉框。
 
     Returns:
         去重（按 PID）后的列表，活跃的排在前面。
     """
+    excluded = {os.getpid()} if exclude_pids is None else set(exclude_pids)
+
     sessions = _collect_sessions(all_devices)
     if sessions is None:
         return []
@@ -144,7 +152,7 @@ def enumerate_audio_processes(
     merged: dict[int, AudioProcess] = {}
     for sess in sessions:
         pid = getattr(sess, "ProcessId", None)
-        if pid is None:
+        if pid is None or pid in excluded:
             continue
         state = int(getattr(sess, "State", SESSION_INACTIVE))
         if state == SESSION_EXPIRED:
@@ -238,3 +246,45 @@ def _process_exe(sess, pid: int) -> str:
         return psutil.Process(pid).exe()
     except Exception:  # noqa: BLE001
         return ""
+
+
+# --------------------------------------------------------------------------- #
+# 会话音量查询（P1 实测：采集幅度与会话音量成正比，可用于自动增益补偿）
+# --------------------------------------------------------------------------- #
+def get_session_volume(pid: int) -> tuple[float, bool] | None:
+    """读取目标会话的主音量与静音状态。
+
+    Returns:
+        ``(volume, muted)``，拿不到时返回 None。
+        volume 为 0.0~1.0。
+
+    用途：实测证明**进程回环采集发生在音量合成器之后**——
+    用户把小说音量调到 30%，我们收到的信号也只有约 32%。
+    因此可以用这里的音量值做数字增益补偿，让用户把音量调轻（不打扰游戏）
+    而识别端仍然拿到满幅信号。
+    """
+    try:
+        from pycaw.pycaw import AudioUtilities
+
+        for s in AudioUtilities.GetAllSessions():
+            if getattr(s, "ProcessId", None) != pid:
+                continue
+            av = getattr(s, "SimpleAudioVolume", None)
+            if av is None:
+                return None
+            return float(av.GetMasterVolume()), bool(av.GetMute())
+    except Exception as exc:  # noqa: BLE001
+        log.debug("读取会话音量失败 pid=%s: %s", pid, exc)
+    return None
+
+
+def suggest_gain(volume: float | None, max_gain_db: float = 24.0) -> float:
+    """根据会话音量给出数字增益建议（线性倍数）。
+
+    音量 1.0 → 1.0 倍；音量 0.2 → 最多 5 倍，但不超过 ``max_gain_db``。
+    音量过低或为 0 时不做无限放大（那只会把底噪也放大），由上限兜住。
+    """
+    if volume is None or volume <= 0.001:
+        return 1.0
+    max_gain = 10.0 ** (max_gain_db / 20.0)
+    return min(max_gain, 1.0 / volume)

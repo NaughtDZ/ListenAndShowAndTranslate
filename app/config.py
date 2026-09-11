@@ -54,6 +54,22 @@ class AudioConfig(BaseModel):
     target_sample_rate: int = 16000
     """ASR 输入采样率；16k 是绝大多数中文 ASR 模型的原生采样率。"""
 
+    silence_rms_threshold_db: float = Field(default=-80.0, ge=-100.0, le=-20.0)
+    """静音阈值（dBFS）——**由用户调整**，低于此电平视为"没有声音"。
+
+    默认 -80 dBFS（线性 1e-4）。实测教训：定太严（如 -60 dBFS）会把
+    "用户把音量调小后正在播放的语音"误判成静音（实测这种语音 RMS 可低至 5e-4）。
+    进程回环在目标不渲染音频时给出的是精确的 0，所以默认可以放得很宽。
+    """
+
+    gain_db: float = Field(default=0.0, ge=-20.0, le=24.0)
+    """数字增益（dB）。实测采集发生在音量合成器之后，可用它补偿被调小的音量。"""
+
+    auto_gain: bool = False
+    """按会话音量自动补偿增益（用户把小说音量调轻也能识别清楚）。"""
+
+    max_auto_gain_db: float = Field(default=24.0, ge=0.0, le=48.0)
+
 
 # --------------------------------------------------------------------------- #
 # 语音识别
@@ -190,6 +206,31 @@ class OverlayConfig(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
+# 电平表
+# --------------------------------------------------------------------------- #
+class MeterConfig(BaseModel):
+    """电平表（音量条）显示设置。用户要求必须有可见的 RMS/PEAK 指示。"""
+
+    enabled: bool = True
+    show_rms: bool = True
+    show_peak: bool = True
+    show_peak_hold: bool = True
+    show_threshold_line: bool = True
+
+    db_min: float = Field(default=-70.0, ge=-120.0, le=-20.0)
+    db_max: float = Field(default=0.0, ge=-40.0, le=12.0)
+
+    peak_hold_s: float = Field(default=1.5, ge=0.0, le=10.0)
+    attack: float = Field(default=0.6, gt=0.0, le=1.0)
+    release: float = Field(default=0.12, gt=0.0, le=1.0)
+
+    width: int = Field(default=460, ge=200, le=4000)
+    height: int = Field(default=92, ge=40, le=600)
+    opacity: float = Field(default=1.0, ge=0.1, le=1.0)
+    click_through: bool = True
+
+
+# --------------------------------------------------------------------------- #
 # 顶层配置
 # --------------------------------------------------------------------------- #
 class AppConfig(BaseModel):
@@ -202,6 +243,7 @@ class AppConfig(BaseModel):
     asr: ASRConfig = Field(default_factory=ASRConfig)
     translate: TranslateConfig = Field(default_factory=TranslateConfig)
     overlay: OverlayConfig = Field(default_factory=OverlayConfig)
+    meter: MeterConfig = Field(default_factory=MeterConfig)
 
     # ---------------- 读写 ---------------- #
     @classmethod

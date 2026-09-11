@@ -64,6 +64,10 @@ uv pip install --python .venv\Scripts\python.exe -r requirements.txt
 .venv\Scripts\python.exe main.py --capture 43052 --seconds 10
 .venv\Scripts\python.exe main.py --capture 喜马拉雅.exe --seconds 10
 
+# 打开电平表悬浮窗（RMS/PEAK 条 + 峰值保持 + 可调静音阈值）
+.venv\Scripts\python.exe main.py --meter 43052
+.venv\Scripts\python.exe main.py --meter 43052 --threshold-db -70
+
 # 录一段成 16k 单声道 WAV（录的是 3 秒音频，不是墙钟 3 秒）
 .venv\Scripts\python.exe main.py --capture 43052 --record test.wav --seconds 3
 
@@ -94,7 +98,7 @@ start.bat --list-audio
 峰值 0.4000，末次 RMS 0.2810，重连 0 次
 ```
 
-### 验收脚本
+### 验收与调试脚本
 
 ```powershell
 # 隔离性：验证不会混入其他程序的声音
@@ -102,6 +106,15 @@ start.bat --list-audio
 
 # 保真性：验证采集→降混→16k 整条链路不破坏声音
 .venv\Scripts\python.exe scripts\verify_capture_e2e.py
+
+# 会话音量/静音对采集的影响（自动控制音量，只调小不调大）
+.venv\Scripts\python.exe scripts\verify_session_volume_effect.py --pid <音频会话PID>
+
+# 没有真实音频时，用测试音演示电平表
+.venv\Scripts\python.exe scripts\demo_meter.py
+
+# 把电平表渲染成 PNG（检查绘制效果，不需要音频）
+.venv\Scripts\python.exe scripts\preview_meter.py
 
 # 单元测试
 .venv\Scripts\python.exe -m pytest -q

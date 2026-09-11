@@ -313,7 +313,7 @@ class CaptureWorker:
             self.stats.last_rms = rms
             self.stats.peak = self.pipeline.stats.peak
 
-            if rms >= 0.001:
+            if rms >= self.pipeline.silence_threshold:
                 self._last_loud_at = now
                 self.stats.silent_seconds = 0.0
             else:

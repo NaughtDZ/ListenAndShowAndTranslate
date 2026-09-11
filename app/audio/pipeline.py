@@ -29,8 +29,14 @@ DEFAULT_IN_RATE = 48000
 DEFAULT_IN_CHANNELS = 2
 DEFAULT_OUT_RATE = 16000
 
-# RMS 低于此值视为静音（float32 满幅为 1.0；-60 dBFS ≈ 0.001）
-SILENCE_RMS_THRESHOLD = 0.001
+# RMS 低于此值视为静音（float32 满幅为 1.0）。
+#
+# 实测教训（docs/P1-实测记录.md）：原先取 0.001（-60 dBFS）**太大**——
+# 用户把小说音量调小时，真实语音的 RMS 只有 0.0005 左右，
+# 会被误判成"目标没在放音"，UI 就会错误地提示用户去排查。
+# 进程回环在目标不渲染音频时给出的是**精确的 0**，
+# 因此阈值可以取得很低而不怕把底噪当人声：1e-4（-80 dBFS）。
+SILENCE_RMS_THRESHOLD = 1e-4
 
 
 @dataclass
@@ -48,12 +54,14 @@ class PipelineStats:
 
     silent_seconds_total: float = 0.0
 
+    silence_threshold: float = SILENCE_RMS_THRESHOLD
+
     def reset_peak(self) -> None:
         self.peak = 0.0
 
     @property
     def is_silent(self) -> bool:
-        return self.last_rms < SILENCE_RMS_THRESHOLD
+        return self.last_rms < self.silence_threshold
 
 
 class RingBuffer:
@@ -118,18 +126,24 @@ class AudioPipeline:
         downmix: bool = True,
         quality: str = "HQ",
         input_dtype: str = "float32",
+        silence_threshold: float = SILENCE_RMS_THRESHOLD,
+        gain: float = 1.0,
     ) -> None:
         self.in_rate = in_rate
         self.in_channels = in_channels
         self.out_rate = out_rate
         self.downmix = downmix
         self.input_dtype = input_dtype
+        self.silence_threshold = silence_threshold
+        self.gain = float(gain)
+        """数字增益。实测采集发生在音量合成器之后，用户把音量调小时信号也变小，
+        可用会话音量的倒数做补偿（见 process_list.suggest_gain）。"""
 
         out_channels = 1 if downmix else in_channels
         self._resampler = soxr.ResampleStream(
             in_rate, out_rate, out_channels, dtype="float32", quality=quality
         )
-        self.stats = PipelineStats()
+        self.stats = PipelineStats(silence_threshold=silence_threshold)
         self._chunk_seconds = 0.0
 
     # ------------------------------------------------------------------ #
@@ -138,6 +152,9 @@ class AudioPipeline:
         samples = self._to_float32(pcm)
         if samples.size == 0:
             return np.zeros(0, dtype=np.float32)
+
+        if self.gain != 1.0:
+            samples = np.clip(samples * self.gain, -1.0, 1.0)
 
         if self.in_channels > 1:
             if samples.size % self.in_channels != 0:
@@ -174,7 +191,16 @@ class AudioPipeline:
 
     def reset(self) -> None:
         self._resampler.clear()
-        self.stats = PipelineStats()
+        self.stats = PipelineStats(silence_threshold=self.silence_threshold)
+
+    def set_gain(self, gain: float) -> None:
+        """调整数字增益（用于按会话音量做补偿）。"""
+        self.gain = max(0.0, float(gain))
+
+    def set_silence_threshold(self, threshold: float) -> None:
+        """用户可随时调整"什么算静音"。"""
+        self.silence_threshold = float(threshold)
+        self.stats.silence_threshold = float(threshold)
 
     # ------------------------------------------------------------------ #
     def _to_float32(self, pcm: bytes | np.ndarray) -> np.ndarray:
@@ -199,7 +225,7 @@ class AudioPipeline:
         rms = float(np.sqrt(np.mean(np.square(samples, dtype=np.float64))))
         self.stats.last_rms = rms
 
-        if rms < SILENCE_RMS_THRESHOLD:
+        if rms < self.silence_threshold:
             self.stats.silent_chunks += 1
             self.stats.silent_seconds_total += self._block_seconds(samples)
         else:

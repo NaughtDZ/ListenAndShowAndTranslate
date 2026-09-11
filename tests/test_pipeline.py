@@ -215,3 +215,39 @@ def test_reset_clears_stats():
 def test_pcm_duration_helper():
     assert pcm_duration_seconds(np.zeros(16000, dtype=np.float32), 16000) == 1.0
     assert pcm_duration_seconds(np.zeros(0, dtype=np.float32), 16000) == 0.0
+
+
+# --------------------------------------------------------------------------- #
+# 静音阈值（实测教训：阈值定高会把"小音量播放"误判成"没在放音"）
+# --------------------------------------------------------------------------- #
+def test_quiet_playback_is_not_classified_as_silence():
+    """用户把小说音量调小时，真实语音 RMS 只有 ~5e-4。
+
+    旧的 0.001 阈值会把它判成静音，导致 UI 误报"目标程序没在放音"。
+    """
+    pipe = AudioPipeline()
+    pipe.process(_stereo(_sine(440, 0.2, amp=0.0007)))  # RMS ≈ 5e-4
+    assert pipe.stats.last_rms > 4e-4, pipe.stats.last_rms
+    assert not pipe.stats.is_silent, "小音量播放不能被判成静音"
+    assert pipe.stats.silent_chunks == 0
+
+
+def test_digital_silence_is_still_silence():
+    """进程回环在目标不渲染音频时给出精确的 0，必须仍判为静音。"""
+    pipe = AudioPipeline()
+    pipe.process(_stereo(np.zeros(4800, dtype=np.float32)))
+    assert pipe.stats.is_silent
+    assert pipe.stats.silent_chunks == 1
+
+
+def test_silence_threshold_is_configurable():
+    pipe = AudioPipeline(silence_threshold=0.05)
+    pipe.process(_stereo(_sine(440, 0.2, amp=0.02)))  # RMS ≈ 1.4e-2 < 0.05
+    assert pipe.stats.is_silent
+    assert pipe.stats.silence_threshold == 0.05
+
+
+def test_reset_preserves_threshold():
+    pipe = AudioPipeline(silence_threshold=0.05)
+    pipe.reset()
+    assert pipe.stats.silence_threshold == 0.05
