@@ -1,0 +1,52 @@
+# 运行时依赖（精确锁定）
+# 安装：uv pip install --python .venv\Scripts\python.exe -r requirements.txt
+# 生成：uv pip freeze --python .venv\Scripts\python.exe
+#
+# 注意：本清单锁定 Python 3.12.x（见 计划书.md 第 1.1 节，勿用系统 3.14）
+
+# --- 界面 ---
+pyside6==6.11.2
+pyside6-addons==6.11.2
+pyside6-essentials==6.11.2
+shiboken6==6.11.2
+
+# --- 音频采集（WASAPI 进程级回环）---
+proc-tap==1.1.1
+
+# --- 发声进程枚举（Windows 音频会话 API / 音量合成器同款）---
+pycaw==20251023
+comtypes==1.4.16
+psutil==7.2.2
+
+# --- 语音识别 ---
+sherpa-onnx==1.13.8
+sherpa-onnx-core==1.13.8
+
+# --- 音频处理 ---
+numpy==2.5.3
+scipy==1.18.1
+soxr==1.1.0
+soundfile==0.14.0
+
+# --- 网络与配置 ---
+httpx==0.28.1
+httpcore==1.0.9
+h11==0.16.0
+anyio==4.15.1
+certifi==2026.7.22
+idna==3.19
+tenacity==9.1.4
+
+# --- 数据模型与工具 ---
+pydantic==2.13.5
+pydantic-core==2.46.5
+annotated-types==0.8.0
+typing-extensions==4.16.0
+typing-inspection==0.4.4
+platformdirs==4.11.8
+packaging==26.3
+
+# --- 间接依赖（comtypes/pycaw 链路）---
+cffi==2.1.1
+pycparser==3.0
+colorama==0.4.6

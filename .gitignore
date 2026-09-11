@@ -1,0 +1,92 @@
+# ============================================================
+#  ListenAndShowAndTranslate  .gitignore
+#  ★ 红线：以下内容永远不进 Git（见 计划书.md 第 9 节）
+# ============================================================
+
+# --- 红线 1：虚拟环境 ---
+.venv/
+venv/
+env/
+ENV/
+
+# --- 红线 2：运行时数据（配置含 API Key、SQLite、模型、日志、导出）---
+data/
+*.db
+*.sqlite
+*.sqlite3
+logs/
+output/
+
+# --- 红线 3：凭据（任何形式的密钥都不许进仓库）---
+.env
+.env.*
+secrets.json
+credentials.json
+*_token.txt
+*token*.json
+!.env.example
+
+# --- 模型文件（体积大，由 downloader 运行时拉取）---
+models/
+*.onnx
+*.bin
+*.gguf
+*.ggml
+*.pt
+*.pth
+*.safetensors
+
+# --- 音频临时产物 ---
+*.wav
+*.mp3
+*.flac
+*.srt
+*.vtt
+
+# --- Python 通用 ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
+.Python
+build/
+dist/
+develop-eggs/
+downloads/
+eggs/
+.eggs/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# --- 工具缓存 ---
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.uv/
+uv.lock
+
+# --- 编辑器 / 系统 ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
+
+# --- 打包产物 ---
+*.spec.bak
+!*.spec
