@@ -12,7 +12,7 @@ def test_defaults_are_sane():
     cfg = AppConfig()
     assert cfg.asr.engine == "sherpa_stream"
     assert cfg.audio.source_mode == "process"
-    assert cfg.translate.display_mode == "bilingual"
+    assert cfg.overlay.display_mode == "bilingual"
     assert cfg.overlay.click_through is True
     assert cfg.overlay.always_on_top is True
 

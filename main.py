@@ -377,6 +377,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--list-audio", action="store_true", help="列出当前正在发声的进程")
     p.add_argument("--capture", metavar="PID|进程名", help="采集目标音频并显示实时电平")
     p.add_argument("--meter", metavar="PID", help="打开电平表悬浮窗（RMS/PEAK 条 + 可调阈值）")
+    p.add_argument("--run", metavar="PID", help="启动字幕程序：透明悬浮窗 + 实时翻译")
+    p.add_argument("--process", metavar="NAME", help="配合 --run：按进程名（如 喜马拉雅.exe）")
     p.add_argument(
         "--models",
         choices=["list", "status", "install", "uninstall"],
@@ -418,6 +420,13 @@ def main(argv: list[str] | None = None) -> int:
         return list_audio_processes()
     if args.models:
         return models_command(args)
+    if args.run or args.process:
+        from app.ui.runner import run_subtitles
+
+        return run_subtitles(
+            pid=int(args.run) if args.run else None,
+            process_name=args.process or "",
+        )
     if args.meter:
         from app.ui.meter import run_meter
 

@@ -381,7 +381,6 @@ class TranslateConfig(BaseModel):
     只接受 ``auto`` 或要求英中转，需在适配器里降级。"""
 
     target_language: str = "zh"
-    display_mode: Literal["source", "target", "bilingual"] = "bilingual"
     prompt_template: str = "subtitle_direct"
     """内置模板名，见 assets/prompts/。"""
 
@@ -437,6 +436,18 @@ class OverlayConfig(BaseModel):
 
     scroll_mode: Literal["accumulate", "replace", "typewriter", "karaoke"] = "accumulate"
     max_lines: int = Field(default=3, ge=1, le=20)
+
+    display_mode: Literal["source", "target", "bilingual"] = "bilingual"
+    """显示什么：仅原文 / 仅译文 / 双语。
+
+    注意它属于**显示配置**而不是翻译配置——翻译总是照常进行，
+    这个开关只决定屏幕上画什么（否则用户切一下显示模式就会白白重翻）。"""
+
+    lines_per_subtitle: int = Field(default=2, ge=1, le=6)
+    """每条字幕最多允许换几行。
+
+    **不能用截断代替换行**：截断会直接丢内容（实测预览里长句被截成"…"），
+    听小说时丢半句话是不能接受的。所以超长自动换行，真的放不下才在最后一行省略。"""
     line_spacing: float = Field(default=1.15, ge=0.8, le=3.0)
     fade_ms: int = Field(default=180, ge=0, le=2000)
 
