@@ -219,14 +219,18 @@ class LanguageRoute(BaseModel):
 def _default_routing() -> dict[str, LanguageRoute]:
     """默认语言路由（依据 sherpa-onnx 官方模型可用性，见计划书 12.2）。
 
+    ⚠️ ``model`` 字段必须是 **app/models/registry.py 里的注册表键名**
+    （如 ``sensevoice-int8``），不是仓库名或显示名——
+    写错会导致引擎加载时找不到模型。有单元测试守着这条（tests/test_asr_text.py）。
+
     实测结论：官方**没有日语流式模型**，所以 ja 只能走分块引擎；
     韩语/粤语与日语共用同一个 SenseVoice 模型（一个模型覆盖 5 种语言）。
     """
-    sense = "sense-voice-zh-en-ja-ko-yue-int8"
+    sense = "sensevoice-int8"
     return {
-        "zh": LanguageRoute(engine="sherpa_stream", model="streaming-zipformer-zh-int8", streaming=True),
-        "zh-en": LanguageRoute(engine="sherpa_stream", model="streaming-zipformer-bilingual-zh-en", streaming=True),
-        "en": LanguageRoute(engine="sherpa_stream", model="streaming-zipformer-en", streaming=True),
+        "zh": LanguageRoute(engine="sherpa_stream", model="zipformer-zh-int8", streaming=True),
+        "zh-en": LanguageRoute(engine="sherpa_stream", model="zipformer-zh-en-int8", streaming=True),
+        "en": LanguageRoute(engine="sherpa_stream", model="zipformer-en-int8", streaming=True),
         "ja": LanguageRoute(engine="sherpa_offline", model=sense, streaming=False),
         "ko": LanguageRoute(engine="sherpa_offline", model=sense, streaming=False),
         "yue": LanguageRoute(engine="sherpa_offline", model=sense, streaming=False),

@@ -100,7 +100,7 @@ def test_japanese_routes_to_offline_engine():
     ja = cfg.asr.routing["ja"]
     assert ja.engine == "sherpa_offline"
     assert ja.streaming is False
-    assert "sense-voice" in ja.model
+    assert ja.model == "sensevoice-int8", "模型键名必须是注册表里的键"
 
 
 def test_japanese_korean_cantonese_share_one_model():
