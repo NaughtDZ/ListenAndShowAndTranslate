@@ -1,8 +1,17 @@
-# 开发依赖
-# 安装：uv pip install --python .venv\Scripts\python.exe -r requirements-dev.txt
+# 开发依赖（**只装进项目 .venv**，禁止全局安装）
+# 安装（需要代理时先设 HTTP_PROXY / HTTPS_PROXY）：
+#   $env:HTTP_PROXY="http://127.0.0.1:2333"; $env:HTTPS_PROXY="http://127.0.0.1:2333"
+#   uv pip install --python .venv\Scripts\python.exe -r requirements-dev.txt
 -r requirements.txt
 
 pytest==9.1.1
 iniconfig==2.3.0
 pluggy==1.6.0
 pygments==2.21.0
+
+# 打包前端 exe（scripts/build_exe.py / 构建exe.bat）；运行时不需要
+pyinstaller==6.22.2
+altgraph==0.17.5
+pefile==2024.8.26
+pyinstaller-hooks-contrib==2026.7
+pywin32-ctypes==0.2.3

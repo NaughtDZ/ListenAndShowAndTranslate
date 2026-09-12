@@ -4,54 +4,95 @@
 > 以透明、置顶、点击穿透的悬浮窗盖在游戏画面上。
 > 典型场景：一边用播放器听小说，一边打游戏——**只有小说声进识别，游戏声完全不理**。
 
----
-
-## 这是什么
-
 Windows 的声卡输出把"小说软件"和"游戏"的音频混在一起。本程序用 **WASAPI 进程级回环**
 （`ActivateAudioInterfaceAsync` + PROCESS_LOOPBACK）从系统层面**只抓目标进程的音频**，
-再经过 VAD → 语音识别 → 翻译 → 悬浮字幕窗，全程不需要安装虚拟声卡、不需要管理员权限。
+再经过 VAD → 语音识别 → 翻译 → 悬浮字幕窗，全程不需要虚拟声卡、不需要管理员权限、
+不做任何游戏注入（不碰反作弊）。
 
-## 功能清单
+---
+
+## 功能清单（当前实际状态）
 
 | 模块 | 状态 | 说明 |
 |---|---|---|
-| 选择音频来源程序 | ✅ **已可用** | 直接调用 Windows 音频会话 API（音量合成器同款），列出真正在发声的进程 |
-| 进程级音频采集 | 🚧 P1 | proc-tap（WASAPI 进程回环） |
-| 实时语音识别 | 🚧 P2 | sherpa-onnx 流式 zipformer（低延迟，中文优先） |
-| 悬浮字幕窗 | 🚧 P3 | 透明 / 置顶 / 点击穿透 / 描边 / 多种滚动模式 |
-| 翻译（API + LLM + 本地） | 🚧 P4 | 百度/有道/微软/谷歌/DeepL + OpenAI 兼容/Ollama/LM Studio |
-| 字幕历史与 srt/txt 导出 | 🚧 P5 | |
-| 首次运行向导 | 🚧 P5 | 硬件探测 → 推荐档位 → 一键下模型 |
+| 选择音频来源程序 | ✅ 已可用 | Windows 音频会话 API（音量合成器同款），只列**真正在发声**的进程 |
+| 进程级音频采集 | ✅ 已可用 | `proc-tap`（WASAPI 进程回环）+ 降混/重采样；隔离性 99.90% 实测见 `docs/P1-实测记录.md` |
+| 实时语音识别 | ✅ 已可用 | sherpa-onnx：流式 zipformer（中/英）+ SenseVoice（中英日韩粤）+ Whisper turbo；实测见 `docs/P2-ASR实测.md` |
+| 悬浮字幕窗 | ✅ 已可用 | 透明 / 置顶 / 点击穿透 / 描边 / 字体自适应 / 可拖拽缩放；见 `docs/字幕窗尺寸与字号.md` |
+| 翻译（API + LLM + 本地） | ✅ 已可用 | 5 家官方 API + 谷歌/必应网页版 + OpenAI 兼容（LM Studio/Ollama）+ 术语表 + 缓存；见 `docs/P4-翻译实测.md` |
+| 静音阈值与电平表 | ✅ 已可用 | 启动窗口独立电平表窗口 + 设置里内嵌实时电平表；见 `docs/静音阈值与电平表.md` |
+| 首次运行向导 | ✅ 已可用 | 硬件探测 → 推荐档位 → 一键下模型 → 代理/翻译通道配置 |
+| 系统托盘 / 窗口生命周期 | ✅ 已可用 | 控制窗可收进托盘，退出行为有明确约定；见 `docs/窗口与退出行为.md` |
+| 前端 exe（无控制台黑窗） | ✅ 已可用 | `听显译.exe`，见下面「启动方式」 |
+| 字幕历史与 srt 导出 | 🚧 部分 | 数据模型与 `to_srt()` 已有，UI 入口待接线 |
+| 全局热键 / 安装包 | ⏳ 未开始 | 计划书 P6/P7 |
 
-进度按 `计划书.md` 的 P0–P7 推进。
+进度按 `计划书.md` 的 P0–P7 推进（第 11 节有逐项产出与实测数据）。
 
 ---
 
-## 快速开始
+## 启动方式（三个入口，随便挑一个）
 
-### 1. 环境要求
+| 入口 | 有没有控制台窗口 | 说明 |
+|---|---|---|
+| **`听显译.exe`**（推荐） | **没有** | 前端启动器：检查环境 → 用 `pythonw.exe` 拉起主程序 → 自己立刻退出。也能带参数：`听显译.exe --settings`、`听显译.exe --list-audio` |
+| `启动.bat` | 有（会一直留一个黑框） | 命令行入口，方便看日志/传参数；首次装环境也走它 |
+| `首次安装.bat` | 有 | 只负责创建 `.venv` 并装依赖（`启动.bat` 发现没环境时也会引导过来） |
 
-- Windows 10 20H1+ / Windows 11（进程回环的硬性要求）
-- Python **3.12**（由 uv 管理，**不要用系统的 3.14**，见 `计划书.md` 第 1.1 节）
-- [uv](https://docs.astral.sh/uv/)
+> ⚠️ `听显译.exe` **不是独立发行版**：它是个几十 KB 逻辑的前端壳（打包后约 8 MB），
+> 真正跑字幕的仍然是项目里的 `.venv` + `main.py`，模型也还在 `data/models/`。
+> 所以先按下面「安装」把环境装好，再双击 exe。
+> exe 未做代码签名，Windows SmartScreen 可能提示"未知发布者"，选「仍要运行」即可；
+> 也可以随时用 `构建exe.bat` 自己重新生成（源码就是 `frontend.py`）。
 
-### 2. 安装
+### 重新打包 exe
 
 ```powershell
-cd L:\AI_AudioAndChat\ListenAndShowAndTranslate
+构建exe.bat
+# 等价于：.venv\Scripts\python.exe scripts\build_exe.py
+```
 
-# 创建隔离虚拟环境（红线：一切依赖只装进 .venv）
+打包用 PyInstaller（开发依赖，装在 `.venv` 里）。产物覆盖根目录的 `听显译.exe`；
+中间文件在 `data/build/`（已被 `.gitignore` 忽略）。
+
+---
+
+## 安装（Windows / Python 3.12）
+
+```powershell
+git clone https://github.com/NaughtDZ/ListenAndShowAndTranslate.git
+cd ListenAndShowAndTranslate
+
+# 一键：建 .venv（uv 托管的 Python 3.12.12）并安装依赖
+.\首次安装.bat
+```
+
+手动等价命令（**禁止全局 pip**，红线见下）：
+
+```powershell
 uv venv --python 3.12.12 .venv
 
-# 安装依赖（国内/受限网络可先设置代理）
+# 国内/受限网络：uv 走环境变量代理（注意 uv pip 没有 --proxy 参数）
 $env:HTTP_PROXY='http://127.0.0.1:2333'; $env:HTTPS_PROXY='http://127.0.0.1:2333'
 uv pip install --python .venv\Scripts\python.exe -r requirements.txt
 ```
 
-> ⚠️ **禁止全局 `pip install`**。所有依赖必须装在项目内的 `.venv/`。
+- 必须是 **Python 3.12**：`proc-tap` 与 `sherpa-onnx` 没有 3.13+ 的轮子
+  （系统只装了 3.14 也没关系，uv 会自己拉一个 3.12）。
+- 首次启动会自动下载识别/翻译模型到 `data/models/`（向导里可以选档位与体积）。
 
-### 3. 使用
+---
+
+## 使用
+
+双击 `听显译.exe` → 在列表里选**正在播放**的小说软件 → 「开始字幕」。
+（浏览器/Electron 类应用有多个同名子进程，选错了会一直静音，换一个同名项试试。）
+
+字幕窗：**拖动任意位置**移动，**拖边缘/角**缩放；控制窗里可切原文/译文/双语、
+点击穿透、暂停，并可「最小化到托盘」（关闭控制窗才会退出程序，见
+`docs/窗口与退出行为.md`）。
+
+### 命令行用法
 
 ```powershell
 # 环境自检（解释器/依赖/目录/代理/GPU 一次全查）
@@ -68,11 +109,9 @@ uv pip install --python .venv\Scripts\python.exe -r requirements.txt
 .venv\Scripts\python.exe main.py --meter 43052
 .venv\Scripts\python.exe main.py --meter 43052 --threshold-db -70
 
-# 录一段成 16k 单声道 WAV（录的是 3 秒音频，不是墙钟 3 秒）
+# 直接开设置窗 / 录一段 16k 单声道 WAV
+.venv\Scripts\python.exe main.py --settings
 .venv\Scripts\python.exe main.py --capture 43052 --record test.wav --seconds 3
-
-# 或直接双击
-start.bat --list-audio
 ```
 
 `--list-audio` 输出示例（真实运行结果）：
@@ -110,13 +149,12 @@ start.bat --list-audio
 # 会话音量/静音对采集的影响（自动控制音量，只调小不调大）
 .venv\Scripts\python.exe scripts\verify_session_volume_effect.py --pid <音频会话PID>
 
-# 没有真实音频时，用测试音演示电平表
+# 没有真实音频时，用测试音演示电平表 / 渲染成 PNG
 .venv\Scripts\python.exe scripts\demo_meter.py
-
-# 把电平表渲染成 PNG（检查绘制效果，不需要音频）
 .venv\Scripts\python.exe scripts\preview_meter.py
+.venv\Scripts\python.exe scripts\preview_subtitle.py
 
-# 单元测试
+# 单元测试（300+ 项，含 Qt offscreen UI 用例）
 .venv\Scripts\python.exe -m pytest -q
 ```
 
@@ -128,10 +166,11 @@ start.bat --list-audio
 |---|---|---|
 | 音频隔离 | **WASAPI 进程回环**（`proc-tap`，MIT） | 系统原生能力，零驱动、零权限、按 PID 精确隔离 |
 | 发声进程枚举 | **Windows 音频会话 API**（`pycaw`） | 音量合成器同款接口，真实反映"谁在响" |
-| 语音识别 | **sherpa-onnx 流式 zipformer**（首选） | 真流式、低延迟、体积小、中文友好 |
+| 语音识别 | **sherpa-onnx**：流式 zipformer / SenseVoice / Whisper | 真流式、低延迟、体积小、中文友好，全本地推理 |
 | GPU 加速 | **Vulkan + ONNX Runtime(DirectML/CUDA) + CPU** 三通道 | 单一后端无法覆盖 N/A/I 三家显卡 |
 | 翻译 | 统一适配器 + 内置提示词模板 | 传统 API 与 LLM/本地模型同一接口，可自由切换 |
 | 界面 | **PySide6**（Qt6） | 透明/点击穿透/置顶只有原生窗口才能可靠实现 |
+| 前端入口 | **PyInstaller 单文件启动器** | 双击即开，不留控制台黑窗 |
 
 ---
 
@@ -140,8 +179,13 @@ start.bat --list-audio
 - **真·独占全屏游戏无法被普通窗口覆盖**。请把游戏设为「**无边框窗口全屏**」（通常性能损失 < 2%）；
   开着 Windows「全屏优化」的"独占全屏"大多也能覆盖。
   注入式 Overlay（RTSS 那种）有反作弊封号风险，**本项目默认不做**。
-- 枚举发声进程目前只覆盖**默认播放设备**上的会话（P1 完善多设备）。
+- 枚举发声进程目前只覆盖**默认播放设备**上的会话（多设备切换待完善）。
 - 目标程序如果是 DRM 保护音频路径，可能采不到声音（P1 实测确认）。
+- **别在音量合成器里把目标程序静音**：进程回环采集发生在音量合成器"之后"，
+  静音会直接切断信号（实测采集到精确的 0）；调小音量则会等比变小，
+  程序里有数字增益可以补偿。
+- `听显译.exe` 是**前端壳**，不是脱离 Python 的独立发行版；未签名，可能触发 SmartScreen 提示。
+- 字幕准确率取决于模型与音源质量，实测数据都在 `docs/` 里，不做夸大。
 
 ---
 
@@ -172,7 +216,22 @@ start.bat --list-audio
 | `docs/静音阈值与电平表.md` | 静音阈值的实测参考、三个调节入口、设置里的实时电平表 |
 | `docs/第三方许可.md` | 依赖许可清单（LGPL/GPL 组件与商用注意点） |
 
+## 目录结构（主要部分）
+
+```
+main.py              命令行入口（--selftest / --list-audio / --run / --meter / --settings / --wizard）
+frontend.py          前端启动器源码（打包成 听显译.exe）
+app/audio/           进程回环采集、音频管线、电平统计
+app/asr/             识别引擎抽象、VAD、流式/离线引擎、语言路由
+app/translate/       翻译适配器（官方 API / 网页通道 / OpenAI 兼容）、提示词、术语表
+app/models/          模型注册表、下载器、硬件探测
+app/ui/              悬浮字幕窗、控制窗、电平表、设置窗、向导、启动器
+scripts/             验收脚本 + 出图预览 + 打包脚本
+tests/               300+ 项 pytest（含 Qt offscreen 用例）
+docs/                一手实测记录与专题说明
+```
+
 ## 许可证
 
 MIT，见 `LICENSE`。
-第三方组件许可见后续 `docs/第三方许可.md`。
+第三方组件许可（PySide6 的 LGPL、libsndfile 等）见 `docs/第三方许可.md`。
