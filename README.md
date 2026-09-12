@@ -1,4 +1,5 @@
 # ListenAndShowAndTranslate · 听·显·译
+<img width="1047" height="1680" alt="image" src="https://github.com/user-attachments/assets/26cb7906-e715-4ec5-b7ea-3e4c0e111599" />
 
 > **只监听你指定的那一个程序的音频**，实时生成字幕（原文 / 译文 / 双语），
 > 以透明、置顶、点击穿透的悬浮窗盖在游戏画面上。
@@ -26,6 +27,9 @@ Windows 的声卡输出把"小说软件"和"游戏"的音频混在一起。本�
 | 前端 exe（无控制台黑窗） | ✅ 已可用 | `听显译.exe`，见下面「启动方式」 |
 | 字幕历史与 srt 导出 | 🚧 部分 | 数据模型与 `to_srt()` 已有，UI 入口待接线 |
 | 全局热键 / 安装包 | ⏳ 未开始 | 计划书 P6/P7 |
+<img width="1070" height="1687" alt="image" src="https://github.com/user-attachments/assets/044a48c2-6efe-4659-90bc-ff69b8d98249" />
+<img width="1048" height="1682" alt="image" src="https://github.com/user-attachments/assets/f8808d8d-c1b4-474e-9d72-eec48775f29d" />
+<img width="898" height="288" alt="image" src="https://github.com/user-attachments/assets/6904b2ca-4a52-4979-b416-c188297f07cd" />
 
 进度按 `计划书.md` 的 P0–P7 推进（第 11 节有逐项产出与实测数据）。
 
