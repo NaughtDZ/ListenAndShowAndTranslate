@@ -319,9 +319,10 @@ WEB_PROVIDERS: dict[str, type[TraditionalTranslatorBase]] = {}
 
 def _register_web_providers() -> None:
     try:
-        from app.translate.traditional.web import GoogleWebTranslator
+        from app.translate.traditional.web import BingWebTranslator, GoogleWebTranslator
 
         WEB_PROVIDERS["web_google"] = GoogleWebTranslator
+        WEB_PROVIDERS["web_bing"] = BingWebTranslator
     except Exception as exc:  # noqa: BLE001
         log.debug("加载网页版翻译通道失败: %s", exc)
 
