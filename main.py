@@ -14,7 +14,7 @@ from typing import Callable
 
 from app import __version__, paths
 from app.config import AppConfig
-from app.utils.log import get_logger
+from app.utils.log import get_logger, install_excepthook
 
 log = get_logger("main")
 
@@ -414,6 +414,8 @@ def main(argv: list[str] | None = None) -> int:
         paths.CONFIG_FILE = Path(args.config).resolve()
 
     paths.ensure_dirs()
+    # pythonw.exe 起的子进程没有控制台，未捕获异常必须落到日志里（否则凭空消失）
+    install_excepthook()
     log.info("启动 v%s | Python %s | %s", __version__, sys.version.split()[0], paths.DATA_DIR)
 
     if args.selftest:

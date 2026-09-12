@@ -24,6 +24,12 @@ from PySide6.QtWidgets import (
 from app.audio.capture import TargetSpec
 from app.audio.process_list import enumerate_audio_processes
 from app.config import AppConfig
+from app.ui.lifecycle import (
+    configure_quit_policy,
+    open_settings_window,
+    quit_app,
+    set_quitting,
+)
 from app.utils.log import get_logger
 
 log = get_logger(__name__)
@@ -117,8 +123,8 @@ class LauncherWindow(QWidget):
         return int(value) if value is not None else None
 
     # ------------------------------------------------------------------ #
-    def _spawn_child(self, args: list[str]) -> None:
-        """用**独立子进程**启动字幕/电平表。
+    def _spawn_child(self, args: list[str]):
+        """用**独立子进程**启动字幕/电平表。成功返回 Popen，失败返回 None。
 
         为什么必须是独立进程，而不是在本进程里再建窗口：
 
@@ -149,18 +155,49 @@ class LauncherWindow(QWidget):
         cmd = [str(exe), str(ROOT / "main.py"), *args]
         log.info("启动子进程：%s", " ".join(cmd))
         try:
-            subprocess.Popen(cmd, cwd=str(ROOT), creationflags=flags, close_fds=True)
+            return subprocess.Popen(cmd, cwd=str(ROOT), creationflags=flags, close_fds=True)
         except Exception as exc:  # noqa: BLE001
             self.empty_hint.setText(f"❌ 启动失败：{exc}")
+            return None
 
     def _start(self) -> None:
         pid = self._selected_pid()
         if pid is None:
             self.empty_hint.setText("请先在列表里选一个程序。")
             return
-        self._spawn_child(["--run", str(pid)])
-        # 字幕窗由子进程负责；主窗口先藏起来，免得两个窗口叠在一起
-        self.hide()
+        proc = self._spawn_child(["--run", str(pid)])
+        if proc is None:
+            return
+
+        # 选完音频，主窗口的任务就结束了。**不要只是 hide()**——它是普通窗口，
+        # 藏起来就既看不见也点不到（`hide()` 不触发 closeEvent，程序会一直挂着），
+        # 而且它又不是 Qt.Tool，托盘里还会多出一个图标。
+        # 所以给它 1.5 秒自检：子进程活着就关掉自己，秒退就留在界面上报错
+        # （pythonw 会把 traceback 吞掉，不这么做用户什么提示都看不到）。
+        self._timer.stop()  # 别再无谓地每 3 秒枚举音频会话
+        self.start_btn.setEnabled(False)
+        self.refresh_btn.setEnabled(False)
+        self.hint.setText(
+            "字幕已启动，正在确认子进程是否正常…<br>"
+            "稍后本窗口会自动关闭，字幕窗由子进程负责。"
+        )
+        QTimer.singleShot(1500, lambda: self._finish_start(proc))
+
+    def _finish_start(self, proc) -> None:
+        code = proc.poll()
+        if code is None:
+            log.info("字幕子进程 pid=%s 运行正常，关闭选择窗口", proc.pid)
+            self._quit()
+            return
+        self.start_btn.setEnabled(True)
+        self.refresh_btn.setEnabled(True)
+        self._timer.start(3000)
+        self.hint.setText("选一个正在播放的<b>小说软件</b>，点「开始字幕」。")
+        self.empty_hint.setText(
+            f"❌ 字幕进程启动后立刻退出了（exit {code}）。<br>"
+            "常见原因：这个进程其实没在发声（浏览器/Electron 选错子进程）、"
+            "或者配置有误。日志见 data\\logs\\lst.log。"
+        )
 
     def _open_meter(self) -> None:
         pid = self._selected_pid()
@@ -170,14 +207,19 @@ class LauncherWindow(QWidget):
         self._spawn_child(["--meter", str(pid)])
 
     def _open_settings(self) -> None:
-        from app.ui.settings import SettingsWindow
+        """打开（复用）设置窗。**只有关这个窗不会退出程序**。"""
+        open_settings_window(self, self.config)
 
-        win = getattr(self, "_settings_win", None)
-        if win is not None and win.isVisible():
-            win.raise_()
+    def _quit(self) -> None:
+        """显式退出：关主窗口 / 退出按钮都走这里。"""
+        if not set_quitting(self):
             return
-        self._settings_win = SettingsWindow(self.config)
-        self._settings_win.show()
+        quit_app()
+
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt 命名
+        """右上角 ✕ = 退出选择窗口（不是"只关掉这个窗"）。"""
+        event.accept()
+        self._quit()
 
 
 def run_launcher(config: AppConfig | None = None) -> int:
@@ -194,6 +236,9 @@ def run_launcher(config: AppConfig | None = None) -> int:
         cfg = AppConfig.load()
 
     app = QApplication.instance() or QApplication([])
+    # 退出必须显式（见 app/ui/lifecycle.py）：不设这个的话，"关掉主窗口"
+    # 会让还在看的设置窗连带失效，反过来"关掉设置窗"又会把主窗口带走。
+    configure_quit_policy(app)
     win = LauncherWindow(cfg)
     win.show()
     return int(app.exec())

@@ -601,7 +601,12 @@ def run_wizard(config: AppConfig | None = None) -> int:
     """跑向导。返回 QDialog 结果码。"""
     from PySide6.QtWidgets import QApplication
 
+    from app.ui.lifecycle import configure_quit_policy
+
     app = QApplication.instance() or QApplication([])
+    # 向导是这期间唯一的窗口：默认策略下向导一关就会调 QApplication.quit()，
+    # 而下面主窗口的 app.exec() 还没开始跑，容易被这个"待退出"标记坑到。
+    configure_quit_policy(app)
     wiz = FirstRunWizard(config)
     wiz.show()
     return int(wiz.exec())

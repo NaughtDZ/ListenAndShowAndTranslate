@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import time
+from typing import TYPE_CHECKING
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
@@ -27,9 +28,13 @@ from PySide6.QtWidgets import (
 from app.audio.capture import TargetSpec, resolve_target
 from app.config import AppConfig
 from app.pipeline import SubtitlePipeline
+from app.ui.lifecycle import configure_quit_policy
 from app.ui.subtitle_overlay import SubtitleOverlay
 from app.utils import win32
 from app.utils.log import get_logger
+
+if TYPE_CHECKING:  # 只为类型标注，运行时不导入（设置窗是懒加载的）
+    from app.ui.settings import SettingsWindow
 
 log = get_logger(__name__)
 
@@ -143,19 +148,18 @@ class SubtitleControlWindow(QWidget):
         # 按内容自适应尺寸（高 DPI 下字体放大，固定尺寸会把按钮挤掉）
         self.adjustSize()
 
-    def _open_settings(self) -> None:
-        """打开设置窗。**不能放在悬浮窗里**——开了点击穿透就点不动了。"""
-        from app.ui.settings import SettingsWindow
+    def _open_settings(self) -> "SettingsWindow":
+        """打开设置窗，返回该窗口。**不能放在悬浮窗里**——开了点击穿透就点不动了。
 
-        win = getattr(self, "_settings_win", None)
-        if win is not None and win.isVisible():
-            win.raise_()
-            win.activateWindow()
-            return
-        self._settings_win = SettingsWindow(self.pipeline.config)
+        复用同一个实例：关掉设置窗只是 ``hide()``，再点「设置…」还是它；
+        新建的话会堆出一打藏起来的窗口，而销毁旧窗口会带走还在跑的测试线程。
+        """
+        from app.ui.lifecycle import open_settings_window
+
         # 保存后立即应用，而不是让用户重启程序（用户明确反馈过这点）
-        self._settings_win.saved.connect(self._apply_settings_live)
-        self._settings_win.show()
+        return open_settings_window(
+            self, self.pipeline.config, on_saved=self._apply_settings_live
+        )
 
     def _apply_settings_live(self) -> None:
         """设置保存后立刻生效。
@@ -242,10 +246,11 @@ class SubtitleControlWindow(QWidget):
             self._restore_from_tray()
 
     def _to_tray(self) -> None:
+        # 没有托盘就别藏：藏起来就再也找不回来了（托盘是唯一入口）
+        if getattr(self, "tray", None) is None:
+            return
         self.hide()
-        tray = getattr(self, "tray", None)
-        if tray is not None:
-            tray.showMessage("听·显·译", "已最小化到托盘，双击图标可恢复。", 
+        self.tray.showMessage("听·显·译", "已最小化到托盘，双击图标可恢复。", 
                              self.tray.MessageIcon.Information, 3000)
 
     def _restore_from_tray(self) -> None:
@@ -257,12 +262,25 @@ class SubtitleControlWindow(QWidget):
         self.overlay.setVisible(not self.overlay.isVisible())
 
     def _quit(self) -> None:
-        from PySide6.QtWidgets import QApplication
+        """显式退出：控制窗「退出」按钮、托盘菜单、右上角 ✕ 都走这里。"""
+        from app.ui.lifecycle import quit_app, set_quitting
 
+        if not set_quitting(self):
+            return
         tray = getattr(self, "tray", None)
         if tray is not None:
             tray.hide()
-        QApplication.quit()
+        quit_app()
+
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt 命名
+        """右上角 ✕ = 退出程序（和从前一样）。
+
+        注意：**只有这一条路是"关窗即退出"**。「最小化到托盘」走的是
+        ``hide()``，不经过这里；设置窗关了也只关它自己——否则就会出现
+        "把控制窗收进托盘后一关设置窗，整个程序没了"（用户实测反馈过）。
+        """
+        event.accept()
+        self._quit()
 
 
     # ------------------------------------------------------------------ #
@@ -313,6 +331,10 @@ def run_subtitles(pid: int | None = None, process_name: str = "", config: AppCon
 
     # Qt 自己会设置 DPI 感知，这里不要抢（见 app/utils/win32.py 的说明）
     app = QApplication.instance() or QApplication([])
+    # 退出必须显式：默认策略下"最后一个可见窗口关闭"会顺手退出整个程序，
+    # 而悬浮窗是 Qt.Tool（不计数）、控制窗收进托盘后也不算可见窗口，
+    # 于是"控制窗在托盘 + 关掉设置窗"= 程序自杀（用户实测反馈）。
+    configure_quit_policy(app)
 
     overlay = SubtitleOverlay(cfg.overlay)
     pipeline = SubtitlePipeline(cfg)
@@ -357,7 +379,7 @@ def run_subtitles(pid: int | None = None, process_name: str = "", config: AppCon
     ok, note = pipeline.prepare()
     on_status(note or "就绪")
 
-    control.quit_btn.clicked.connect(app.quit)
+    control.quit_btn.clicked.connect(control._quit)
     control.settings_btn.clicked.connect(control._open_settings)
     overlay.show()
     control.show()
@@ -372,6 +394,7 @@ def run_subtitles(pid: int | None = None, process_name: str = "", config: AppCon
 
     print(f"字幕已启动，目标: {target.name} (PID {target.pid})")
     print("控制窗里可切显示模式/穿透/暂停。关掉控制窗即退出。")
+    print("想把控制窗收起来就点「最小化到托盘」；单独关掉设置窗不会退出程序。")
 
     try:
         return int(app.exec())

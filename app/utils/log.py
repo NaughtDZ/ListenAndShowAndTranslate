@@ -9,6 +9,7 @@ import logging
 import logging.handlers
 import re
 import sys
+import threading
 
 from app import paths
 
@@ -93,3 +94,33 @@ def get_logger(name: str | None = None) -> logging.Logger:
         _configured = True
 
     return logger if name is None else logger.getChild(name)
+
+
+def install_excepthook() -> None:
+    """把未捕获异常写进日志（主线程 + 普通线程）。
+
+    为什么必要：字幕/电平表是由主窗口用 ``pythonw.exe`` 拉起来的**无控制台**
+    进程，traceback 没有 stderr 可去，等于凭空消失——用户只看到"点了没反应"。
+    日志是这种情况下唯一的证据。
+    """
+    logger = get_logger()
+
+    def _hook(exc_type, exc, tb) -> None:  # noqa: ANN001 - 与 sys.excepthook 同签名
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc, tb)
+            return
+        logger.critical("未捕获异常", exc_info=(exc_type, exc, tb))
+
+    sys.excepthook = _hook
+
+    def _thread_hook(args) -> None:  # noqa: ANN001 - threading.ExceptHookArgs
+        if issubclass(args.exc_type, SystemExit):
+            return
+        name = getattr(getattr(args, "thread", None), "name", "?")
+        logger.critical(
+            "线程未捕获异常（%s）",
+            name,
+            exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+        )
+
+    threading.excepthook = _thread_hook

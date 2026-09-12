@@ -6,7 +6,10 @@
 
 from __future__ import annotations
 
-from app.utils.log import scrub
+import logging
+import sys
+
+from app.utils.log import install_excepthook, scrub
 
 # 运行时拼接的假凭据（源码里不存在完整 token 形态）
 FAKE_OPENAI_KEY = "sk-" + "A1b2C3d4E5f6G7h8I9j0"
@@ -53,3 +56,66 @@ def test_scrub_leaves_normal_text_alone():
 def test_scrub_is_idempotent():
     once = scrub(f"api_key={FAKE_OPENAI_KEY}")
     assert scrub(once) == once
+
+
+class _Collect(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__()
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+
+def _capture_hook(fn) -> list[logging.LogRecord]:
+    """把日志抓下来看（lst logger 的 propagate=False，caplog 抓不到）。"""
+    logger = logging.getLogger("lst")
+    handler = _Collect()
+    logger.addHandler(handler)
+    try:
+        fn()
+    finally:
+        logger.removeHandler(handler)
+    return handler.records
+
+
+def test_excepthook_writes_uncaught_exception_to_log():
+    """pythonw 起的子进程没有控制台：未捕获异常必须落到日志，否则凭空消失。"""
+    original = sys.excepthook
+    try:
+        install_excepthook()
+        assert sys.excepthook is not original
+
+        def boom() -> None:
+            raise ValueError("字幕子进程崩了")
+
+        def run() -> None:
+            try:
+                boom()
+            except ValueError:
+                sys.excepthook(*sys.exc_info())
+
+        records = _capture_hook(run)
+        assert records, "excepthook 什么都没写"
+        assert "未捕获异常" in records[0].getMessage()
+        assert records[0].exc_info is not None
+    finally:
+        sys.excepthook = original
+
+
+def test_excepthook_keeps_keyboard_interrupt_quiet():
+    """Ctrl+C 不该被记成 CRITICAL 异常。"""
+    original = sys.excepthook
+    try:
+        install_excepthook()
+
+        def run() -> None:
+            try:
+                raise KeyboardInterrupt
+            except KeyboardInterrupt:
+                sys.excepthook(*sys.exc_info())
+
+        records = _capture_hook(run)
+    finally:
+        sys.excepthook = original
+    assert not [r for r in records if r.levelno >= logging.CRITICAL]
