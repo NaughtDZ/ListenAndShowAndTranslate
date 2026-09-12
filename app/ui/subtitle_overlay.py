@@ -29,6 +29,18 @@ log = get_logger(__name__)
 STATUS_HEIGHT = 16
 PADDING = 10
 
+MIN_WINDOW_HEIGHT = 30
+"""窗口最小高度（拖到再矮就没法看了）。"""
+
+MIN_FONT_SIZE = 8
+"""字号下限（pt）。"""
+
+MIN_EFFECTIVE_FONT_SCALE = 0.6
+"""自动缩小字号时最多缩到基准字号的 60%。
+
+再小就不如让长句换行/把最老那行顶走——字幕看不清等于没有。
+"""
+
 
 # CJK 禁则处理：这些标点不能出现在行首 / 行尾，否则会出现"孤零零一个句号"这种难看排版
 _NO_LINE_START = "。，、！？；：）〕」』】〉》”’…·%℃"
@@ -130,6 +142,12 @@ class SubtitleOverlay(QWidget):
         self._resize_origin: QPoint | None = None
         self._resize_geo = None
         self._click_through = self.config.click_through
+        # 实际绘制用的字号（基准字号 + 放不下时的动态缩小），由 _relayout() 算
+        self._draw_font_size = self.config.font_size
+        # 上一次真正生效的宽度。**不能拿 config.window_width 当基准**：它会被
+        # 屏幕宽度夹一次（小屏/竖屏时 config 1200 实际只有 760），
+        # 那样第一次拖高就会误判成"宽度变了"从而顺手改掉字号。
+        self._layout_width = 0
 
         # 对抗游戏抢 Z 序：定时重申置顶（计划书第 2.4 节）
         self._topmost_timer = QTimer(self)
@@ -209,8 +227,8 @@ class SubtitleOverlay(QWidget):
     # ------------------------------------------------------------------ #
     # 布局
     # ------------------------------------------------------------------ #
-    def _line_height(self) -> int:
-        fm = QFontMetrics(self._font(self.config.font_size, self.config.bold))
+    def _line_height(self, size: int | None = None) -> int:
+        fm = QFontMetrics(self._font(size or self._draw_font_size, self.config.bold))
         return int(fm.height() * self.config.line_spacing)
 
     def _max_subtitles(self) -> int:
@@ -223,31 +241,91 @@ class SubtitleOverlay(QWidget):
             per_sub *= 2
         return self._max_subtitles() * per_sub
 
-    def _relayout(self) -> None:
-        rows = self._max_rows()
-        auto_h = max(
-            40,
-            rows * self._line_height() + PADDING * 2
-            + (STATUS_HEIGHT if self.show_status else 0),
-        )
-        # 用户手动拖过高就沿用他的高度，否则按内容自动算
-        height = self.config.window_height if self.config.window_height > 0 else auto_h
+    def _min_font_size(self) -> int:
+        """动态缩字的下限。"""
+        return max(MIN_FONT_SIZE, int(round(self.config.font_size * MIN_EFFECTIVE_FONT_SCALE)))
+
+    def _target_width(self) -> int:
         width = self.config.window_width
         screen = self.screen()
         if screen is not None:
             geo = screen.availableGeometry()
             width = min(width, geo.width() - 40) if width else geo.width() - 40
-        self.resize(width, max(auto_h, height))
+        return max(120, width)
+
+    def _relayout(self) -> None:
+        """按"内容 + 用户拖出来的尺寸"重排窗口。
+
+        这里踩过两个坑（用户反馈，2026-09-12）：
+
+        1. **上下拖动无效**：以前高度写成 ``max(自动高度, window_height)``，而自动
+           高度按"最多可能几行"预留（3 条 × 每条 2 行 × 双语 = 12 行 ≈ 650px），
+           用户拖出来的任何高度都被它顶回去；而且只有 ``window_height == 0``
+           时才记录拖出来的高度，一旦存过一次就再也不更新 → 永远弹回原样。
+           现在：用户拖过就**完全听用户的**。
+        2. **顶上空一行**：自动高度以前按最大预留算，内容没那么多时底部对齐，
+           空出来的部分就堆在顶上。现在自动高度**按当前内容实际行数**算。
+
+        另外在这里统一决定绘制字号：窗口是用户拖出来的、内容又放不下时，
+        把字号动态缩小到刚好放得下（长句过去后下一帧自动回到基准字号）。
+        """
+        cfg = self.config
+        status_h = STATUS_HEIGHT if self.show_status else 0
+        width = self._target_width()
+        wrap_w = max(40, width - PADDING * 2)
+
+        # 一、自动高度 = 当前内容**实际**需要的高度（不再按最大行数预留）
+        content_rows = len(self._wrap_rows(wrap_w, cfg.font_size))
+        rows = max(1, min(self._max_rows(), content_rows))
+        auto_h = max(
+            MIN_WINDOW_HEIGHT,
+            rows * self._line_height(cfg.font_size) + PADDING * 2 + status_h,
+        )
+
+        # 二、定高度 + 定绘制字号
+        if cfg.window_height > 0:
+            height = max(MIN_WINDOW_HEIGHT, cfg.window_height)
+            body_h = height - PADDING * 2 - status_h
+            self._draw_font_size = self._fit_font_size(width, body_h)
+        else:
+            height = auto_h
+            self._draw_font_size = cfg.font_size
+
+        self.resize(width, height)
+        self._layout_width = width
         self._reposition()
 
-    def _build_draw_rows(self) -> list[tuple[str, bool, bool]]:
+    def _rows_height(self, wrap_w: int, font_size: int) -> int:
+        """当前内容在给定宽度/字号下需要多高。"""
+        return len(self._wrap_rows(wrap_w, font_size)) * self._line_height(font_size)
+
+    def _fit_font_size(self, width: int, body_h: int) -> int:
+        """放不下就把字号缩小到刚好放得下；放得下就用基准字号。
+
+        **每次都从基准字号重新算**，不记"上次缩了多少"——这样长句一被顶走，
+        下一帧字号就回到设置值（用户要的正是这个）。
+        """
+        base = self.config.font_size
+        if not getattr(self.config, "auto_shrink_font", True) or body_h <= 0:
+            return base
+        wrap_w = max(40, width - PADDING * 2)
+        if self._rows_height(wrap_w, base) <= body_h:
+            return base
+        floor = self._min_font_size()
+        for size in range(base - 1, floor - 1, -1):
+            if self._rows_height(wrap_w, size) <= body_h:
+                return size
+        return floor
+
+    def _wrap_rows(
+        self, width: int, font_size: int
+    ) -> list[tuple[str, bool, bool]]:
         """按需换行，返回 ``[(文本, 是否译文, 是否未定稿)]``。
 
         换行而不是截断——截断会丢内容（听小说时丢半句不可接受）。
         """
         cfg = self.config
-        width = max(40, self.width() - PADDING * 2)
-        fm = QFontMetrics(self._font(cfg.font_size, cfg.bold))
+        fm = QFontMetrics(self._font(font_size, cfg.bold))
         per_sub = cfg.lines_per_subtitle
 
         rows: list[tuple[str, bool, bool]] = []
@@ -264,6 +342,9 @@ class SubtitleOverlay(QWidget):
             for t in wrap_text(fm, self.state.partial_source, width, per_sub):
                 rows.append((t, False, True))
         return rows
+
+    def _build_draw_rows(self) -> list[tuple[str, bool, bool]]:
+        return self._wrap_rows(max(40, self.width() - PADDING * 2), self._draw_font_size)
 
     def _reposition(self) -> None:
         screen = self.screen()
@@ -321,12 +402,15 @@ class SubtitleOverlay(QWidget):
             p.drawRoundedRect(0, 0, w - 1, h - 1, 8, 8)
 
         rows = self._build_draw_rows()
-        row_h = self._line_height()
+        row_h = self._line_height(self._draw_font_size)
         status_h = STATUS_HEIGHT if self.show_status else 0
         body_h = h - PADDING * 2 - status_h
 
-        # 底部对齐：新行从下往上堆，像真正的字幕
-        visible_rows = rows[-self._max_rows():] if self._max_rows() else rows
+        # 底部对齐：新行从下往上堆，像真正的字幕。
+        # 只画窗口真装得下的行数——手动把窗口拖矮时优先牺牲最老的那几行，
+        # 而不是让最新的行掉到窗口外面去（那样用户会以为"字幕停了"）。
+        budget = max(1, int(body_h // row_h)) if row_h > 0 else 1
+        visible_rows = rows[-min(self._max_rows(), budget):]
         total = len(visible_rows) * row_h
         y = PADDING + max(0, body_h - total)
 
@@ -336,10 +420,10 @@ class SubtitleOverlay(QWidget):
             color = QColor(cfg.target_color if is_translation else cfg.source_color)
             if is_partial:
                 color.setAlphaF(0.6)   # 未定稿：半透明，一眼可辨
-            fm = QFontMetrics(self._font(cfg.font_size, cfg.bold))
+            fm = QFontMetrics(self._font(self._draw_font_size, cfg.bold))
             self._draw_outlined_text(
                 p, text, PADDING, y, w - PADDING * 2, row_h,
-                self._font(cfg.font_size, cfg.bold), color, cfg, fm,
+                self._font(self._draw_font_size, cfg.bold), color, cfg, fm,
             )
             y += row_h
 
@@ -435,9 +519,9 @@ class SubtitleOverlay(QWidget):
             if "r" in self._resize_edge:
                 right = max(right + delta.x(), left + 120)
             if "t" in self._resize_edge:
-                top = min(top + delta.y(), bottom - 30)
+                top = min(top + delta.y(), bottom - MIN_WINDOW_HEIGHT)
             if "b" in self._resize_edge:
-                bottom = max(bottom + delta.y(), top + 30)
+                bottom = max(bottom + delta.y(), top + MIN_WINDOW_HEIGHT)
             self.setGeometry(left, top, right - left, bottom - top)
             return
 
@@ -461,27 +545,59 @@ class SubtitleOverlay(QWidget):
             self.setCursor(cursors.get(edge, Qt.ArrowCursor))
 
     def mouseReleaseEvent(self, _event) -> None:  # noqa: N802
-        if self._resize_edge:
-            old_w = max(1, self.config.window_width)
-            new_w = self.width()
-            # 拉大窗口时字号跟着放大，否则用户还得再跑去改字号（用户反馈）
-            if self.config.auto_font_scale:
-                ratio = new_w / old_w
-                if abs(ratio - 1.0) > 0.02:
-                    before = self.config.font_size
-                    self.config.font_size = max(8, min(200, int(round(before * ratio))))
-                    if self._font_spin is not None:
-                        self._font_spin.blockSignals(True)
-                        self._font_spin.setValue(self.config.font_size)
-                        self._font_spin.blockSignals(False)
-                    log.info("字号随窗口缩放：%d → %d（宽 %d → %d）",
-                             before, self.config.font_size, old_w, new_w)
-                    self.config.window_height = 0
-                    self._relayout()
-            self.config.window_width = self.width()
-            if self.config.window_height == 0:
-                self.config.window_height = self.height()
-            log.info("字幕窗尺寸已记录：%dx%d，字号 %d",
-                     self.width(), self.height(), self.config.font_size)
+        edge = self._resize_edge
         self._resize_edge = ""
         self._drag_from = None
+        if edge:
+            self._apply_resize(edge)
+
+    def _apply_resize(self, edge: str) -> None:
+        """把拖出来的尺寸记进配置。
+
+        **宽和高都要记**，而且拖过的高度必须原样生效——用户反馈过两个坑：
+
+        1. 以前只在 ``window_height == 0`` 时记录高度，存过一次以后上下拖动就
+           再也不生效，下一帧 `_relayout()` 又用旧值顶回去 → "拉高拉低都弹回原样"；
+        2. 拖上边缘时窗口位置变了，但 ``custom_x/custom_y`` 没跟着更新，
+           下一次 `_reposition()` 又把 y 拉回去 → 往上拉也白拉。
+
+        ``auto_font_scale`` 打开时字号跟着**宽度**走；只拖上下时字号不动
+        （本来就该这样：高度变化不该改字号）。
+        """
+        cfg = self.config
+        old_w = max(1, self._layout_width or cfg.window_width)
+        new_w, dragged_h = self.width(), max(MIN_WINDOW_HEIGHT, self.height())
+        dragged_pos = (self.x(), self.y())
+        vertical = "t" in edge or "b" in edge
+
+        font_changed = False
+        if cfg.auto_font_scale and abs(new_w / old_w - 1.0) > 0.02:
+            before = cfg.font_size
+            cfg.font_size = max(MIN_FONT_SIZE, min(200, int(round(before * new_w / old_w))))
+            font_changed = cfg.font_size != before
+            if font_changed and self._font_spin is not None:
+                self._font_spin.blockSignals(True)
+                self._font_spin.setValue(cfg.font_size)
+                self._font_spin.blockSignals(False)
+            log.info("字号随窗口缩放：%d → %d（宽 %d → %d）",
+                     before, cfg.font_size, old_w, new_w)
+
+        cfg.window_width = new_w
+        if vertical:
+            # 用户明确拖了高度：以后就以这个高度为准（不再被自动高度顶回去）
+            cfg.window_height = dragged_h
+        elif font_changed:
+            # 只拖了宽、字号变了：高度交回自动，免得放大后的字被裁掉
+            cfg.window_height = 0
+        if cfg.position == "custom":
+            # 拖上边缘会改 y，先把新位置记下来，否则 _reposition() 又把 y 拉回去
+            cfg.custom_x, cfg.custom_y = dragged_pos
+
+        if font_changed and cfg.window_height > 0:
+            cfg.window_height = 0          # 先按新字号自动算一次
+            self._relayout()
+            cfg.window_height = max(dragged_h, self.height())
+
+        self._relayout()
+        log.info("字幕窗尺寸已记录：%dx%d，字号 %d（基准 %d）",
+                 self.width(), self.height(), self._draw_font_size, cfg.font_size)

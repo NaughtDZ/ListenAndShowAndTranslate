@@ -457,7 +457,14 @@ class OverlayConfig(BaseModel):
     """
 
     window_height: int = Field(default=0, ge=0, le=2000)
-    """手动调整过的高度；0 = 按条数与字号自动算。"""
+    """手动调整过的高度；0 = 按内容实际行数自动算。"""
+
+    auto_shrink_font: bool = True
+    """窗口装不下时把字号动态缩小到刚好放得下。
+
+    用户提的需求：自动换行 + 一行放不下就缩字，长句被顶走以后字号**自动回到
+    基准值**（基准值就是 ``font_size``）。所以实现上每次布局都从 ``font_size``
+    重新算，不做"记住上次缩了多少"。缩放下限是基准的 60%。"""
 
     lock_position: bool = True
     """锁定位置：勾上后不能拖动，避免玩游戏时误拖。"""

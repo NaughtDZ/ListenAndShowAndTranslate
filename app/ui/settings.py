@@ -113,6 +113,45 @@ class SettingsWindow(QWidget):
         root.addLayout(bottom)
 
     # ------------------------------------------------------------------ #
+    # 每次打开都同步一次"别处也能改"的字段
+    # ------------------------------------------------------------------ #
+    def showEvent(self, event) -> None:  # noqa: N802 - Qt 命名
+        super().showEvent(event)
+        self._sync_live_fields()
+
+    def _sync_live_fields(self) -> None:
+        """从配置里回读那些**在别处也会被改**的值。
+
+        字幕窗那边拖边框会改宽度/高度/字号，控制窗上有透明度滑杆和
+        原文/译文/双语、累积/单行的按钮。以前这个设置窗只在构造时读一次值，
+        用户拖完窗口再进来点一次「保存设置」，就会把拖出来的尺寸**覆盖回旧值**
+        ——表现出来就是"设置保存不了 / 改完又变回去"（用户反馈过同类问题）。
+
+        这里用 blockSignals 改控件，避免触发各种联动回调。
+        """
+        ov = self.config.overlay
+        for widget, value in (
+            (self.win_width, ov.window_width),
+            (self.win_height, ov.window_height),
+            (self.font_size, ov.font_size),
+        ):
+            widget.blockSignals(True)
+            widget.setValue(int(value))
+            widget.blockSignals(False)
+
+        self.win_opacity.blockSignals(True)
+        self.win_opacity.setValue(float(ov.window_opacity))
+        self.win_opacity.blockSignals(False)
+
+        for combo, value in (
+            (self.mode_combo, ov.display_mode),
+            (self.scroll_combo, ov.scroll_mode),
+        ):
+            combo.blockSignals(True)
+            combo.setCurrentIndex(max(0, combo.findData(value)))
+            combo.blockSignals(False)
+
+    # ------------------------------------------------------------------ #
     # 网络
     # ------------------------------------------------------------------ #
     def _build_network_tab(self) -> QWidget:
@@ -446,6 +485,20 @@ class SettingsWindow(QWidget):
         self.win_width.setSuffix(" px")
         form.addRow("字幕窗宽度", self.win_width)
 
+        # 高度：0 = 自动（正好装下当前内容，不留空行）；手动拖过就会写进这里
+        self.win_height = QSpinBox()
+        self.win_height.setRange(0, 2000)
+        self.win_height.setSpecialValueText("自动（按内容）")
+        self.win_height.setValue(ov.window_height)
+        self.win_height.setSuffix(" px")
+        form.addRow("字幕窗高度", self.win_height)
+        whh = QLabel(
+            "拖动字幕窗<b>上/下边缘</b>也会改这里。填 0 = 自动：窗口高度正好等于"
+            "当前字幕实际占的行数（不留空行）。"
+        )
+        whh.setWordWrap(True)
+        form.addRow("", whh)
+
         self.bg_opacity = QDoubleSpinBox()
         self.bg_opacity.setRange(0.0, 1.0)
         self.bg_opacity.setSingleStep(0.05)
@@ -474,6 +527,17 @@ class SettingsWindow(QWidget):
         )
         afh.setWordWrap(True)
         form.addRow("", afh)
+
+        self.shrink_font = QCheckBox("放不下时自动缩小字号（长句过去后自动恢复）")
+        self.shrink_font.setChecked(ov.auto_shrink_font)
+        form.addRow("", self.shrink_font)
+        sfh = QLabel(
+            "窗口装不下当前字幕时（比如你把窗口拖矮了、或者一次来了好几条），"
+            "把字号<b>动态</b>缩小到刚好放得下，最多缩到基准字号的 60%；"
+            "内容一少，字号自动回到上面设置的基准值。"
+        )
+        sfh.setWordWrap(True)
+        form.addRow("", sfh)
 
         self.always_on_top = QCheckBox("始终置顶（每 2 秒重申一次，对抗游戏抢 Z 序）")
         self.always_on_top.setChecked(ov.always_on_top)
@@ -708,10 +772,12 @@ class SettingsWindow(QWidget):
         c.overlay.font_size = self.font_size.value()
         c.overlay.outline_width = self.outline_width.value()
         c.overlay.window_width = self.win_width.value()
+        c.overlay.window_height = self.win_height.value()
         c.overlay.background_opacity = self.bg_opacity.value()
         c.overlay.window_opacity = self.win_opacity.value()
         c.overlay.resizable = self.resizable.isChecked()
         c.overlay.auto_font_scale = self.auto_font.isChecked()
+        c.overlay.auto_shrink_font = self.shrink_font.isChecked()
         c.overlay.always_on_top = self.always_on_top.isChecked()
         # 穿透/锁定 的入口在控制窗（避免两处重复），这里不覆盖它们的值
 

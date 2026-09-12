@@ -157,9 +157,13 @@ class SubtitleControlWindow(QWidget):
         from app.ui.lifecycle import open_settings_window
 
         # 保存后立即应用，而不是让用户重启程序（用户明确反馈过这点）
-        return open_settings_window(
+        win = open_settings_window(
             self, self.pipeline.config, on_saved=self._apply_settings_live
         )
+        # 拉宽字幕窗时字号会跟着变大：把设置窗里的"字号"框接上，
+        # 用户正开着设置窗时也能看到新值（否则要关掉再开才刷新）
+        self.overlay._font_spin = win.font_size
+        return win
 
     def _apply_settings_live(self) -> None:
         """设置保存后立刻生效。
