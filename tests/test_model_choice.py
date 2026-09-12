@@ -49,9 +49,10 @@ def no_save(monkeypatch):
 def test_supports_language_matches_registry():
     assert supports_language("zipformer-zh-int8", "zh") is True
     assert supports_language("zipformer-zh-int8", "ja") is False
-    assert supports_language("sensevoice-int8", "ja") is True
-    assert supports_language("sensevoice-int8", "ko") is True
-    assert supports_language("sensevoice-int8", "fr") is False
+    assert supports_language("parakeet-ja-int8", "ja") is True
+    assert supports_language("parakeet-ja-int8", "ko") is False   # 日语专用模型
+    assert supports_language("dolphin-base-ctc-int8", "ko") is True
+    assert supports_language("dolphin-base-ctc-int8", "yue") is True
     # Whisper turbo 声明了 "*"：什么语言都能塞
     assert supports_language("whisper-turbo-int8", "fr") is True
     assert supports_language("whisper-turbo-int8", "zh") is True
@@ -74,10 +75,12 @@ def test_non_asr_models_are_never_offered():
 
 def test_models_for_language_contents():
     ja = {m.id for m in models_for_language("ja")}
-    assert ja == {"sensevoice-int8", "whisper-turbo-int8"}
+    assert ja == {"sensevoice-int8", "parakeet-ja-int8", "dolphin-base-ctc-int8",
+                  "omnilingual-300m-ctc-int8", "whisper-turbo-int8"}
     zh = {m.id for m in models_for_language("zh")}
-    assert {"zipformer-zh-int8", "zipformer-zh-en-int8", "sensevoice-int8",
-            "whisper-turbo-int8"} <= zh
+    assert {"zipformer-zh-int8", "zipformer-zh-en-int8", "fire-red-asr2-ctc-zh_en-int8",
+            "dolphin-base-ctc-int8", "omnilingual-300m-ctc-int8",
+            "whisper-turbo-int8"} <= {m.id for m in models_for_language("zh")}
     assert "zipformer-en-int8" not in zh
 
 
@@ -86,7 +89,7 @@ def test_route_kwargs_follow_registry_engine():
     stream = route_kwargs_for("zipformer-zh-int8")
     assert stream["engine"] == "sherpa_stream"
     assert stream["streaming"] is True
-    offline = route_kwargs_for("sensevoice-int8")
+    offline = route_kwargs_for("dolphin-base-ctc-int8")
     assert offline["engine"] == "sherpa_offline"
     assert offline["streaming"] is False
     whisper = route_kwargs_for("whisper-turbo-int8")
@@ -95,7 +98,8 @@ def test_route_kwargs_follow_registry_engine():
 
 
 def test_pack_for_model_gives_download_hint():
-    assert pack_for_model("sensevoice-int8") == "ja-ko-yue"
+    assert pack_for_model("parakeet-ja-int8") == "ja-parakeet"
+    assert pack_for_model("dolphin-base-ctc-int8") == "dolphin"
     assert pack_for_model("zipformer-zh-int8") == "zh"
     assert pack_for_model("silero-vad") == "core"
     assert pack_for_model("chatgpt-asr") == ""
@@ -108,7 +112,7 @@ def test_default_route_is_the_builtin_table():
     asr = AppConfig().asr
     assert asr.default_route_for("ja").model == "sensevoice-int8"
     assert asr.default_route_for("zh").model == "zipformer-zh-int8"
-    # 没见过的语言落到 "*" 兜底（Whisper）
+    # 没见过的语言落到 "*" 兜底（Whisper turbo，99 语言）
     assert asr.default_route_for("fr").model == "whisper-turbo-int8"
 
 
@@ -211,7 +215,10 @@ def test_ui_only_offers_models_that_support_the_language(qapp, no_save, monkeypa
                 assert model_id in MODELS
                 assert supports_language(model_id, lang), (lang, model_id)
         ja = [win.model_combos["ja"].itemData(i) for i in range(win.model_combos["ja"].count())]
-        assert ja == ["", "sensevoice-int8", "whisper-turbo-int8"]
+        assert ja == [
+            "", "sensevoice-int8", "parakeet-ja-int8", "dolphin-base-ctc-int8",
+            "omnilingual-300m-ctc-int8", "whisper-turbo-int8",
+        ]
     finally:
         win.hide()
         win.deleteLater()
@@ -235,7 +242,7 @@ def test_ui_no_warning_when_everything_installed(qapp, no_save, monkeypatch):
     win = _settings(qapp, no_save, monkeypatch, installed=True)
     try:
         combo = win.model_combos["ja"]
-        combo.setCurrentIndex(combo.findData("whisper-turbo-int8"))
+        combo.setCurrentIndex(combo.findData("omnilingual-300m-ctc-int8"))
         assert win.model_hint.text() == ""
     finally:
         win.hide()
@@ -246,11 +253,11 @@ def test_ui_save_writes_route_with_registry_engine(qapp, no_save, monkeypatch):
     win = _settings(qapp, no_save, monkeypatch)
     try:
         combo = win.model_combos["ja"]
-        combo.setCurrentIndex(combo.findData("whisper-turbo-int8"))
+        combo.setCurrentIndex(combo.findData("omnilingual-300m-ctc-int8"))
         win._save()
         route = win.config.asr.route_for("ja")
-        assert route.model == "whisper-turbo-int8"
-        assert route.engine == "whispercpp"
+        assert route.model == "omnilingual-300m-ctc-int8"
+        assert route.engine == "sherpa_offline"  # 引擎大类由注册表决定
         assert route.streaming is False
     finally:
         win.hide()
@@ -261,7 +268,7 @@ def test_ui_auto_restores_default_route(qapp, no_save, monkeypatch):
     win = _settings(qapp, no_save, monkeypatch)
     try:
         combo = win.model_combos["ja"]
-        combo.setCurrentIndex(combo.findData("whisper-turbo-int8"))
+        combo.setCurrentIndex(combo.findData("omnilingual-300m-ctc-int8"))
         win._save()
         win.reset_model_choices()
         win._save()

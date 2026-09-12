@@ -215,7 +215,7 @@ def test_first_run_still_uses_hardware_recommendation(qapp, fake_hardware, monke
     try:
         wiz.page2.initializePage()
         assert wiz.page2.tier_buttons["mid"].isChecked()  # 假硬件推荐 mid
-        assert "ja-ko-yue" in wiz.page2.selected_packs()  # 按档位的推荐组合，不是"已装的"
+        assert "ja-ko-yue" in wiz.page2.selected_packs()  # 按档位的推荐组合，不是「已装的」
     finally:
         wiz.deleteLater()
 

@@ -62,6 +62,47 @@ CASES: list[tuple[str, tuple[str, ...], str]] = [
         "第一章、夜の列車。リンファンは手の中の青銅の鍵を強く握りしめ、"
         "「今度こそ、誰も失望させたりはしない」と小さくつぶやいた。",
     ),
+    # ---- 2026-09 换模型时补充：只有 1 句日语时字准率没有统计意义，
+    #      多来几句不同类型的（口语 / 长句 / 数字 / 专有名词）才好比模型。 ----
+    (
+        "ja",
+        ("Microsoft Haruka Desktop", "Microsoft Haruka", "Microsoft Ichiro"),
+        "「おい、そっちの車両は危ないぞ」と老人が叫んだが、"
+        "リンファンは振り返らずに走り続けた。",
+    ),
+    (
+        "ja",
+        ("Microsoft Ayumi", "Microsoft Sayaka", "Microsoft Haruka"),
+        "駅前の定食屋で九百八十円のカツ丼を食べながら、"
+        "彼は昨日の出来事を思い出していた。",
+    ),
+    (
+        "ja",
+        ("Microsoft Ichiro", "Microsoft Sayaka", "Microsoft Haruka"),
+        "雨の音が窓を打つ。遠くで雷が鳴り、部屋の明かりが一瞬だけ消えた。",
+    ),
+    (
+        "ja",
+        ("Microsoft Haruka Desktop", "Microsoft Sayaka", "Microsoft Ayumi"),
+        "「そんなはずはない」と彼女は首を横に振り、"
+        "震える手で手紙をもう一度読み返した。",
+    ),
+    (
+        "zh",
+        ("Microsoft Yaoyao", "Microsoft Huihui Desktop", "Microsoft Kangkang"),
+        "窗外下着雨，雨点敲在玻璃上，远处传来一阵闷雷，屋里的灯闪了一下。",
+    ),
+    (
+        "zh",
+        ("Microsoft Kangkang Desktop", "Microsoft Yaoyao", "Microsoft Huihui"),
+        "“别开玩笑了。”她摇了摇头，用发抖的手把那封信又读了一遍。",
+    ),
+    (
+        "en",
+        ("Microsoft David Desktop", "Microsoft David", "Microsoft Zira"),
+        "The rain tapped against the window while a distant thunder rolled,"
+        " and the lamp flickered once.",
+    ),
 ]
 
 

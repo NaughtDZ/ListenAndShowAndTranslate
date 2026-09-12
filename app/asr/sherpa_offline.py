@@ -20,11 +20,18 @@ import sherpa_onnx
 from app.asr.base import ASREvent, BaseEngine
 from app.asr.locate import require
 from app.asr.vad import SAMPLE_RATE, VadSegmenter
+from app.models.registry import MODELS
 from app.utils.log import get_logger
 
 log = get_logger(__name__)
 
 FEATURE_DIM = 80
+
+_CTC_FACTORIES: tuple[str, ...] = (
+    "nemo_ctc", "dolphin_ctc", "omnilingual_asr_ctc", "fire_red_asr_ctc",
+    "paraformer", "zipformer_ctc", "telespeech_ctc", "wenet_ctc",
+)
+"""单文件（model.onnx + tokens.txt）+ ``from_<factory>`` 的离线识别器家族。"""
 
 
 class SherpaOfflineEngine(BaseEngine):
@@ -69,14 +76,40 @@ class SherpaOfflineEngine(BaseEngine):
         )
         self._vad.load()
 
-        is_sense = "sensevoice" in self.model_id or "sense-voice" in self.model_id
-        is_whisper = "whisper" in self.model_id
-        # 不同模型族的文件结构不同：SenseVoice 单模型，Whisper 是 encoder+decoder
-        roles = ("model", "tokens") if is_sense else ("encoder", "decoder", "tokens")
+        # 用哪个 sherpa-onnx 工厂由**注册表**说了算（ModelSpec.factory）：
+        # 模型族的文件结构差别很大（Whisper 是 encoder+decoder，CTC 家族是单个
+        # model.onnx + tokens.txt），但"引擎大类"只有流式/分块两种，所以这层映射
+        # 放注册表，避免 LanguageRoute.engine 的 Literal 一直膨胀。
+        spec = MODELS.get(self.model_id)
+        factory = (spec.factory if spec else "") or self._guess_factory()
+
+        if factory == "whisper":
+            roles = ("encoder", "decoder", "tokens")
+        elif factory == "sense_voice":
+            roles = ("model", "tokens")
+        elif factory in _CTC_FACTORIES:
+            roles = ("model", "tokens")
+        else:
+            raise ValueError(
+                f"分块引擎不认识这个模型：{self.model_id}（factory={factory or '未声明'}）"
+            )
+
         paths = require(self.model_id, self.models_dir, roles=roles)
 
-        # SenseVoice：language 支持 auto/zh/en/ja/ko/yue，且自带语种识别
-        if is_sense:
+        if factory == "whisper":
+            # 注意：from_whisper **不接受** sample_rate / feature_dim
+            self._recognizer = sherpa_onnx.OfflineRecognizer.from_whisper(
+                encoder=str(paths["encoder"]),
+                decoder=str(paths["decoder"]),
+                tokens=str(paths["tokens"]),
+                num_threads=self.num_threads,
+                language=self.language if self.language not in ("zh-en", "") else "auto",
+                task="transcribe",
+                decoding_method="greedy_search",
+                provider=self.provider,
+            )
+        elif factory == "sense_voice":
+            # SenseVoice：language 支持 auto/zh/en/ja/ko/yue，自带语种识别与标点
             lang = self.language if self.language != "zh-en" else "auto"
             self._recognizer = sherpa_onnx.OfflineRecognizer.from_sense_voice(
                 model=str(paths["model"]),
@@ -89,22 +122,39 @@ class SherpaOfflineEngine(BaseEngine):
                 use_itn=self.use_itn,
                 provider=self.provider,
             )
-            log.info("加载 SenseVoice（model=%s language=%s）", self.model_id, lang)
-        elif is_whisper:
-            # 注意：from_whisper **不接受** sample_rate / feature_dim（与 SenseVoice 不同）
-            self._recognizer = sherpa_onnx.OfflineRecognizer.from_whisper(
-                encoder=str(paths["encoder"]),
-                decoder=str(paths["decoder"]),
+        else:
+            # NeMo CTC / Dolphin / Omnilingual / FireRedASR CTC 这一族：
+            # 单个 model.onnx + tokens.txt，参数完全一致（语言信息在模型内部）。
+            build = getattr(sherpa_onnx.OfflineRecognizer, f"from_{factory}", None)
+            if build is None:
+                raise ValueError(
+                    f"当前 sherpa-onnx 不支持 factory={factory}（模型 {self.model_id}）"
+                )
+            self._recognizer = build(
+                model=str(paths["model"]),
                 tokens=str(paths["tokens"]),
                 num_threads=self.num_threads,
-                language=self.language if self.language not in ("zh-en", "") else "auto",
-                task="transcribe",
-                decoding_method="greedy_search",
                 provider=self.provider,
             )
-            log.info("加载 Whisper（model=%s language=%s）", self.model_id, self.language)
-        else:
-            raise ValueError(f"分块引擎暂不支持该模型: {self.model_id}")
+        log.info(
+            "加载分块识别器：model=%s factory=%s language=%s provider=%s",
+            self.model_id, factory, self.language, self.provider,
+        )
+
+    def _guess_factory(self) -> str:
+        """注册表没写 factory 时的兜底推断（兼容老配置/手写模型 id）。"""
+        name = self.model_id.lower()
+        if "whisper" in name:
+            return "whisper"
+        if "parakeet" in name:
+            return "nemo_ctc"
+        if "dolphin" in name:
+            return "dolphin_ctc"
+        if "omnilingual" in name:
+            return "omnilingual_asr_ctc"
+        if "fire" in name:
+            return "fire_red_asr_ctc"
+        return ""
 
     # ------------------------------------------------------------------ #
     def _feed(self, samples: np.ndarray) -> list[ASREvent]:

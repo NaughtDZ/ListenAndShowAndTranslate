@@ -104,10 +104,10 @@ def test_japanese_routes_to_offline_engine():
 
 
 def test_japanese_korean_cantonese_share_one_model():
-    """SenseVoice 单模型覆盖 5 语言，不应让用户重复下载三份。"""
+    """SenseVoice 单模型覆盖 5 语言，ja/ko/yue 共用一份（2026-09 实测日语仍是它最优）。"""
     cfg = AppConfig()
     models = {cfg.asr.routing[k].model for k in ("ja", "ko", "yue")}
-    assert len(models) == 1, models
+    assert models == {"sensevoice-int8"}, models
 
 
 def test_chinese_and_english_are_streaming():

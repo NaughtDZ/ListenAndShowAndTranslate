@@ -239,9 +239,9 @@ class HardwarePage(QWizardPage):
         tier_box = QGroupBox("识别档位")
         tl = QVBoxLayout(tier_box)
         for tier, desc in (
-            ("low", "轻量档：CPU 为主，只装中文/日语包，占用最小"),
-            ("mid", "平衡档：中英日韩粤 + 语种识别，适合大多数机器"),
-            ("high", "性能档：再加 99 语言兜底（多下 1GB），显存充足时最舒服"),
+            ("low", "轻量档：CPU 为主，只装中文/日语专用包，占用最小"),
+            ("mid", "平衡档：中英日韩粤 + 1600 语言兜底 + 语种识别，适合大多数机器"),
+            ("high", "性能档：再加中文最准档与 Whisper 兜底（多下 1.7GB），显存充足时最舒服"),
         ):
             rb = QRadioButton(f"{tier_label(tier)} —— {desc}")
             self.tier_buttons[tier] = rb
@@ -308,10 +308,18 @@ class HardwarePage(QWizardPage):
 
     @staticmethod
     def _packs_for_tier(tier: str, hw=None) -> list[str]:
+        """档位 → 语言包组合（2026-09 换模型后重排）。
+
+        轻量：够听中文/日语；平衡：再加中英混说、韩粤与 1600 语言兜底；
+        性能：最后加"中文最准档"和保留的 Whisper 兜底（这两个最占地方）。
+        """
         return {
             "low": ["core", "zh", "ja-ko-yue"],
-            "mid": ["core", "zh", "zh-en", "ja-ko-yue", "lid"],
-            "high": ["core", "zh", "zh-en", "en", "ja-ko-yue", "multilingual", "lid"],
+            "mid": ["core", "zh", "zh-en", "ja-ko-yue", "multilingual", "lid"],
+            "high": [
+                "core", "zh", "zh-en", "ja-ko-yue", "multilingual", "lid",
+                "ja-parakeet", "dolphin", "omnilingual", "zh-accurate",
+            ],
         }.get(tier, list(getattr(hw, "recommended_packs", None) or ["core"]))
 
     def _refresh_packs(self) -> None:

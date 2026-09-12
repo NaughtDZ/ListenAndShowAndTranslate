@@ -83,7 +83,7 @@ def test_direct_url_overrides_hf():
 
 
 def test_file_spec_lookup():
-    spec = MODELS["sensevoice-int8"]
+    spec = MODELS["dolphin-base-ctc-int8"]
     assert spec.file_spec("model.int8.onnx") is not None
     assert spec.file_spec("不存在.onnx") is None
 
@@ -101,8 +101,10 @@ def test_default_packs_include_core_and_zh():
     defaults = default_pack_ids()
     assert "core" in defaults
     assert "zh" in defaults
-    # 默认不应把 1GB 的 Whisper 也勾上
-    assert "multilingual" not in defaults
+    # 默认要带上日语/韩粤这些新模型，但不该勾 1GB 的 Whisper 兜底包
+    assert "ja-ko-yue" in defaults and "multilingual" in defaults
+    # 可选候选（实测没赢过默认）不该默认勾上
+    assert "ja-parakeet" not in defaults and "zh-accurate" not in defaults
 
 
 def test_models_for_packs_dedupes_and_keeps_order():
@@ -117,17 +119,21 @@ def test_total_bytes_for_packs():
     assert 100_000_000 < total < 300_000_000
 
 
-def test_all_packs_total_is_about_1_8gb():
-    """用户勾了全部语言包，总量应约 1.8GB —— 这个数字会展示给用户。"""
+def test_all_packs_total_is_reported_to_user():
+    """用户勾了全部语言包的总量（会用 MB/GB 展示给他看）。
+
+    2026-09 换模型后是 ~3.3GB（新模型更准也更占地方；Whisper turbo 那 1GB
+    现在只在"全部勾上"时才包含）。
+    """
     total = total_bytes_for_packs(list(PACKS))
-    assert 1_700_000_000 < total < 1_900_000_000, total / 1e6
+    assert 3_400_000_000 < total < 4_200_000_000, total / 1e6
 
 
 def test_find_by_engine():
     streams = find_by_engine("sherpa_stream")
     assert all(m.engine == "sherpa_stream" for m in streams)
     ja = find_by_engine("sherpa_offline", "ja")
-    assert any("sensevoice" in m.id for m in ja)
+    assert any("sensevoice" in m.id for m in ja)  # 实测日语最优
 
 
 def test_human_size():

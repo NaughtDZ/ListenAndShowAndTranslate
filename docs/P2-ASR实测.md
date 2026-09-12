@@ -160,3 +160,88 @@ RTF 0.015 = 比实时快约 66 倍；0.443 = 比实时快约 2.3 倍。
 # 4) 按真实速度喂入，测实际字幕延迟
 .venv\Scripts\python.exe scripts\transcribe_wav.py data\test_speech\zh_00.wav --model zipformer-zh-int8 --realtime
 ```
+# --------------------------------------------------------------------------- #
+# 2026-09 模型换代实测：新模型 vs 旧模型，同一批音频对拍
+# --------------------------------------------------------------------------- #
+
+> 起因：用户找到 [Open ASR Leaderboard](https://huggingface.co/spaces/hf-audio/open_asr_leaderboard)，
+> 问"要不要换成榜上更好更快的模型"。**先看榜单覆盖范围**（读它的 `constants.py`）：
+> 它评的是 English + de/fr/it/es/pt/hi/nl —— **没有中文、日语、韩语、粤语**，
+> 所以它回答不了我们的问题；榜上第一梯队还是 NVIDIA NeMo（Parakeet/Canary），
+> 好在 sherpa-onnx 能跑 NeMo 的 onnx 导出（`from_nemo_ctc`），于是逐个核实并实测。
+
+## 1. 候选（都是 2025~2026 的新模型，sherpa-onnx 现成可跑）
+
+| 模型 | 体积 | 语言 | 说明 |
+|---|---|---|---|
+| `parakeet-ja-int8` | 626 MB | 日语专用 | NVIDIA NeMo Parakeet TDT-CTC 0.6B，官方卡 CER 6.4~13.2% |
+| `dolphin-base-ctc-int8` | 99 MB | 40 种亚洲语言 + 22 种中国方言 | DataoceanAI Dolphin |
+| `omnilingual-300m-ctc-int8` | 348 MB | 1600 种语言 | Meta Omnilingual ASR |
+| `fire-red-asr2-ctc-zh_en-int8` | 740 MB | 中 / 英 | FireRedASR2 CTC 版（2026-02） |
+
+全部通过 `--models install --packs ja-parakeet,dolphin,omnilingual,zh-accurate` 下载（走代理，40 MB/s）。
+
+## 2. 怎么测的（可复现）
+
+```powershell
+# 同一批音频：Windows SAPI 合成的 11 句（中 4 / 英 2 / 日 5），因此知道正确文本
+.venv\Scripts\python.exe scripts\gen_test_speech.py
+
+# 横向对拍（同一套引擎代码、同一台机器；字准率 = 1-CER，延迟 = 语音结束→字幕）
+.venv\Scripts\python.exe scripts\bench_asr_models.py --lang ja
+.venv\Scripts\python.exe scripts\bench_asr_models.py --lang zh
+.venv\Scripts\python.exe scripts\bench_asr_models.py --lang en
+```
+
+真实录音用 NVIDIA 仓库自带的 `test_ja_1/2.wav` + `transcripts.txt`
+（存在 `data/parakeet_ja_test/`，已核对参考文本；句子是口语化会议录音，和 TTS 完全两回事）。
+
+## 3. 结果
+
+**A. 合成语音（11 句，干净、标准发音）**
+
+| 语言 | 模型 | 字准率 | 计算 RTF | 延迟 |
+|---|---|---|---|---|
+| ja | **SenseVoice（旧默认）** | **94.8%** | 0.01 | ~400ms |
+| ja | Parakeet-ja（新） | 88.1% | 0.03 | 439ms |
+| ja | Dolphin（新） | 83.9% | 0.01 | 375ms |
+| ja | Whisper turbo | 74.0% | 0.30 | 1138ms |
+| ja | Omnilingual（新） | 71.7% | 0.04 | 457ms |
+| zh | **zipformer-zh（流式，默认）** | **97.6%** | 0.06 | 361ms |
+| zh | FireRedASR2-CTC（新） | 96.2% | 0.13 | 991ms |
+| zh | Dolphin（新） | 93.8% | 0.01 | 397ms |
+| zh | Omnilingual（新） | 86.6% | 0.05 | 596ms |
+| zh | Whisper turbo | 62.5% | 0.27 | 1600ms |
+| en | **zipformer-en（流式，默认）** | **98.3%** | 0.04 | 359ms |
+| en | Whisper turbo | 97.8% | 0.28 | 1061ms |
+| en | Omnilingual（新） | 93.3% | 0.05 | 444ms |
+| en | FireRedASR2-CTC（新） | 90.5% | 0.12 | 632ms |
+
+**B. 真实日语录音（2 句，口语化会议风格）**
+
+| 模型 | test_ja_1 | test_ja_2 | 平均 |
+|---|---|---|---|
+| **SenseVoice** | 83.7% | **92.1%** | **87.9%** |
+| Parakeet-ja | **85.7%** | 73.7% | 79.7% |
+| Dolphin | 36.7% | 89.5% | 63.1% |
+
+Parakeet-ja 在 `test_ja_2` 上**整句开头被吃掉**（"これはテスト文です" 没出），
+字幕场景里这种"丢半句"比错几个字更难受。
+
+## 4. 结论（和预期相反，所以写清楚）
+
+1. **日语没有换的必要**：SenseVoice（2024-07-17 版）在两套测试上都赢
+   Parakeet-ja（TTS 94.8% vs 88.1%；真实录音 87.9% vs 79.7%）。
+   官方卡上那组 CER 是 **NeMo TDT 解码器**的成绩，而我们能跑的只有 sherpa-onnx 的
+   **CTC 导出**，两者不是一回事——这大概就是落差的来源。
+2. **中文/英文也不该换**：流式 zipformer 分别 97.6% / 98.3%，比新来的分块模型更准**且延迟低 2~3 倍**
+   （361ms vs 991ms）。FireRedASR2 只在"想试方言/嘈杂音"时值得切。
+3. **Whisper turbo 保留**（用户要求）：英文 97.8%、延迟 1061ms，作为 99 语言兜底仍然合格。
+4. 新模型**没有删**，全部保留为**可在设置 → 模型里一键切换的候选**：
+   它们不是没价值，只是"在**我们的音频**上没赢"；想换随时换，换完引擎立刻重建。
+5. 韩语/粤语**未实测**：本机 SAPI 只有 zh-CN / en-US / ja-JP 音色，造不出带标注的
+   韩语/粤语音频；Dolphin 的亚洲语言覆盖仍然值得留着给用户自选。
+   Omnilingual（1600 语言）同理——没有小语种音频就不敢说它比 Whisper 好。
+
+> 这条正好印证计划书第 9 节的规矩：**模型效果的结论一律以本机实测为准，不凭榜单或模型卡下判断。**
+

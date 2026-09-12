@@ -25,7 +25,7 @@ from app.asr.postprocess import clean_text
 from app.asr.sherpa_offline import SherpaOfflineEngine
 from app.asr.sherpa_stream import SherpaStreamingEngine
 from app.config import ASRConfig, LanguageRoute
-from app.models.registry import supports_language
+from app.models.registry import MODELS, models_for_language, supports_language
 from app.utils.log import get_logger
 
 log = get_logger(__name__)
@@ -143,7 +143,7 @@ class LanguageRouter:
             )
         # sherpa_offline 与 whispercpp 都走分块离线识别器
         return SherpaOfflineEngine(
-            model_id=route.model or "sensevoice-int8",
+            model_id=route.model or "dolphin-base-ctc-int8",
             language=language,
             num_threads=self.num_threads,
             provider=self.provider,
@@ -154,19 +154,20 @@ class LanguageRouter:
         )
 
     def _fallback_chain(self, language: str) -> list[str]:
-        """返回按优先级排列的「模型 id 列表」用于降级尝试。"""
+        """降级链：主模型 → 注册表里其它**支持这门语言**的模型 → Whisper turbo 兜底。
+
+        以前这里写死"sensevoice 或 whisper 二选一"，换个模型就得改代码；
+        现在直接从注册表推（``models_for_language``），加新模型不用动这里，
+        而且每个语言的次选都是"真的支持它"的模型——不会拿中文模型去兜日语。
+        """
         chain: list[str] = []
         primary = self._active_route(language).model
         if primary:
             chain.append(primary)
-        # 配置的降级方向
-        if self.config.fallback_engine == "sherpa_offline":
-            chain.append("sensevoice-int8")
-        elif self.config.fallback_engine == "whispercpp":
-            chain.append("whisper-turbo-int8")
-        # 最后再兜一层 Whisper
+        chain.extend(m.id for m in models_for_language(language))
+        # 最后一道：用户要求保留的 Whisper turbo（99 语言）
         chain.append("whisper-turbo-int8")
-        return [m for m in dict.fromkeys(chain)]
+        return [m for m in dict.fromkeys(chain) if m and m in MODELS]
 
     def _create_engine_with_fallback(self, language: str) -> ASREngine | None:
         errors: list[str] = []

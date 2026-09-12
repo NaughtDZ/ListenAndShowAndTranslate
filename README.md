@@ -18,7 +18,7 @@ Windows 的声卡输出把"小说软件"和"游戏"的音频混在一起。本�
 |---|---|---|
 | 选择音频来源程序 | ✅ 已可用 | Windows 音频会话 API（音量合成器同款），只列**真正在发声**的进程 |
 | 进程级音频采集 | ✅ 已可用 | `proc-tap`（WASAPI 进程回环）+ 降混/重采样；隔离性 99.90% 实测见 `docs/P1-实测记录.md` |
-| 实时语音识别 | ✅ 已可用 | sherpa-onnx：流式 zipformer（中/英）+ SenseVoice（中英日韩粤）+ Whisper turbo；**可按语言手动指定模型**（只列能用的），见 `docs/识别模型选择.md` |
+| 实时语音识别 | ✅ 已可用 | sherpa-onnx：流式 zipformer（中/英）+ SenseVoice（中日韩粤，实测日语最优）+ Whisper turbo 兜底；**可按语言手动指定模型**（只列能用的）；2026-09 新增 Parakeet-ja / Dolphin / Omnilingual / FireRedASR2 四个候选，实测对拍见 `docs/P2-ASR实测.md` 末节 |
 | 悬浮字幕窗 | ✅ 已可用 | 透明 / 置顶 / 点击穿透 / 描边 / 字体自适应 / 可拖拽缩放；见 `docs/字幕窗尺寸与字号.md` |
 | 翻译（API + LLM + 本地） | ✅ 已可用 | 5 家官方 API + 谷歌/必应网页版 + OpenAI 兼容（LM Studio/Ollama）+ 术语表 + 缓存；见 `docs/P4-翻译实测.md` |
 | 静音阈值与电平表 | ✅ 已可用 | 启动窗口独立电平表窗口 + 设置里内嵌实时电平表；见 `docs/静音阈值与电平表.md` |
@@ -184,7 +184,11 @@ uv pip install --python .venv\Scripts\python.exe -r requirements.txt
 .venv\Scripts\python.exe scripts\preview_meter.py
 .venv\Scripts\python.exe scripts\preview_subtitle.py
 
-# 单元测试（300+ 项，含 Qt offscreen UI 用例）
+# 生成测试语音 + ASR 模型横向对拍（换模型前必跑，同一批音频/同一套引擎）
+.venv\Scripts\python.exe scripts\gen_test_speech.py
+.venv\Scripts\python.exe scripts\bench_asr_models.py --lang ja
+
+# 单元测试（350+ 项，含 Qt offscreen UI 用例）
 .venv\Scripts\python.exe -m pytest -q
 ```
 
@@ -237,7 +241,7 @@ uv pip install --python .venv\Scripts\python.exe -r requirements.txt
 | `计划书.md` | 立项计划书：环境实测、选型、架构、里程碑与验收标准、风险登记册 |
 | `docs/P0-实测记录.md` | P0 阶段的一手实测结论（含推翻假设的发现） |
 | `docs/P1-实测记录.md` | 音频链路实测：进程隔离、会话音量、静音判定、电平表 |
-| `docs/P2-ASR实测.md` | 各识别模型的中/英/日准确率与 RTF 实测（含"官方新版反而坏掉"的坑） |
+| `docs/P2-ASR实测.md` | 各识别模型的中/英/日准确率与 RTF 实测；**含 2026-09 新旧模型横向对拍**（结论：新的不一定更好） |
 | `docs/P4-翻译实测.md` | 翻译通道实测：LLM 批量、网页通道、官方 API 的可用性与耗时 |
 | `docs/延迟调节.md` | 延迟旋钮说明：每个参数换多少延迟、换多少准确率 |
 | `docs/显存与模型预算.md` | 显存占用、模型体积、量化档位、嵌入模型上下文与 KV 缓存预算 |

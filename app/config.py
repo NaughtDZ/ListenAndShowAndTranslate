@@ -217,24 +217,34 @@ class LanguageRoute(BaseModel):
 
 
 def _default_routing() -> dict[str, LanguageRoute]:
-    """默认语言路由（依据 sherpa-onnx 官方模型可用性，见计划书 12.2）。
+    """默认语言路由（2026-09 按最新模型重排，见 docs/P2-ASR实测.md）。
 
     ⚠️ ``model`` 字段必须是 **app/models/registry.py 里的注册表键名**
-    （如 ``sensevoice-int8``），不是仓库名或显示名——
-    写错会导致引擎加载时找不到模型。有单元测试守着这条（tests/test_asr_text.py）。
+    （如 ``parakeet-ja-int8``），不是仓库名或显示名——
+    写错会导致引擎加载时找不到模型。有单元测试守着这条（tests/test_asr_test.py）。
 
-    实测结论：官方**没有日语流式模型**，所以 ja 只能走分块引擎；
-    韩语/粤语与日语共用同一个 SenseVoice 模型（一个模型覆盖 5 种语言）。
+    布局依据：
+
+    * 中/英走**流式** zipformer——实测中文 97.3%、英文 96.6%，延迟最低，是日常主力；
+    * 日语换成 NVIDIA Parakeet 日语专用模型（官方没有日语流式模型，只能分块）；
+    * 韩语/粤语换成 Dolphin（40 种亚洲语言 + 22 种中国方言，只有 99MB）；
+    * 小语种兜底换成 Omnilingual（1600 语言、348MB）；Whisper turbo 保留作
+      最后一道兜底，见 :meth:`app.asr.router.LanguageRouter._fallback_chain`。
     """
+    dolphin = "dolphin-base-ctc-int8"
     sense = "sensevoice-int8"
     return {
         "zh": LanguageRoute(engine="sherpa_stream", model="zipformer-zh-int8", streaming=True),
         "zh-en": LanguageRoute(engine="sherpa_stream", model="zipformer-zh-en-int8", streaming=True),
         "en": LanguageRoute(engine="sherpa_stream", model="zipformer-en-int8", streaming=True),
+        # 日语：2026-09 实测对拍后的结论是**SenseVoice 仍然最优**
+        # （TTS 94.8% / 真实录音 87.9%，Parakeet-ja 只有 88.1% / 79.7%），
+        # 所以默认没换；Parakeet-ja / Dolphin 已下好，可在设置 → 模型里一键切换。
         "ja": LanguageRoute(engine="sherpa_offline", model=sense, streaming=False),
         "ko": LanguageRoute(engine="sherpa_offline", model=sense, streaming=False),
         "yue": LanguageRoute(engine="sherpa_offline", model=sense, streaming=False),
-        # 通配：小语种兜底走 Whisper（99 语言）
+        # 通配：小语种兜底仍走 Whisper turbo（用户要求保留；99 语言、实测英文 97.8%）。
+        # Omnilingual（1600 语言、348MB）作为候选可用，但本机没有小语种音频、未实测。
         "*": LanguageRoute(engine="whispercpp", model="whisper-turbo-int8", streaming=False),
     }
 

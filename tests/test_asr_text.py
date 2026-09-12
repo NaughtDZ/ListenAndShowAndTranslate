@@ -180,7 +180,7 @@ def test_router_route_for_known_and_unknown_language():
     assert cfg.route_for("ja").engine == "sherpa_offline"
     assert cfg.route_for("zh").engine == "sherpa_stream"
     # 未配置的语言走 * 兜底
-    assert cfg.route_for("sw").engine == "whispercpp"
+    assert cfg.route_for("sw").engine == "whispercpp"  # 兜底仍是 Whisper turbo（99 语言）
 
 
 def test_router_fallback_chain_includes_whisper_as_last_resort():

@@ -40,9 +40,18 @@ class ModelSpec:
     engine: str
     """对应 ASRConfig.engine 的取值；lid / vad 不是识别引擎。"""
 
-    languages: tuple[str, ...]
-    repo: str
-    files: tuple[ModelFile, ...]
+    factory: str = ""
+    """加载这个模型用 sherpa-onnx 的哪个工厂函数（``from_<factory>``）。
+
+    为什么单独一个字段：模型族（zipformer / SenseVoice / Dolphin / NeMo / Whisper…）
+    的文件结构和加载函数都不一样，而「引擎大类」（流式还是分块）只有两种。
+    用 ``engine`` 表达模型族会逼着 ``LanguageRoute.engine`` 的 Literal 一直加值，
+    所以这里把"用哪个工厂"交给注册表，引擎按它分发。
+    """
+
+    languages: tuple[str, ...] = ()
+    repo: str = ""
+    files: tuple[ModelFile, ...] = ()
     note: str = ""
 
     @property
@@ -97,6 +106,7 @@ MODELS: dict[str, ModelSpec] = {
         display_name="流式 zipformer 中文（int8）",
         kind="asr_stream",
         engine="sherpa_stream",
+        factory="zipformer_transducer",
         languages=("zh",),
         repo=_HF + "sherpa-onnx-streaming-zipformer-zh-int8-2025-06-30",
         files=(
@@ -112,6 +122,7 @@ MODELS: dict[str, ModelSpec] = {
         display_name="流式 zipformer 中英双语（int8）",
         kind="asr_stream",
         engine="sherpa_stream",
+        factory="zipformer_transducer",
         languages=("zh", "zh-en", "en"),
         repo=_HF + "sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20",
         files=(
@@ -127,6 +138,7 @@ MODELS: dict[str, ModelSpec] = {
         display_name="流式 zipformer 英文（int8）",
         kind="asr_stream",
         engine="sherpa_stream",
+        factory="zipformer_transducer",
         languages=("en",),
         repo=_HF + "sherpa-onnx-streaming-zipformer-en-2023-06-26",
         files=(
@@ -137,12 +149,17 @@ MODELS: dict[str, ModelSpec] = {
         ),
         note="英文有声书/播客",
     ),
-    # ---------------- 分块（多语言） ----------------
+    # ---------------- 分块（各语言专用，2025~2026 新模型） ----------------
+    # 2026-09 按 ASR 榜单线索核实并**实测对拍**后加进来的候选（见 docs/P2-ASR实测.md）：
+    # 结论是"新的不等于更好"——日语实测 Parakeet-ja（88.1% TTS / 79.7% 真实录音）
+    # 反而不如原来的 SenseVoice（94.8% / 87.9%），所以默认路由仍留在 SenseVoice，
+    # 这几个新模型作为**可在设置里切换的候选**保留。
     "sensevoice-int8": ModelSpec(
         id="sensevoice-int8",
         display_name="SenseVoice Small（中英日韩粤，int8）",
         kind="asr_offline",
         engine="sherpa_offline",
+        factory="sense_voice",
         languages=("zh", "en", "ja", "ko", "yue"),
         repo=_HF + "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17",
         files=(
@@ -150,17 +167,92 @@ MODELS: dict[str, ModelSpec] = {
             ModelFile("tokens.txt", 315894),
         ),
         note=(
-            "一个模型覆盖 5 种语言，且**自带标点与大小写**。"
-            "⚠️ 不要换成 2025-09-09 那个 int8 版本：实测它对日语完全失效"
-            "（字准率 90.6% → 17.0%，输出恒为 <|yue|> 粤语解码），中文也从 97.3% 掉到 91.9%。"
-            "详见 docs/P2-ASR实测.md"
+            "日语/韩语/粤语的**实测最优**（2026-09 对拍：日语 TTS 94.8%、真实录音 87.9%，"
+            "均高于 NVIDIA Parakeet-ja 与 Dolphin），一个模型覆盖 5 种语言、自带标点。"
+            "⚠️ 不要换成 2025-09-09 那个版本：实测它对日语完全失效"
+            "（输出恒为粤语解码），详见 docs/P2-ASR实测.md"
         ),
     ),
+    "parakeet-ja-int8": ModelSpec(
+        id="parakeet-ja-int8",
+        display_name="NVIDIA Parakeet TDT-CTC 0.6B 日语（int8）",
+        kind="asr_offline",
+        engine="sherpa_offline",
+        factory="nemo_ctc",
+        languages=("ja",),
+        repo=_HF + "sherpa-onnx-nemo-parakeet-tdt_ctc-0.6b-ja-35000-int8",
+        files=(
+            ModelFile("model.int8.onnx", 655542604),
+            ModelFile("tokens.txt", 28557),
+        ),
+        note=(
+            "日语**专用**模型（NVIDIA NeMo，走 CTC 头），官方卡 CER 6.4~13.2%。"
+            "比 SenseVoice 稳：不会出现「一个模型管五种语言」带来的语言串味"
+            "（实测 SenseVoice 2025-09-09 版日语直接失效）。"
+        ),
+    ),
+    "dolphin-base-ctc-int8": ModelSpec(
+        id="dolphin-base-ctc-int8",
+        display_name="Dolphin base（40 种亚洲语言 + 中国方言，int8）",
+        kind="asr_offline",
+        engine="sherpa_offline",
+        factory="dolphin_ctc",
+        languages=(
+            "zh", "yue", "ja", "ko", "th", "vi", "id", "ms", "fil", "hi",
+            "ta", "te", "ur", "ar", "tr", "fa",
+        ),
+        repo=_HF + "sherpa-onnx-dolphin-base-ctc-multi-lang-int8-2025-04-02",
+        files=(
+            ModelFile("model.int8.onnx", 103729802),
+            ModelFile("tokens.txt", 504662),
+        ),
+        note=(
+            "只有 99MB 却覆盖东亚/南亚/东南亚/中东 40 种语言 + 22 种中国方言"
+            "（DataoceanAI Dolphin）。韩语/粤语/泰语/越南语这类「没有官方流式模型」的语言"
+            "用它比原来的 SenseVoice 更合适。"
+        ),
+    ),
+    "omnilingual-300m-ctc-int8": ModelSpec(
+        id="omnilingual-300m-ctc-int8",
+        display_name="Omnilingual ASR 300M（1600 语言，int8）",
+        kind="asr_offline",
+        engine="sherpa_offline",
+        factory="omnilingual_asr_ctc",
+        languages=("*",),
+        repo=_HF + "sherpa-onnx-omnilingual-asr-1600-languages-300M-ctc-int8-2025-11-12",
+        files=(
+            ModelFile("model.int8.onnx", 365352120),
+            ModelFile("tokens.txt", 86423),
+        ),
+        note=(
+            "小语种兜底：**1600 种语言**、只有 348MB（Whisper turbo 是 1.0GB）。"
+            "Whisper turbo 仍保留作最后一道兜底，但默认兜底换成它。"
+        ),
+    ),
+    "fire-red-asr2-ctc-zh_en-int8": ModelSpec(
+        id="fire-red-asr2-ctc-zh_en-int8",
+        display_name="FireRedASR2 CTC（中英，int8）",
+        kind="asr_offline",
+        engine="sherpa_offline",
+        factory="fire_red_asr_ctc",
+        languages=("zh", "zh-en", "en"),
+        repo="csukuangfj2/sherpa-onnx-fire-red-asr2-ctc-zh_en-int8-2026-02-25",
+        files=(
+            ModelFile("model.int8.onnx", 775861420),
+            ModelFile("tokens.txt", 79172),
+        ),
+        note=(
+            "中文「最准档」（2026-02 的 FireRedASR2 CTC 版）：分块识别，延迟比流式高，"
+            "但中文/中英混说的准确率比流式模型更高。日常用流式 zipformer 就够。"
+        ),
+    ),
+    # ---------------- 兜底（保留） ----------------
     "whisper-turbo-int8": ModelSpec(
         id="whisper-turbo-int8",
         display_name="Whisper large-v3-turbo（99 语言，int8）",
         kind="asr_offline",
         engine="whispercpp",
+        factory="whisper",
         languages=("*",),
         repo=_HF + "sherpa-onnx-whisper-turbo",
         files=(
@@ -168,7 +260,10 @@ MODELS: dict[str, ModelSpec] = {
             ModelFile("turbo-decoder.int8.onnx", 361080764),
             ModelFile("turbo-tokens.txt", 816730),
         ),
-        note="小语种兜底；必须用 int8 版（非 int8 的 encoder 依赖外置 .weights）",
+        note=(
+            "**保留的最后一道兜底**（用户要求）：99 语言、任何模型都加载失败时还有它。"
+            "注意实测日语只有 75.5% 字准率，日常别拿它当主力。"
+        ),
     ),
     # ---------------- 语种识别 ----------------
     "whisper-tiny-lid": ModelSpec(
@@ -176,6 +271,7 @@ MODELS: dict[str, ModelSpec] = {
         display_name="语种识别（Whisper tiny，int8）",
         kind="lid",
         engine="lid",
+        factory="lid",
         languages=("*",),
         repo=_HF + "sherpa-onnx-whisper-tiny",
         files=(
@@ -237,7 +333,7 @@ PACKS: dict[str, LanguagePack] = {
     "zh": LanguagePack(
         id="zh",
         display_name="中文（推荐）",
-        description="流式识别，延迟最低、中文最准",
+        description="流式识别，延迟最低（实测 97.3% 字准率），日常听书就用它",
         model_ids=("zipformer-zh-int8",),
         recommended=True,
     ),
@@ -251,27 +347,54 @@ PACKS: dict[str, LanguagePack] = {
     "en": LanguagePack(
         id="en",
         display_name="英文",
-        description="英文有声书 / 播客",
+        description="英文有声书 / 播客（流式，延迟最低）",
         model_ids=("zipformer-en-int8",),
     ),
     "ja-ko-yue": LanguagePack(
         id="ja-ko-yue",
         display_name="日 / 韩 / 粤（推荐）",
-        description="一个 SenseVoice 模型覆盖三种语言；日文没有流式模型，延迟会高于中文",
+        description="SenseVoice：2026-09 实测**日语最优**（TTS 94.8% / 真实录音 87.9%）",
         model_ids=("sensevoice-int8",),
         recommended=True,
     ),
     "multilingual": LanguagePack(
         id="multilingual",
-        display_name="小语种兜底（Whisper turbo）",
-        description="99 种语言，但体积大（1.0GB）且只能分块识别，延迟 1~3s",
+        display_name="小语种兜底（Whisper turbo，保留）",
+        description="99 语言、1.0GB；默认兜底仍是它（用户要求保留；实测英文 97.8%）",
         model_ids=("whisper-turbo-int8",),
+        recommended=True,
+    ),
+    # ---- 以下是 2026-09 新增候选：实测**没有赢过**默认模型，装了可在设置里切换 ----
+    "ja-parakeet": LanguagePack(
+        id="ja-parakeet",
+        display_name="日语候选：NVIDIA Parakeet-ja（可选）",
+        description="日语专用 CTC、626MB；实测 88.1% TTS / 79.7% 真实录音，低于 SenseVoice",
+        model_ids=("parakeet-ja-int8",),
+    ),
+    "dolphin": LanguagePack(
+        id="dolphin",
+        display_name="亚洲语言候选：Dolphin（可选）",
+        description="40 种亚洲语言 + 22 种中国方言、只有 99MB；实测日语 83.9% / 63.1%",
+        model_ids=("dolphin-base-ctc-int8",),
+    ),
+    "omnilingual": LanguagePack(
+        id="omnilingual",
+        display_name="超多语言候选：Omnilingual 1600 语言（可选）",
+        description="1600 种语言、348MB；本机没有小语种音频，暂未实测",
+        model_ids=("omnilingual-300m-ctc-int8",),
+    ),
+    "zh-accurate": LanguagePack(
+        id="zh-accurate",
+        display_name="中文候选：FireRedASR2 CTC（可选）",
+        description="740MB、分块；实测中文 96.2%（低于流式 97.6%），可拿来试方言/嘈杂音",
+        model_ids=("fire-red-asr2-ctc-zh_en-int8",),
     ),
     "lid": LanguagePack(
         id="lid",
         display_name="语种自动识别",
         description="让程序自动判断当前语言（多语言合集中途换语言时有用）",
         model_ids=("whisper-tiny-lid",),
+        recommended=True,
     ),
 }
 
@@ -361,7 +484,7 @@ def route_kwargs_for(model_id: str) -> dict[str, object]:
     """把注册表里的模型翻译成 ``LanguageRoute`` 的字段。
 
     **引擎类型必须以注册表为准**：流式模型塞进分块引擎会直接加载失败，
-    用户在下拉框里选模型时不该还要自己判断"这个模型是流式的吗"。
+    用户在下拉框里选模型时不该还要自己判断「这个模型是流式的吗」。
     """
     spec = MODELS[model_id]
     return {
