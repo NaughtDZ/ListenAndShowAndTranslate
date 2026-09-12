@@ -62,6 +62,12 @@ class LauncherWindow(QWidget):
         self.start_btn.clicked.connect(self._start)
         self.settings_btn = QPushButton("设置…")
         self.settings_btn.clicked.connect(self._open_settings)
+        self.wizard_btn = QPushButton("向导…")
+        self.wizard_btn.setToolTip(
+            "重新运行「首次运行向导」：改语言包（要下哪些模型）、重选档位、补下模型。\n"
+            "会用你当前的配置预填，只改你想改的；已装好的模型会自动跳过下载。"
+        )
+        self.wizard_btn.clicked.connect(self._open_wizard)
         self.meter_btn = QPushButton("电平表")
         self.meter_btn.clicked.connect(self._open_meter)
 
@@ -69,6 +75,7 @@ class LauncherWindow(QWidget):
         row.addWidget(self.refresh_btn)
         row.addStretch(1)
         row.addWidget(self.meter_btn)
+        row.addWidget(self.wizard_btn)
         row.addWidget(self.settings_btn)
         row.addWidget(self.start_btn)
 
@@ -209,6 +216,25 @@ class LauncherWindow(QWidget):
     def _open_settings(self) -> None:
         """打开（复用）设置窗。**只有关这个窗不会退出程序**。"""
         open_settings_window(self, self.config)
+
+    def _open_wizard(self) -> None:
+        """重新跑首次运行向导（改语言包 / 补下载模型 / 重选档位）。
+
+        用户用了一阵子之后想换模型，以前**没有入口**（只在 ``first_run_done``
+        为假时自动跑一次），只能改配置文件——这条就是补那个入口。
+
+        向导直接吃本窗口这份 config 对象，并且会按当前配置预填，所以：
+        改完立刻生效、没改的东西不会被清回默认值。
+        """
+        from app.ui.wizard import run_wizard
+
+        accepted = run_wizard(self.config) == 1
+        if accepted:
+            self.hint.setText(
+                "✅ 向导已完成，配置已更新（模型按需下载）。"
+                "现在选一个正在播放的程序，点「开始字幕」。"
+            )
+        self.refresh()
 
     def _quit(self) -> None:
         """显式退出：关主窗口 / 退出按钮都走这里。"""

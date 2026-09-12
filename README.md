@@ -22,7 +22,7 @@ Windows 的声卡输出把"小说软件"和"游戏"的音频混在一起。本�
 | 悬浮字幕窗 | ✅ 已可用 | 透明 / 置顶 / 点击穿透 / 描边 / 字体自适应 / 可拖拽缩放；见 `docs/字幕窗尺寸与字号.md` |
 | 翻译（API + LLM + 本地） | ✅ 已可用 | 5 家官方 API + 谷歌/必应网页版 + OpenAI 兼容（LM Studio/Ollama）+ 术语表 + 缓存；见 `docs/P4-翻译实测.md` |
 | 静音阈值与电平表 | ✅ 已可用 | 启动窗口独立电平表窗口 + 设置里内嵌实时电平表；见 `docs/静音阈值与电平表.md` |
-| 首次运行向导 | ✅ 已可用 | 硬件探测 → 推荐档位 → 一键下模型 → 代理/翻译通道配置 |
+| 首次运行向导 | ✅ 已可用 | 硬件探测 → 推荐档位 → 一键下模型 → 代理/翻译通道配置；**随时可重跑换模型**，见 `docs/向导与重新配置.md` |
 | 系统托盘 / 窗口生命周期 | ✅ 已可用 | 控制窗可收进托盘，退出行为有明确约定；见 `docs/窗口与退出行为.md` |
 | 前端 exe（无控制台黑窗） | ✅ 已可用 | `听显译.exe`，见下面「启动方式」 |
 | 字幕历史与 srt 导出 | 🚧 部分 | 数据模型与 `to_srt()` 已有，UI 入口待接线 |
@@ -39,7 +39,7 @@ Windows 的声卡输出把"小说软件"和"游戏"的音频混在一起。本�
 
 | 入口 | 有没有控制台窗口 | 说明 |
 |---|---|---|
-| **`听显译.exe`**（推荐） | **没有** | 前端启动器：检查环境 → 用 `pythonw.exe` 拉起主程序 → 自己立刻退出。也能带参数：`听显译.exe --settings`、`听显译.exe --list-audio` |
+| **`听显译.exe`**（推荐） | **没有** | 前端启动器：检查环境 → 用 `pythonw.exe` 拉起主程序 → 自己立刻退出。也能带参数：`听显译.exe --settings`、`听显译.exe --list-audio`、`听显译.exe --wizard` |
 | `启动.bat` | 有（会一直留一个黑框） | 命令行入口，方便看日志/传参数；首次装环境也走它 |
 | `首次安装.bat` | 有 | 只负责创建 `.venv` 并装依赖（`启动.bat` 发现没环境时也会引导过来） |
 
@@ -96,6 +96,22 @@ uv pip install --python .venv\Scripts\python.exe -r requirements.txt
 点击穿透、暂停，并可「最小化到托盘」（关闭控制窗才会退出程序，见
 `docs/窗口与退出行为.md`）。
 
+### 想换识别模型 / 补下载语言包？
+
+三个入口，随便挑一个（细节见 `docs/向导与重新配置.md`）：
+
+| 入口 | 什么时候用 |
+|---|---|
+| 启动窗口 →「**向导…**」按钮 | 还没开始出字幕时，最直观 |
+| 设置 → 识别 →「**重新运行「首次运行向导」…**」 | 字幕正在跑时也能用；完成后自动重建识别/翻译引擎，**不用重启** |
+| `听显译.exe --wizard` | 脚本化 / 排障 |
+
+重跑向导时**默认值就是你的现状**：语言包默认勾"已经装好"的那些（提示会写清
+"其中 N 个已经装好，会自动跳过"）、档位取你当前的延迟档位、代理与翻译通道按
+现状预填。所以"只想再补一个日语包"不会顺手把代理和翻译通道清掉；
+向导里表示不了的官方 API 通道（百度/有道/Azure/谷歌/DeepL）会显示成
+「保持当前：…」原样保留。
+
 ### 命令行用法
 
 ```powershell
@@ -113,9 +129,14 @@ uv pip install --python .venv\Scripts\python.exe -r requirements.txt
 .venv\Scripts\python.exe main.py --meter 43052
 .venv\Scripts\python.exe main.py --meter 43052 --threshold-db -70
 
-# 直接开设置窗 / 录一段 16k 单声道 WAV
+# 直接开设置窗 / 重跑配置向导 / 录一段 16k 单声道 WAV
 .venv\Scripts\python.exe main.py --settings
+.venv\Scripts\python.exe main.py --wizard
 .venv\Scripts\python.exe main.py --capture 43052 --record test.wav --seconds 3
+
+# 模型管理（不走界面）：列出 / 安装指定语言包 / 校验
+.venv\Scripts\python.exe main.py --models list
+.venv\Scripts\python.exe main.py --models install --packs zh,ja-ko-yue
 ```
 
 `--list-audio` 输出示例（真实运行结果）：
@@ -218,6 +239,7 @@ uv pip install --python .venv\Scripts\python.exe -r requirements.txt
 | `docs/窗口与退出行为.md` | 谁能关掉程序、托盘/设置窗/✕ 的行为，以及 Qt 的退出坑 |
 | `docs/字幕窗尺寸与字号.md` | 拖边框缩放、自动高度（不留空行）、放不下时动态缩小字号 |
 | `docs/静音阈值与电平表.md` | 静音阈值的实测参考、三个调节入口、设置里的实时电平表 |
+| `docs/向导与重新配置.md` | 换模型/补下载的三个入口，以及"重跑不许把设置清回默认值"的约定 |
 | `docs/第三方许可.md` | 依赖许可清单（LGPL/GPL 组件与商用注意点） |
 
 ## 目录结构（主要部分）

@@ -25,6 +25,7 @@ from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QDialog,
     QDoubleSpinBox,
     QFormLayout,
     QGroupBox,
@@ -209,6 +210,30 @@ class SettingsWindow(QWidget):
         self._level_status = text
         self.threshold_meter.set_texts("当前采集目标 · 实时电平", text)
 
+    # ------------------------------------------------------------------ #
+    # 重新运行首次运行向导（换模型 / 补下载）
+    # ------------------------------------------------------------------ #
+    def _open_wizard(self) -> None:
+        """重跑首次运行向导：改语言包、补下模型、重选档位。
+
+        用户反馈过「跑了几次之后想重新跑向导来改模型下载，但找不到入口」——
+        以前只有 ``first_run_done`` 为假时才会自动跑一次，之后只能改配置文件。
+
+        这里直接把**本窗口这份 config 对象**交给向导：向导按它预填、改完存盘，
+        回来再发 ``saved``（控制窗接了这个信号 → 立刻重建识别/翻译引擎），
+        所以既不用重启程序，也不会出现"两份配置各说各话"。
+        """
+        from app.ui.wizard import run_wizard
+
+        accepted = run_wizard(self.config) == int(QDialog.DialogCode.Accepted)
+        # 向导可能改了延迟档位/代理/翻译通道 → 把控件同步回来
+        self._sync_live_fields()
+        if accepted:
+            self.status.setText("✅ 向导已完成并保存，正在按新配置重建识别/翻译…")
+            self.saved.emit()
+        else:
+            self.status.setText("向导已取消（配置未改动）")
+
     def _sync_live_fields(self) -> None:
         """从配置里回读那些**在别处也会被改**的值。
 
@@ -247,6 +272,36 @@ class SettingsWindow(QWidget):
         self.silence_db.setValue(float(self.config.audio.silence_rms_threshold_db))
         self.silence_db.blockSignals(False)
         self._on_silence_db_changed(self.silence_db.value())
+
+        self.proxy_edit.blockSignals(True)
+        self.proxy_edit.setText(self.config.proxy)
+        self.proxy_edit.blockSignals(False)
+
+        # 翻译通道也回读：向导（重跑）会改它
+        idx = self.provider_combo.findData(self.config.translate.provider)
+        if idx >= 0 and idx != self.provider_combo.currentIndex():
+            self.provider_combo.setCurrentIndex(idx)  # 让它重建凭据字段
+
+        self._sync_latency_fields()
+
+    def _sync_latency_fields(self) -> None:
+        """延迟档位与五条旋钮从配置回读（重新配置向导可能刚改过它们）。"""
+        asr = self.config.asr
+        for pid, btn in self.preset_buttons.items():
+            btn.blockSignals(True)
+            btn.setChecked(pid == asr.latency_preset)
+            btn.blockSignals(False)
+        for knob in LATENCY_KNOBS:
+            slider = self.knob_sliders.get(knob.field)
+            if slider is None:
+                continue
+            slider.blockSignals(True)
+            slider.setValue(self._knob_value(knob))
+            slider.blockSignals(False)
+            label = self.knob_labels.get(knob.field)
+            if label is not None:
+                label.setText(f"{slider.value()} ms")
+        self._refresh_preset_label()
 
     # ------------------------------------------------------------------ #
     # 网络
@@ -500,6 +555,7 @@ class SettingsWindow(QWidget):
         knob_box = QGroupBox("延迟参数（拖动后档位变为自定义）")
         kv = QVBoxLayout(knob_box)
         self.knob_sliders: dict[str, QSlider] = {}
+        self.knob_labels: dict[str, QLabel] = {}
 
         for knob in LATENCY_KNOBS:
             holder = QVBoxLayout()
@@ -536,11 +592,32 @@ class SettingsWindow(QWidget):
                     desc.setText(desc.text() + "<br><b>该语言使用分块识别，此项无效</b>")
 
             self.knob_sliders[knob.field] = slider
+            self.knob_labels[knob.field] = value
             value.setText(f"{slider.value()} ms")
             kv.addLayout(holder)
             kv.addSpacing(6)
 
         outer.addWidget(knob_box)
+
+        # --- 重新运行首次运行向导（用户反馈："想换模型下载，却没有入口"）---
+        wizard_box = QGroupBox("模型与语言包")
+        wv = QVBoxLayout(wizard_box)
+        self.wizard_btn = QPushButton("重新运行「首次运行向导」…")
+        self.wizard_btn.setToolTip(
+            "改语言包（要下哪些模型）/ 补下载模型 / 重选档位 / 重设翻译通道。\n"
+            "会用你当前的配置预填，只改你想改的；已装好的模型自动跳过下载。"
+        )
+        self.wizard_btn.clicked.connect(self._open_wizard)
+        wv.addWidget(self.wizard_btn)
+        wh = QLabel(
+            "换识别模型走这里：向导第 ② 页勾语言包、第 ③ 页下载。"
+            "重跑时默认勾的是你<b>已经装好</b>的包，代理/翻译通道也按现状预填，"
+            "不会把你的设置清回默认值。完成后字幕引擎会立刻按新配置重建（不用重启）。"
+        )
+        wh.setWordWrap(True)
+        wv.addWidget(wh)
+        outer.addWidget(wizard_box)
+
         outer.addStretch(1)
         self._refresh_preset_label()
         return page
