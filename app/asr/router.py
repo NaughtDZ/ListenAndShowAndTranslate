@@ -24,7 +24,8 @@ from app.asr.locate import ModelNotFound
 from app.asr.postprocess import clean_text
 from app.asr.sherpa_offline import SherpaOfflineEngine
 from app.asr.sherpa_stream import SherpaStreamingEngine
-from app.config import ASRConfig
+from app.config import ASRConfig, LanguageRoute
+from app.models.registry import supports_language
 from app.utils.log import get_logger
 
 log = get_logger(__name__)
@@ -56,6 +57,7 @@ class LanguageRouter:
         self.lid_min_audio_s = lid_min_audio_s
 
         self._engines: dict[str, ASREngine] = {}
+        self._routes: dict[str, LanguageRoute] = {}
         self._lid: LanguageIdentifier | None = None
         self._stabilizer = LanguageStabilizer()
         self._pending: list[np.ndarray] = []
@@ -99,8 +101,34 @@ class LanguageRouter:
     # ------------------------------------------------------------------ #
     # 引擎构建与降级
     # ------------------------------------------------------------------ #
-    def _build_engine(self, language: str) -> ASREngine:
+    def _active_route(self, language: str) -> LanguageRoute:
+        """按语言取路由，并做一道"模型真的能用吗"的兜底。
+
+        用户可以在设置里选识别模型，也可以直接手改 ``data/config.json``；
+        所以这里必须自己判断：模型不存在、不是识别模型（比如把语种识别模型
+        或 VAD 填进来了）、或者**不支持这门语言**时，一律退回默认路由并说明原因，
+        而不是硬拿它去加载（用户最怕的就是"乱用模型"却看不出为什么不对）。
+
+        结果按语言缓存：同一次会话里同一门语言只提示一次，不刷屏
+        （配置改了会重建 LanguageRouter，见 ``pipeline.reload()``）。
+        """
+        cached = self._routes.get(language)
+        if cached is not None:
+            return cached
+
         route = self.config.route_for(language)
+        if route.model and not supports_language(route.model, language):
+            default = self.config.default_route_for(language)
+            self._log(
+                f"⚠️ {language} 配置的模型 {route.model} 不能用（不存在 / 不是识别模型 / "
+                f"不支持该语言），已改回默认：{default.model}"
+            )
+            route = default
+        self._routes[language] = route
+        return route
+
+    def _build_engine(self, language: str) -> ASREngine:
+        route = self._active_route(language)
         vad = self.config.vad
 
         if route.engine == "sherpa_stream":
@@ -128,7 +156,7 @@ class LanguageRouter:
     def _fallback_chain(self, language: str) -> list[str]:
         """返回按优先级排列的「模型 id 列表」用于降级尝试。"""
         chain: list[str] = []
-        primary = self.config.route_for(language).model
+        primary = self._active_route(language).model
         if primary:
             chain.append(primary)
         # 配置的降级方向
@@ -142,8 +170,8 @@ class LanguageRouter:
 
     def _create_engine_with_fallback(self, language: str) -> ASREngine | None:
         errors: list[str] = []
+        route = self._active_route(language)  # 只取一次，避免重复提示
         for model_id in self._fallback_chain(language):
-            route = self.config.route_for(language)
             engine_kind = route.engine
             if model_id != route.model:
                 # 降级时按模型所属引擎类型重建

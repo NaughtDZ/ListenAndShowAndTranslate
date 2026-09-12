@@ -297,6 +297,16 @@ class ASRConfig(BaseModel):
             return self.routing["*"]
         return LanguageRoute(engine=self.engine, model="", streaming=(self.engine == "sherpa_stream"))
 
+    @staticmethod
+    def default_route_for(language: str) -> LanguageRoute:
+        """内置的默认路由（与用户改没改过无关）。
+
+        用途：界面上的「自动」选项 = 恢复成这一条；路由器发现配置里指定了
+        不支持该语言的模型时，也退回这一条。
+        """
+        table = _default_routing()
+        return table.get(language) or table["*"]
+
     fallback_engine: Literal["sherpa_offline", "whispercpp", "none"] = "sherpa_offline"
     """目标语言模型缺失/加载失败时的降级方向。"""
 

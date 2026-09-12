@@ -27,7 +27,11 @@ credentials.json
 !.env.example
 
 # --- 模型文件（体积大，由 downloader 运行时拉取）---
-models/
+# ⚠️ 必须写成 `/models/`（只匹配仓库根目录）：
+# 写成 `models/` 会连 **app/models/ 这个源码包**一起忽略掉——
+# registry.py / downloader.py / hardware.py 曾经因此从没进过仓库，
+# 别人 clone 下来直接 import 失败。有 tests/test_repo_hygiene.py 守着这条。
+/models/
 *.onnx
 *.bin
 *.gguf

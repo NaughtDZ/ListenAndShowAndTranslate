@@ -44,6 +44,7 @@ from PySide6.QtWidgets import (
 
 from app.audio.levels import LevelState, LevelTracker, threshold_from_db
 from app.config import LATENCY_KNOBS, LATENCY_PRESETS, AppConfig
+from app.models.registry import LANGUAGE_LABELS
 from app.translate.prompts import list_templates
 from app.translate.traditional.providers import ALL_PROVIDERS, WEB_PROVIDERS
 from app.ui.meter import LevelMeterWidget
@@ -112,6 +113,10 @@ class SettingsWindow(QWidget):
         self.setMinimumWidth(560)
 
         self._threads: list[_TestThread] = []
+
+        # 识别模型下拉框用的缓存（"装没装"要在窗口打开时刷新，见 _sync_live_fields）
+        self._model_installed: dict[str, bool] = {}
+        self._invalid_routes: list[tuple[str, str]] = []
 
         # 实时电平：来源由调用方给（字幕进程给采集线程的读数；启动窗口没有采集，
         # 就不给来源，电平表只显示阈值线和参考线）。
@@ -282,6 +287,8 @@ class SettingsWindow(QWidget):
         if idx >= 0 and idx != self.provider_combo.currentIndex():
             self.provider_combo.setCurrentIndex(idx)  # 让它重建凭据字段
 
+        # 识别模型：向导可能刚补下了模型，"未下载"标记要跟着刷新
+        self._refresh_model_choices()
         self._sync_latency_fields()
 
     def _sync_latency_fields(self) -> None:
@@ -497,6 +504,41 @@ class SettingsWindow(QWidget):
         lang_hint.setWordWrap(True)
         form.addRow("", lang_hint)
 
+        # --- 识别模型（按语言手动指定）---
+        # 用户要的：模型是程序硬编码的注册表，程序当然知道谁能识别谁，
+        # 那就别让人乱下模型乱用 —— 下拉框只列**真的支持这门语言**的识别模型。
+        model_box = QGroupBox("识别模型（按语言）")
+        model_form = QFormLayout(model_box)
+        self.model_combos: dict[str, QComboBox] = {}
+        for lang in self._routing_languages():
+            combo = QComboBox()
+            combo.setToolTip(
+                "「自动」= 用程序实测挑出来的默认模型（推荐）。\n"
+                "手动选也是受限的：这里只会列出真正支持这门语言的识别模型。"
+            )
+            combo.currentIndexChanged.connect(self._refresh_model_hints)
+            self.model_combos[lang] = combo
+            model_form.addRow(LANGUAGE_LABELS.get(lang, lang), combo)
+
+        self.model_reset_btn = QPushButton("全部恢复默认（自动）")
+        self.model_reset_btn.clicked.connect(self.reset_model_choices)
+        self.model_hint = QLabel("")
+        self.model_hint.setWordWrap(True)
+        reset_row = QHBoxLayout()
+        reset_row.addWidget(self.model_reset_btn)
+        reset_row.addStretch(1)
+        model_form.addRow("", reset_row)
+        model_form.addRow("", self.model_hint)
+        model_box_hint = QLabel(
+            "为什么不能任选？识别模型是**按语言写在注册表**里的："
+            "流式模型只能吃它训练过的语言，Whisper turbo 才能通吃 99 种；"
+            "语种识别模型和 VAD 更是根本不出字幕。所以这里只列能用的；"
+            "选了但还没下载的，会提示你去「模型与语言包」补下。"
+        )
+        model_box_hint.setWordWrap(True)
+        model_form.addRow("", model_box_hint)
+        outer.addWidget(model_box)
+
         # 静音阈值：用户要求"电平设置除了开始选程序时能调，设置里也要能调"，
         # 而且以前**根本没保存过**（关掉电平窗再开又回 -80）。
         self.silence_db = QDoubleSpinBox()
@@ -619,8 +661,127 @@ class SettingsWindow(QWidget):
         outer.addWidget(wizard_box)
 
         outer.addStretch(1)
+        # 建好就把下拉框填上（别等窗口 show：否则没打开过就保存会写错路由）
+        self._refresh_model_choices()
         self._refresh_preset_label()
         return page
+
+    # ------------------------------------------------------------------ #
+    # 识别模型（按语言手动指定）
+    # ------------------------------------------------------------------ #
+    def _routing_languages(self) -> list[str]:
+        """「识别模型」那一组按哪些语言成行：取路由表的键，``*`` 排最后。"""
+        keys = [k for k in self.config.asr.routing if k != "*"]
+        order = ["zh", "zh-en", "en", "ja", "ko", "yue"]
+        keys.sort(key=lambda k: (order.index(k) if k in order else len(order), k))
+        if "*" in self.config.asr.routing:
+            keys.append("*")
+        return keys
+
+    @staticmethod
+    def _is_installed(downloader, model_id: str) -> bool:
+        if downloader is None:
+            return False
+        try:
+            return downloader.status(model_id) == "installed"
+        except Exception:  # noqa: BLE001 - 探测失败就当作没装
+            return False
+
+    def _refresh_model_choices(self) -> None:
+        """把每个语言的**候选模型**填进下拉框，并选中当前配置。
+
+        候选只来自 ``registry.models_for_language()``——也就是"真的能识别这门语言"
+        的识别模型。用户因此不可能在这里选出语种识别模型 / VAD / 不支持该语言的模型，
+        从源头堵掉"乱用模型"。
+        """
+        from app.models.downloader import ModelDownloader
+        from app.models.registry import MODELS, models_for_language
+
+        try:
+            downloader = ModelDownloader()
+        except Exception as exc:  # noqa: BLE001
+            log.debug("初始化模型下载器失败，安装状态按未装显示：%s", exc)
+            downloader = None
+
+        self._model_installed = {}
+        self._invalid_routes = []
+        for lang, combo in self.model_combos.items():
+            current = self.config.asr.route_for(lang).model
+            if current and not any(
+                m.id == current for m in models_for_language(lang)
+            ):
+                self._invalid_routes.append((lang, current))
+
+            default_route = self.config.asr.default_route_for(lang)
+            default_spec = MODELS.get(default_route.model)
+            default_label = default_spec.display_name if default_spec else "程序默认"
+
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem(f"自动（默认：{default_label}）", "")
+            for spec in models_for_language(lang):
+                ok = self._is_installed(downloader, spec.id)
+                self._model_installed[spec.id] = ok
+                combo.addItem(
+                    spec.display_name + ("" if ok else "（未下载）"), spec.id
+                )
+                combo.setItemData(
+                    combo.count() - 1,
+                    f"{spec.note or ''}\n体积约 {spec.total_mb:.0f} MB"
+                    f"\n识别语言：{'/'.join(spec.languages)}",
+                    Qt.ToolTipRole,
+                )
+            idx = combo.findData(current)
+            combo.setCurrentIndex(idx if idx >= 0 else 0)
+            combo.blockSignals(False)
+
+        self._refresh_model_hints()
+
+    def _refresh_model_hints(self) -> None:
+        """把"选了但没下载"和"配置里的模型不支持该语言"直接写在界面上。"""
+        from app.models.registry import MODELS, pack_for_model
+
+        missing = [
+            (lang, combo.currentData())
+            for lang, combo in self.model_combos.items()
+            if combo.currentData()
+            and not self._model_installed.get(combo.currentData(), False)
+        ]
+        lines: list[str] = []
+        if missing:
+            names = "、".join(MODELS[m].display_name for _, m in missing if m in MODELS)
+            packs = sorted({p for _, m in missing if (p := pack_for_model(m))})
+            line = f"⚠️ 选中的模型还没下载：{names}"
+            if packs:
+                line += f"。点下面「重新运行「首次运行向导」…」勾选 {('、'.join(packs))} 语言包即可下载。"
+            lines.append(line)
+        for lang, model_id in getattr(self, "_invalid_routes", []):
+            lines.append(
+                f"⚠️ 配置里给「{LANGUAGE_LABELS.get(lang, lang)}」指定的是 {model_id}，"
+                "它不能识别这门语言（或不是识别模型），运行时会被忽略并改回默认；"
+                "这里选「自动」再保存即可修正。"
+            )
+        self.model_hint.setText("\n".join(lines))
+
+    def reset_model_choices(self) -> None:
+        """全部恢复成「自动」= 程序实测挑出来的默认模型。"""
+        for combo in self.model_combos.values():
+            combo.blockSignals(True)
+            combo.setCurrentIndex(0)
+            combo.blockSignals(False)
+        self._refresh_model_hints()
+
+    def _save_model_choices(self) -> None:
+        """把下拉框写回 ``asr.routing``（引擎类型一律以注册表为准）。"""
+        from app.models.registry import route_kwargs_for
+
+        asr = self.config.asr
+        for lang, combo in self.model_combos.items():
+            model_id = combo.currentData() or ""
+            if model_id:
+                asr.set_route(lang, route_kwargs_for(model_id))
+            else:
+                asr.set_route(lang, asr.default_route_for(lang))
 
     # ------------------------------------------------------------------ #
     # 外观
@@ -951,6 +1112,8 @@ class SettingsWindow(QWidget):
         c.translate.glossary = glossary
 
         c.asr.language = self.lang_combo.currentData() or "auto"
+        # 识别模型（按语言）：下拉框里只有"真的支持这门语言"的识别模型
+        self._save_model_choices()
         # 静音阈值：以前只能在电平表窗口里调，而且**根本没存过**，
         # 关掉再开又回到 -80（用户反馈）。现在在这里也能调，并且会保存。
         c.audio.silence_rms_threshold_db = float(self.silence_db.value())

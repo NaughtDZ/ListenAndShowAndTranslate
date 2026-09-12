@@ -93,12 +93,9 @@ def require(model_id: str, models_dir: Path | None = None, roles: tuple[str, ...
 
 def _pack_for(model_id: str) -> str:
     """反查该模型属于哪个语言包，用于给出准确的修复命令。"""
-    from app.models.registry import PACKS
+    from app.models.registry import pack_for_model
 
-    for pack in PACKS.values():
-        if model_id in pack.model_ids:
-            return pack.id
-    return ""
+    return pack_for_model(model_id)
 
 
 def describe(spec: ModelSpec) -> str:
