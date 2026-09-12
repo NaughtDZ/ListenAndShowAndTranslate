@@ -736,12 +736,14 @@ def run_wizard(config: AppConfig | None = None, *, rerun: bool | None = None) ->
     """
     from PySide6.QtWidgets import QApplication
 
-    from app.ui.lifecycle import configure_quit_policy
+    from app.ui.lifecycle import configure_quit_policy, fit_window_to_screen
 
     app = QApplication.instance() or QApplication([])
     # 向导是这期间唯一的窗口：默认策略下向导一关就会调 QApplication.quit()，
     # 而下面主窗口的 app.exec() 还没开始跑，容易被这个"待退出"标记坑到。
     configure_quit_policy(app)
     wiz = FirstRunWizard(config, rerun=rerun)
+    # 有的页面（语言包那一页）很长，先夹进屏幕，别让标题栏跑到屏幕外
+    fit_window_to_screen(wiz)
     wiz.show()
     return int(wiz.exec())

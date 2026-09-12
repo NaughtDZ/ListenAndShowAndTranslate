@@ -32,7 +32,61 @@ __all__ = [
     "quit_app",
     "set_quitting",
     "open_settings_window",
+    "fit_window_to_screen",
+    "scrollable",
 ]
+
+MARGIN = 8
+
+
+def fit_window_to_screen(window: Any, *, max_ratio: float = 0.92) -> None:
+    """把窗口的尺寸和位置都夹进屏幕可用区域，**保证标题栏留在屏幕上**。
+
+    为什么必须做：设置窗的内容一多，它的 ``minimumSizeHint`` 就会被撑得比屏幕还高
+    （实测 692×1275）。Qt 会照这个最小尺寸摆放窗口，于是标题栏跑到屏幕上方之外，
+    用户既看不到也拖不动它——只能去改分辨率。用户反馈过这个（2026-09-12）。
+
+    所以：进不去的窗口主动缩到屏幕的 ``max_ratio``，位置也夹在可用区域内。
+    页面自己可以做滚动（见 :func:`scrollable`），缩了也不会丢内容。
+    """
+    from PySide6.QtWidgets import QApplication
+
+    screen = window.screen() or QApplication.primaryScreen()
+    if screen is None:
+        return
+    geo = screen.availableGeometry()
+    max_w = max(320, int(geo.width() * max_ratio))
+    max_h = max(240, int(geo.height() * max_ratio))
+
+    width = min(max(window.width(), window.minimumWidth()), max_w)
+    height = min(max(window.height(), window.minimumHeight()), max_h)
+    window.resize(width, height)
+
+    x = window.x()
+    y = window.y()
+    if x + width > geo.right() - MARGIN or x < geo.left() + MARGIN:
+        x = geo.left() + (geo.width() - width) // 2
+    if y + height > geo.bottom() - MARGIN or y < geo.top() + MARGIN:
+        y = geo.top() + (geo.height() - height) // 2
+    window.move(x, y)
+
+
+def scrollable(page: Any) -> Any:
+    """把整个分页塞进一个滚动区域——这样窗口可以缩得很小，内容照样够得着。
+
+    设置页里"识别"这一类分页本来是一根很长的竖列（语言 + 阈值 + 电平表 +
+    延迟档位 + 五个滑杆 + 模型选择…），整页的最小高度能到 1200px 以上；
+    不套滚动区域的话，窗口就永远缩不下去（见 :func:`fit_window_to_screen`）。
+    """
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QScrollArea
+
+    area = QScrollArea()
+    area.setWidgetResizable(True)   # 关键：跟着窗口宽度自适应，只在竖直方向滚动
+    area.setFrameShape(QScrollArea.NoFrame)
+    area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+    area.setWidget(page)
+    return area
 
 
 def configure_quit_policy(app: Any) -> None:

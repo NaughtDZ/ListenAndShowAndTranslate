@@ -1,20 +1,24 @@
 """设置界面。
 
-四个分页，都是"用户在真实使用中一定会要调"的东西：
+五个分页，都是"用户在真实使用中一定会要调"的东西：
 
   网络  —— 程序走哪个代理（模型下载、翻译通道共用），以及一键连通性测试
   翻译  —— 用哪个通道、凭据、上下文行数、提示词模板、术语表，以及一键测试
   识别  —— 语言、静音阈值（带**实时电平表 + 阈值线 + 实测参考线**）、
           延迟档位与五个延迟参数（每个都写清"调小/调大各会怎样"）
+  模型  —— 识别模型（按语言选，只列真的支持这门语言的）+ 语言包下载（运行向导）
   外观  —— 原文/译文/双语、滚动方式、每屏行数、字号颜色、点击穿透
 
-两个设计约束（都是踩过坑之后定的）：
+三个设计约束（都是踩过坑之后定的）：
 
 1. **控制项不能放在悬浮窗里** —— 一旦开启点击穿透，悬浮窗就点不动了，
    用户会把自己锁死。所以所有设置都在这个普通窗口里。
 2. **每个旋钮都要写清作用** —— 只写"延迟相关"等于没写。
    延迟参数的说明文字直接来自 ``app/config.py: LATENCY_KNOBS``，
    与 docs/延迟调节.md 同源，避免两处维护。
+3. **窗口绝不许比屏幕大** —— 每个分页都套 ``lifecycle.scrollable``，
+   显示前再 ``fit_window_to_screen`` 夹一次；否则内容一多，最小高度会把
+   标题栏顶到屏幕外，用户连窗口都拖不动（用户反馈过，见 tests/test_settings_layout.py）。
 """
 
 from __future__ import annotations
@@ -34,6 +38,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QPushButton,
     QScrollArea,
+    QSizeGrip,
     QSlider,
     QSpinBox,
     QTabWidget,
@@ -47,6 +52,7 @@ from app.config import LATENCY_KNOBS, LATENCY_PRESETS, AppConfig
 from app.models.registry import LANGUAGE_LABELS
 from app.translate.prompts import list_templates
 from app.translate.traditional.providers import ALL_PROVIDERS, WEB_PROVIDERS
+from app.ui.lifecycle import fit_window_to_screen
 from app.ui.meter import LevelMeterWidget
 from app.utils.log import get_logger
 
@@ -109,10 +115,13 @@ class SettingsWindow(QWidget):
         super().__init__(None)
         self.config = config or AppConfig.load()
         self.setWindowTitle("听·显·译 — 设置")
-        self.resize(720, 640)
-        self.setMinimumWidth(560)
+        # 初始尺寸只当"建议值"：真正显示时会按屏幕再夹一次（fit_window_to_screen），
+        # 最小尺寸给得很小，这样窗口随便缩、内容靠分页滚动，标题栏永远够得着。
+        self.resize(760, 660)
+        self.setMinimumSize(520, 320)
 
         self._threads: list[_TestThread] = []
+        self._fitted = False
 
         # 识别模型下拉框用的缓存（"装没装"要在窗口打开时刷新，见 _sync_live_fields）
         self._model_installed: dict[str, bool] = {}
@@ -133,10 +142,14 @@ class SettingsWindow(QWidget):
         self._level_timer.timeout.connect(self._poll_level)
 
         tabs = QTabWidget(self)
-        tabs.addTab(self._build_network_tab(), "网络")
-        tabs.addTab(self._build_translate_tab(), "翻译")
-        tabs.addTab(self._build_asr_tab(), "识别")
-        tabs.addTab(self._build_appearance_tab(), "外观")
+        self.tabs = tabs
+        # 每个分页都自己做滚动（见 lifecycle.scrollable）：
+        # 否则"识别"那种长竖列会把窗口最小高度撑到 1200px+，标题栏被顶出屏幕。
+        tabs.addTab(self._scrollable(self._build_network_tab()), "网络")
+        tabs.addTab(self._build_translate_tab(), "翻译")  # 它自己内部已经带滚动
+        tabs.addTab(self._scrollable(self._build_asr_tab()), "识别")
+        tabs.addTab(self._scrollable(self._build_model_tab()), "模型")
+        tabs.addTab(self._scrollable(self._build_appearance_tab()), "外观")
 
         self.status = QLabel("")
         self.status.setWordWrap(True)
@@ -147,6 +160,8 @@ class SettingsWindow(QWidget):
 
         bottom = QHBoxLayout()
         bottom.addWidget(self.status, 1)
+        # 右下角放个缩放手柄：让"这个窗口可以拖大拖小"一眼可见
+        bottom.addWidget(QSizeGrip(self))
         bottom.addWidget(save_btn)
         bottom.addWidget(close_btn)
 
@@ -155,10 +170,21 @@ class SettingsWindow(QWidget):
         root.addLayout(bottom)
 
     # ------------------------------------------------------------------ #
+    def _scrollable(self, page: QWidget) -> QWidget:
+        """把分页塞进滚动区域（窗口缩小时内容不会丢）。"""
+        from app.ui.lifecycle import scrollable
+
+        return scrollable(page)
+
+    # ------------------------------------------------------------------ #
     # 每次打开都同步一次"别处也能改"的字段
     # ------------------------------------------------------------------ #
     def showEvent(self, event) -> None:  # noqa: N802 - Qt 命名
         super().showEvent(event)
+        if not self._fitted:
+            # 第一次显示时按屏幕夹一次：内容再长也不许把标题栏顶到屏幕外
+            self._fitted = True
+            fit_window_to_screen(self)
         self._sync_live_fields()
         # 只在窗口可见时轮询电平：设置窗常年开着不该白烧 CPU
         if self._level_source is not None:
@@ -504,41 +530,6 @@ class SettingsWindow(QWidget):
         lang_hint.setWordWrap(True)
         form.addRow("", lang_hint)
 
-        # --- 识别模型（按语言手动指定）---
-        # 用户要的：模型是程序硬编码的注册表，程序当然知道谁能识别谁，
-        # 那就别让人乱下模型乱用 —— 下拉框只列**真的支持这门语言**的识别模型。
-        model_box = QGroupBox("识别模型（按语言）")
-        model_form = QFormLayout(model_box)
-        self.model_combos: dict[str, QComboBox] = {}
-        for lang in self._routing_languages():
-            combo = QComboBox()
-            combo.setToolTip(
-                "「自动」= 用程序实测挑出来的默认模型（推荐）。\n"
-                "手动选也是受限的：这里只会列出真正支持这门语言的识别模型。"
-            )
-            combo.currentIndexChanged.connect(self._refresh_model_hints)
-            self.model_combos[lang] = combo
-            model_form.addRow(LANGUAGE_LABELS.get(lang, lang), combo)
-
-        self.model_reset_btn = QPushButton("全部恢复默认（自动）")
-        self.model_reset_btn.clicked.connect(self.reset_model_choices)
-        self.model_hint = QLabel("")
-        self.model_hint.setWordWrap(True)
-        reset_row = QHBoxLayout()
-        reset_row.addWidget(self.model_reset_btn)
-        reset_row.addStretch(1)
-        model_form.addRow("", reset_row)
-        model_form.addRow("", self.model_hint)
-        model_box_hint = QLabel(
-            "为什么不能任选？识别模型是**按语言写在注册表**里的："
-            "流式模型只能吃它训练过的语言，Whisper turbo 才能通吃 99 种；"
-            "语种识别模型和 VAD 更是根本不出字幕。所以这里只列能用的；"
-            "选了但还没下载的，会提示你去「模型与语言包」补下。"
-        )
-        model_box_hint.setWordWrap(True)
-        model_form.addRow("", model_box_hint)
-        outer.addWidget(model_box)
-
         # 静音阈值：用户要求"电平设置除了开始选程序时能调，设置里也要能调"，
         # 而且以前**根本没保存过**（关掉电平窗再开又回 -80）。
         self.silence_db = QDoubleSpinBox()
@@ -641,8 +632,67 @@ class SettingsWindow(QWidget):
 
         outer.addWidget(knob_box)
 
-        # --- 重新运行首次运行向导（用户反馈："想换模型下载，却没有入口"）---
-        wizard_box = QGroupBox("模型与语言包")
+        outer.addStretch(1)
+        self._refresh_preset_label()
+        return page
+
+    # ------------------------------------------------------------------ #
+    # 模型：识别模型（按语言）+ 语言包/向导入口
+    # ------------------------------------------------------------------ #
+    def _build_model_tab(self) -> QWidget:
+        """「模型」分页。
+
+        用户反馈设置窗太长、标题栏被顶出屏幕，所以把"选哪些模型"这一类
+        从「识别」里拆出来单独一页；这一页自己也套了滚动区域（见 ``_scrollable``）。
+        """
+        page = QWidget()
+        outer = QVBoxLayout(page)
+
+        intro = QLabel(
+            "<b>这一页管「用哪个模型」和「下哪些模型」。</b><br>"
+            "识别模型只能从程序注册表里选，而且<b>按语言限制</b>——"
+            "不存在「下了个中文模型却让它识别日语」这种乱用。"
+        )
+        intro.setWordWrap(True)
+        outer.addWidget(intro)
+
+        # --- 识别模型（按语言手动指定）---
+        # 用户要的：模型是程序硬编码的注册表，程序当然知道谁能识别谁，
+        # 那就别让人乱下模型乱用 —— 下拉框只列**真的支持这门语言**的识别模型。
+        model_box = QGroupBox("识别模型（按语言）")
+        model_form = QFormLayout(model_box)
+        self.model_combos: dict[str, QComboBox] = {}
+        for lang in self._routing_languages():
+            combo = QComboBox()
+            combo.setToolTip(
+                "「自动」= 用程序实测挑出来的默认模型（推荐）。\n"
+                "手动选也是受限的：这里只会列出真正支持这门语言的识别模型。"
+            )
+            combo.currentIndexChanged.connect(self._refresh_model_hints)
+            self.model_combos[lang] = combo
+            model_form.addRow(LANGUAGE_LABELS.get(lang, lang), combo)
+
+        self.model_reset_btn = QPushButton("全部恢复默认（自动）")
+        self.model_reset_btn.clicked.connect(self.reset_model_choices)
+        self.model_hint = QLabel("")
+        self.model_hint.setWordWrap(True)
+        reset_row = QHBoxLayout()
+        reset_row.addWidget(self.model_reset_btn)
+        reset_row.addStretch(1)
+        model_form.addRow("", reset_row)
+        model_form.addRow("", self.model_hint)
+        model_box_hint = QLabel(
+            "为什么不能任选？识别模型是**按语言写在注册表**里的："
+            "流式模型只能吃它训练过的语言，Whisper turbo 才能通吃 99 种；"
+            "语种识别模型和 VAD 更是根本不出字幕。所以这里只列能用的；"
+            "选了但还没下载的，会提示你去下面补下。详见 docs/识别模型选择.md。"
+        )
+        model_box_hint.setWordWrap(True)
+        model_form.addRow("", model_box_hint)
+        outer.addWidget(model_box)
+
+        # --- 语言包：下载/删除模型（重新运行首次运行向导）---
+        wizard_box = QGroupBox("语言包与下载")
         wv = QVBoxLayout(wizard_box)
         self.wizard_btn = QPushButton("重新运行「首次运行向导」…")
         self.wizard_btn.setToolTip(
@@ -652,7 +702,7 @@ class SettingsWindow(QWidget):
         self.wizard_btn.clicked.connect(self._open_wizard)
         wv.addWidget(self.wizard_btn)
         wh = QLabel(
-            "换识别模型走这里：向导第 ② 页勾语言包、第 ③ 页下载。"
+            "要换模型、补下语言包就走这里：向导第 ② 页勾语言包、第 ③ 页下载。"
             "重跑时默认勾的是你<b>已经装好</b>的包，代理/翻译通道也按现状预填，"
             "不会把你的设置清回默认值。完成后字幕引擎会立刻按新配置重建（不用重启）。"
         )
@@ -663,7 +713,6 @@ class SettingsWindow(QWidget):
         outer.addStretch(1)
         # 建好就把下拉框填上（别等窗口 show：否则没打开过就保存会写错路由）
         self._refresh_model_choices()
-        self._refresh_preset_label()
         return page
 
     # ------------------------------------------------------------------ #

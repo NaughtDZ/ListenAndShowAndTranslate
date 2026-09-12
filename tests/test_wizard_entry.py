@@ -173,6 +173,8 @@ def test_run_wizard_passes_explicit_rerun_through(qapp, monkeypatch):
             return 1
 
     monkeypatch.setattr(wizard_mod, "FirstRunWizard", _Fake)
+    # 这个替身没有真窗口，跳过"夹进屏幕"那一步（那条逻辑另有专门用例守着）
+    monkeypatch.setattr("app.ui.lifecycle.fit_window_to_screen", lambda window: None)
     cfg = AppConfig()
     assert wizard_mod.run_wizard(cfg) == 1
     assert wizard_mod.run_wizard(cfg, rerun=False) == 1
