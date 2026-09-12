@@ -1,20 +1,9 @@
 @echo off
 REM ============================================================
-REM  ListenAndShowAndTranslate 一键启动
-REM  依赖必须装在 .venv 内（红线：禁止全局 pip install）
+REM  兼容入口：转发到「启动.bat」
+REM  保留它是为了兼容早期文档里写的 start.bat --list-audio 等用法。
+REM  真正的逻辑只在「启动.bat」里维护一份，避免两个入口各自漂移。
 REM ============================================================
-setlocal
-cd /d "%~dp0"
-
-if not exist ".venv\Scripts\python.exe" (
-    echo [错误] 未找到虚拟环境 .venv
-    echo 请先执行:  uv venv --python 3.12.12 .venv
-    echo            uv pip install --python .venv\Scripts\python.exe -r requirements.txt
-    pause
-    exit /b 1
-)
-
-set PYTHONUTF8=1
-".venv\Scripts\python.exe" main.py %*
-if errorlevel 1 pause
-endlocal
+chcp 65001 >nul
+call "%~dp0启动.bat" %*
+exit /b %errorlevel%

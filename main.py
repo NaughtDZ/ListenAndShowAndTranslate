@@ -380,6 +380,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--run", metavar="PID", help="启动字幕程序：透明悬浮窗 + 实时翻译")
     p.add_argument("--process", metavar="NAME", help="配合 --run：按进程名（如 喜马拉雅.exe）")
     p.add_argument("--settings", action="store_true", help="打开设置界面（网络/翻译/识别/外观）")
+    p.add_argument("--wizard", action="store_true", help="重新运行首次运行向导（硬件/档位/模型/翻译）")
     p.add_argument(
         "--models",
         choices=["list", "status", "install", "uninstall"],
@@ -430,6 +431,10 @@ def main(argv: list[str] | None = None) -> int:
         win = SettingsWindow(AppConfig.load())
         win.show()
         return int(app.exec())
+    if args.wizard:
+        from app.ui.wizard import run_wizard
+
+        return run_wizard(AppConfig.load())
     if args.run or args.process:
         from app.ui.runner import run_subtitles
 
@@ -444,17 +449,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.capture:
         return capture_target(args)
 
-    # 无参数：P0 阶段先做自检；P3 起换成启动 GUI
-    print(f"ListenAndShowAndTranslate v{__version__}")
-    print("GUI 尚未实现（计划书 P3 阶段）。当前可用：")
-    print("  python main.py --selftest             环境自检")
-    print("  python main.py --list-audio           列出正在发声的进程")
-    print("  python main.py --capture <PID|名字>   采集目标音频并显示实时电平")
-    print("  python main.py --meter <PID>          打开电平表悬浮窗（RMS/PEAK，阈值可调）")
-    print("  python main.py --models list          查看语言包与模型清单")
-    print("  python main.py --models install --packs all")
-    print("  python main.py --capture 1234 --record out.wav --seconds 5")
-    return selftest()
+    # 无参数 = 正常启动（双击 启动.bat 走的就是这条路）
+    #   没做过首次设置 → 先走向导；否则直接开主窗口选音频来源
+    from app.ui.launcher import run_launcher
+
+    return run_launcher(AppConfig.load())
 
 
 if __name__ == "__main__":
