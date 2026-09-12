@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QSlider,
     QVBoxLayout,
     QWidget,
 )
@@ -90,10 +91,32 @@ class SubtitleControlWindow(QWidget):
         self.click_through.setChecked(overlay.config.click_through)
         self.click_through.toggled.connect(self.overlay.set_click_through)
 
+        # 整体透明度：快速调到"看得清但不抢眼"
+        self.opacity_slider = QSlider(Qt.Horizontal)
+        self.opacity_slider.setRange(20, 100)
+        self.opacity_slider.setValue(int(overlay.config.window_opacity * 100))
+        self.opacity_label = QLabel(f"{self.opacity_slider.value()}%")
+        self.opacity_slider.valueChanged.connect(self._on_opacity)
+        op_row = QHBoxLayout()
+        op_row.addWidget(QLabel("透明度"))
+        op_row.addWidget(self.opacity_slider, 1)
+        op_row.addWidget(self.opacity_label)
+
+        self.lock_pos = QCheckBox("锁定位置（防止玩游戏时误拖）")
+        self.lock_pos.setChecked(overlay.config.lock_position)
+        self.lock_pos.toggled.connect(self._on_lock)
+        # 锁定后就不能拖；而"能拖"的前提是没开点击穿透——在提示里说清
+        self.drag_hint = QLabel(
+            "取消勾选后<b>拖动字幕窗任意位置</b>可移动、拖<b>边缘或右下角</b>可缩放尺寸。"
+            "注意：开了点击穿透就拖不动了。"
+        )
+        self.drag_hint.setWordWrap(True)
+
         self.pause_btn = QPushButton("暂停字幕")
         self.pause_btn.setCheckable(True)
         self.pause_btn.toggled.connect(self._toggle_pause)
 
+        self.tray_btn = QPushButton("最小化到托盘")
         self.settings_btn = QPushButton("设置…")
 
         self.quit_btn = QPushButton("退出")
@@ -104,12 +127,18 @@ class SubtitleControlWindow(QWidget):
         root.addLayout(self.mode_row)
         root.addLayout(self.scroll_row)
         root.addWidget(self.click_through)
+        root.addLayout(op_row)
+        root.addWidget(self.lock_pos)
+        root.addWidget(self.drag_hint)
         root.addWidget(self.stats_label)
         root.addWidget(self.hint_label)
         root.addStretch(1)
         root.addWidget(self.pause_btn)
+        root.addWidget(self.tray_btn)
         root.addWidget(self.settings_btn)
         root.addWidget(self.quit_btn)
+
+        self._setup_tray()
 
         # 按内容自适应尺寸（高 DPI 下字体放大，固定尺寸会把按钮挤掉）
         self.adjustSize()
@@ -125,6 +154,83 @@ class SubtitleControlWindow(QWidget):
             return
         self._settings_win = SettingsWindow(self.pipeline.config)
         self._settings_win.show()
+
+    # ------------------------------------------------------------------ #
+    def _on_opacity(self, value: int) -> None:
+        self.opacity_label.setText(f"{value}%")
+        self.overlay.config.window_opacity = value / 100.0
+        self.overlay._apply_opacity()
+
+    def _on_lock(self, locked: bool) -> None:
+        self.overlay.config.lock_position = locked
+
+    # ------------------------------------------------------------------ #
+    def _setup_tray(self) -> None:
+        """托盘图标：开始采集后可以把控制窗收起来，不挡游戏。
+
+        退出走托盘菜单或按钮都行；**托盘是唯一在隐藏后还能找回来的入口**，
+        所以必须建好，否则用户一收起来就再也找不到控制窗了。
+        """
+        from PySide6.QtGui import QAction
+        from PySide6.QtWidgets import QMenu, QSystemTrayIcon
+
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            self.tray_btn.setEnabled(False)
+            self.tray_btn.setToolTip("系统不支持托盘")
+            return
+
+        self.tray = QSystemTrayIcon(self)
+        self.tray.setIcon(self.style().standardIcon(
+            self.style().StandardPixmap.SP_ComputerIcon
+        ))
+        self.tray.setToolTip("听·显·译 — 字幕运行中")
+
+        menu = QMenu()
+        act_show = QAction("显示控制窗", self)
+        act_show.triggered.connect(self._restore_from_tray)
+        act_toggle = QAction("显示 / 隐藏字幕", self)
+        act_toggle.triggered.connect(self._toggle_overlay_visible)
+        act_quit = QAction("退出", self)
+        act_quit.triggered.connect(self._quit)
+        menu.addAction(act_show)
+        menu.addAction(act_toggle)
+        menu.addSeparator()
+        menu.addAction(act_quit)
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(self._on_tray_activated)
+        self.tray.show()
+
+        self.tray_btn.clicked.connect(self._to_tray)
+
+    def _on_tray_activated(self, reason) -> None:
+        from PySide6.QtWidgets import QSystemTrayIcon
+
+        if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
+            self._restore_from_tray()
+
+    def _to_tray(self) -> None:
+        self.hide()
+        tray = getattr(self, "tray", None)
+        if tray is not None:
+            tray.showMessage("听·显·译", "已最小化到托盘，双击图标可恢复。", 
+                             self.tray.MessageIcon.Information, 3000)
+
+    def _restore_from_tray(self) -> None:
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def _toggle_overlay_visible(self) -> None:
+        self.overlay.setVisible(not self.overlay.isVisible())
+
+    def _quit(self) -> None:
+        from PySide6.QtWidgets import QApplication
+
+        tray = getattr(self, "tray", None)
+        if tray is not None:
+            tray.hide()
+        QApplication.quit()
+
 
     # ------------------------------------------------------------------ #
     def _set_mode(self, mode: str) -> None:

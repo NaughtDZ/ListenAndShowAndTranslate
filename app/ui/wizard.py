@@ -268,7 +268,21 @@ class DownloadPage(QWizardPage):
 
         self.info = QTextEdit()
         self.info.setReadOnly(True)
-        self.info.setMinimumHeight(160)
+        self.info.setMinimumHeight(140)
+
+        # 代理：**默认留空**，由用户按需填。
+        # 以前这里预填了作者本机的代理，别人的机器上会直接连不上网，
+        # 而且用户会以为是程序坏了。
+        self.proxy_edit = QLineEdit("")
+        self.proxy_edit.setPlaceholderText("例如 http://127.0.0.1:2333 —— 用不到就留空")
+        proxy_row = QHBoxLayout()
+        proxy_row.addWidget(QLabel("下载代理"))
+        proxy_row.addWidget(self.proxy_edit, 1)
+        proxy_hint = QLabel(
+            "模型从 HuggingFace 下载，<b>国内直连通常很慢或失败</b>，这时才需要填代理；"
+            "留空表示直连。以后也能在「设置 → 网络」里改。"
+        )
+        proxy_hint.setWordWrap(True)
 
         self.bar = QProgressBar()
         self.bar.setRange(0, 100)
@@ -285,6 +299,8 @@ class DownloadPage(QWizardPage):
 
         lay = QVBoxLayout(self)
         lay.addWidget(self.info, 1)
+        lay.addLayout(proxy_row)
+        lay.addWidget(proxy_hint)
         lay.addWidget(self.bar)
         lay.addLayout(row)
 
@@ -530,7 +546,16 @@ class FirstRunWizard(QWizard):
 
     # ---- 向导内部共享 ----
     def proxy(self) -> str:
-        return self.config.proxy
+        """当前生效的代理。
+
+        以向导里那个输入框为准（**默认空**），再回落到配置。
+        不再预填作者本机的地址——别人的机器上不该有那个东西。
+        """
+        try:
+            text = self.page3.proxy_edit.text().strip()
+        except Exception:  # noqa: BLE001
+            text = ""
+        return text or self.config.proxy
 
     def set_proxy(self, value: str) -> None:
         self.config.proxy = value
@@ -541,6 +566,7 @@ class FirstRunWizard(QWizard):
     # ---- 收尾 ----
     def _apply(self) -> None:
         c = self.config
+        c.proxy = self.page3.proxy_edit.text().strip()
         c.asr.preset = "custom"
         tier = next(
             (t for t, rb in self.page2.tier_buttons.items() if rb.isChecked()),

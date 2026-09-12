@@ -122,6 +122,9 @@ class SubtitleOverlay(QWidget):
 
         self.setFont(_pick_cjk_font())
         self._drag_from: QPoint | None = None
+        self._resize_edge: str = ""
+        self._resize_origin: QPoint | None = None
+        self._resize_geo = None
         self._click_through = self.config.click_through
 
         # 对抗游戏抢 Z 序：定时重申置顶（计划书第 2.4 节）
@@ -152,15 +155,28 @@ class SubtitleOverlay(QWidget):
     def apply_config(self, config: OverlayConfig) -> None:
         self.config = config
         self._click_through = config.click_through
+        self._apply_opacity()
         self.apply_native_flags()
         self._relayout()
         self.update()
+
+    def _apply_opacity(self) -> None:
+        """整体不透明度。
+
+        与 ``background_opacity`` 的区别：那个只淡化底衬，这个**连文字一起淡化**，
+        用来让字幕"融进"游戏画面（也有人反过来要它更醒目，所以做成可调）。
+        """
+        try:
+            self.setWindowOpacity(max(0.2, min(1.0, float(self.config.window_opacity))))
+        except Exception as exc:  # noqa: BLE001
+            log.debug("设置窗口不透明度失败: %s", exc)
 
     # ------------------------------------------------------------------ #
     # 原生窗口
     # ------------------------------------------------------------------ #
     def showEvent(self, event) -> None:  # noqa: N802
         super().showEvent(event)
+        self._apply_opacity()
         QTimer.singleShot(0, self.apply_native_flags)
 
     def apply_native_flags(self) -> None:
@@ -205,13 +221,19 @@ class SubtitleOverlay(QWidget):
 
     def _relayout(self) -> None:
         rows = self._max_rows()
-        height = rows * self._line_height() + PADDING * 2 + (STATUS_HEIGHT if self.show_status else 0)
+        auto_h = max(
+            40,
+            rows * self._line_height() + PADDING * 2
+            + (STATUS_HEIGHT if self.show_status else 0),
+        )
+        # 用户手动拖过高就沿用他的高度，否则按内容自动算
+        height = self.config.window_height if self.config.window_height > 0 else auto_h
         width = self.config.window_width
         screen = self.screen()
         if screen is not None:
             geo = screen.availableGeometry()
             width = min(width, geo.width() - 40) if width else geo.width() - 40
-        self.resize(width, max(40, height))
+        self.resize(width, max(auto_h, height))
         self._reposition()
 
     def _build_draw_rows(self) -> list[tuple[str, bool, bool]]:
@@ -364,18 +386,81 @@ class SubtitleOverlay(QWidget):
             p.drawText(x, baseline, display)
 
     # ------------------------------------------------------------------ #
-    # 拖动（未开穿透时）
+    # 拖动 / 缩放（未开穿透时）
     # ------------------------------------------------------------------ #
+    def _hit_edge(self, pos) -> str:
+        """判断鼠标压在哪个边/角上，返回形如 ``"br"`` 的字符串。
+
+        无边框窗口没有系统的缩放边框，只能自己判定——所以这里手工算，
+        否则用户根本没法调字幕窗大小（用户明确提过这个需求）。
+        """
+        m = 8  # 边缘判定宽度（px）
+        w, h = self.width(), self.height()
+        x, y = pos.x(), pos.y()
+        out = ""
+        if x <= m:
+            out += "l"
+        elif x >= w - m:
+            out += "r"
+        if y <= m:
+            out += "t"
+        elif y >= h - m:
+            out += "b"
+        return out
+
     def mousePressEvent(self, event) -> None:  # noqa: N802
-        if event.button() == Qt.LeftButton and not self.config.lock_position:
+        if event.button() != Qt.LeftButton:
+            return
+        edge = self._hit_edge(event.position().toPoint())
+        if edge and self.config.resizable:
+            self._resize_edge = edge
+            self._resize_origin = event.globalPosition().toPoint()
+            self._resize_geo = self.geometry()
+            return
+        if not self.config.lock_position:
             self._drag_from = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        # 缩放
+        if self._resize_edge:
+            delta = event.globalPosition().toPoint() - self._resize_origin
+            geo = self._resize_geo
+            left, top, right, bottom = geo.left(), geo.top(), geo.right(), geo.bottom()
+            if "l" in self._resize_edge:
+                left = min(left + delta.x(), right - 120)
+            if "r" in self._resize_edge:
+                right = max(right + delta.x(), left + 120)
+            if "t" in self._resize_edge:
+                top = min(top + delta.y(), bottom - 30)
+            if "b" in self._resize_edge:
+                bottom = max(bottom + delta.y(), top + 30)
+            self.setGeometry(left, top, right - left, bottom - top)
+            return
+
+        # 拖动
         if self._drag_from is not None and event.buttons() & Qt.LeftButton:
             self.move(event.globalPosition().toPoint() - self._drag_from)
             self.config.position = "custom"  # type: ignore[assignment]
             self.config.custom_x = self.x()
             self.config.custom_y = self.y()
+            return
+
+        # 光标反馈：让用户知道哪里能拖
+        if self.config.resizable and not self._click_through:
+            edge = self._hit_edge(event.position().toPoint())
+            cursors = {
+                "l": Qt.SizeHorCursor, "r": Qt.SizeHorCursor,
+                "t": Qt.SizeVerCursor, "b": Qt.SizeVerCursor,
+                "tl": Qt.SizeFDiagCursor, "br": Qt.SizeFDiagCursor,
+                "tr": Qt.SizeBDiagCursor, "bl": Qt.SizeBDiagCursor,
+            }
+            self.setCursor(cursors.get(edge, Qt.ArrowCursor))
 
     def mouseReleaseEvent(self, _event) -> None:  # noqa: N802
+        if self._resize_edge:
+            # 记下手动尺寸，下次启动沿用（横向拖动改宽度，纵向拖动改高度）
+            self.config.window_width = self.width()
+            self.config.window_height = self.height()
+            log.info("字幕窗尺寸已记录：%dx%d", self.width(), self.height())
+        self._resize_edge = None
         self._drag_from = None

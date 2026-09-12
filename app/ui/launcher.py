@@ -117,40 +117,57 @@ class LauncherWindow(QWidget):
         return int(value) if value is not None else None
 
     # ------------------------------------------------------------------ #
+    def _spawn_child(self, args: list[str]) -> None:
+        """用**独立子进程**启动字幕/电平表。
+
+        为什么必须是独立进程，而不是在本进程里再建窗口：
+
+        1. 同一个 QApplication 里再调 ``app.exec()`` 会报
+           ``QCoreApplication::exec: The event loop is already running``；
+        2. 更糟的是 exec 失败后 ``run_subtitles`` 的 ``finally: pipeline.stop()``
+           会**立刻执行**，日志表现为「开始采集 → 采集线程已停止」，
+           用户看到的就是"点了没反应 / 采集不到音频"；
+        3. 独立进程还能隔离崩溃：字幕进程挂了不会带走主窗口。
+
+        优先用 ``pythonw.exe``（无控制台窗口）；找不到就退回 python.exe。
+        """
+        import os
+        import subprocess
+        import sys
+        from pathlib import Path
+
+        from app.paths import ROOT
+
+        py = Path(sys.executable)
+        pythonw = py.with_name("pythonw.exe")
+        exe = pythonw if pythonw.exists() else py
+
+        flags = 0
+        if os.name == "nt":
+            flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+
+        cmd = [str(exe), str(ROOT / "main.py"), *args]
+        log.info("启动子进程：%s", " ".join(cmd))
+        try:
+            subprocess.Popen(cmd, cwd=str(ROOT), creationflags=flags, close_fds=True)
+        except Exception as exc:  # noqa: BLE001
+            self.empty_hint.setText(f"❌ 启动失败：{exc}")
+
     def _start(self) -> None:
         pid = self._selected_pid()
         if pid is None:
             self.empty_hint.setText("请先在列表里选一个程序。")
             return
-        self._launch_subtitles(pid)
-
-    def _launch_subtitles(self, pid: int) -> None:
-        from app.ui.runner import run_subtitles
-
-        self._timer.stop()
+        self._spawn_child(["--run", str(pid)])
+        # 字幕窗由子进程负责；主窗口先藏起来，免得两个窗口叠在一起
         self.hide()
-        try:
-            # run_subtitles 内部会再起一个事件循环；返回时字幕窗已关闭，回到本窗口
-            run_subtitles(pid=pid, config=self.config)
-        finally:
-            self.show()
-            self._timer.start(3000)
-            self.refresh()
 
     def _open_meter(self) -> None:
         pid = self._selected_pid()
         if pid is None:
             self.empty_hint.setText("请先选一个程序，再打开电平表。")
             return
-        from app.ui.meter import run_meter
-
-        self._timer.stop()
-        self.hide()
-        try:
-            run_meter(pid)
-        finally:
-            self.show()
-            self._timer.start(3000)
+        self._spawn_child(["--meter", str(pid)])
 
     def _open_settings(self) -> None:
         from app.ui.settings import SettingsWindow

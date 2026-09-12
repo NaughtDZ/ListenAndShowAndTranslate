@@ -441,6 +441,20 @@ class OverlayConfig(BaseModel):
 
     background_color: str = "#000000"
     background_opacity: float = Field(default=0.35, ge=0.0, le=1.0)
+    """底衬的不透明度（只影响那块黑底，不影响文字）。"""
+
+    window_opacity: float = Field(default=1.0, ge=0.2, le=1.0)
+    """**整个悬浮窗**的不透明度（连文字一起淡化），让字幕更"融进"游戏画面。"""
+
+    resizable: bool = True
+    """是否允许用鼠标拖边框/右下角调整字幕窗大小。"""
+
+    window_height: int = Field(default=0, ge=0, le=2000)
+    """手动调整过的高度；0 = 按条数与字号自动算。"""
+
+    lock_position: bool = True
+    """锁定位置：勾上后不能拖动，避免玩游戏时误拖。"""
+
     margin_px: int = Field(default=24, ge=0, le=400)
 
     scroll_mode: Literal["accumulate", "replace", "typewriter", "karaoke"] = "accumulate"
@@ -510,8 +524,12 @@ class MeterConfig(BaseModel):
 # --------------------------------------------------------------------------- #
 class AppConfig(BaseModel):
     version: int = CONFIG_VERSION
-    proxy: str = "http://127.0.0.1:2333"
-    """网络代理；留空表示直连。pip/模型下载/翻译 API 共用。"""
+    proxy: str = ""
+    """网络代理；**默认留空（直连）**，让用户自己填。
+
+    以前默认写死成作者本机的代理地址，那是错的：别人的机器上没有这个代理，
+    一启动就连不上网，用户还会以为程序坏了。
+    模型下载与翻译 API 共用这一项；本地地址（127.0.0.1）自动不走代理。"""
 
     first_run_done: bool = False
     audio: AudioConfig = Field(default_factory=AudioConfig)
