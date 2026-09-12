@@ -6,9 +6,16 @@ Ollama / LM Studio / llama.cpp server。
 1. **批量比逐条省 71% token**（5 条一起翻：439 tok vs 逐条 1508 tok），
    所以默认就按 ``batch_size`` 合并请求。代价是批量时术语表遵守率略降，
    因此加了第 3 条的校验。
-2. **推理模型的思考开关在 API 侧关不掉**（``enable_thinking=false``、``/no_think``
-   实测全部无效），会导致 ``content`` 为空字符串而 ``reasoning_content`` 有一大堆内容。
-   不处理的话用户看到的就是**空白字幕**。这里会检测并自动加大预算重试、再退回单条。
+2. **思考必须在客户端主动关掉**（默认关）。字幕翻译是"短句、要快、要省钱"，
+   思考纯属浪费——而且思考模型经常把预算全烧在 ``reasoning_content`` 上，
+   返回**空 content**，用户看到的就是空白字幕。这里做三层处理：
+   ``chat_template_kwargs.enable_thinking=false``（vLLM / LM Studio / llama.cpp 系）、
+   按服务端类型换参数（OpenAI 用 ``reasoning_effort=minimal``、OpenRouter 用
+   ``reasoning.enabled=false``、DashScope 用顶层 ``enable_thinking``）、
+   以及**兜底重试**：空译文时把 ``/no_think`` 追加进提示词再试一次（Qwen 软开关），
+   还不行才加大预算、退回逐条。
+   另外会**剥掉内联在 content 里的思考块**（``<think>…</think>``），
+   否则思考会被当成译文上屏。
 3. **术语表必须可校验**：批量翻译时模型偶尔漏替换（实测「声堂」没被换成「青铜」），
    所以翻完要检查，违规的条目单独重翻。
 
@@ -57,6 +64,52 @@ def looks_like_echo(text: str) -> bool:
     if not text:
         return False
     return any(m in text for m in _PROMPT_MARKERS)
+
+
+_THINK_BLOCK_RE = re.compile(r"<(think|thinking|reasoning)>.*?</\1>", re.S | re.I)
+_THINK_OPEN_RE = re.compile(r"<(think|thinking|reasoning)>.*$", re.S | re.I)
+
+
+def strip_thinking(text: str) -> str:
+    """剥掉**内联在 content 里**的思考块。
+
+    大多数服务端把思考放在单独的 ``reasoning_content`` 字段里，但有些网关
+    （或开了 reasoning 透传的 llama.cpp）会把 ``<think>…</think>`` 直接塞进 content。
+    不处理的话这段"思考"会被当成译文上屏——字幕里出现模型的自言自语。
+    """
+    if not text:
+        return text
+    out = _THINK_BLOCK_RE.sub("", text)
+    # 被 max_tokens 截断、没闭合的思考块：从 <think> 起全丢
+    out = _THINK_OPEN_RE.sub("", out)
+    return out.strip()
+
+
+def thinking_extras(base_url: str, model: str = "") -> dict:
+    """按服务端类型给出「关掉思考」的请求参数。
+
+    **实测（2026-09，LM Studio 0.x）**：这些字段服务端不认识时会**忽略**，
+    不会 400（逐个试过 chat_template_kwargs / reasoning_effort / reasoning /
+    enable_thinking / think / extra_body，全部 200）。但严格网关（OpenAI 官方 API、
+    DeepSeek 官方 API）对未知字段会直接 400，所以 ``_call`` 里遇到 400 会去掉这些
+    参数**重试一次**——功能宁可少关思考，也不能整句翻不出来。
+
+    各家开关不一样（这是 2026 年的现实）：
+
+    * vLLM / LM Studio / llama.cpp / 自建 Qwen 兼容服务：``chat_template_kwargs.enable_thinking=false``
+    * OpenAI 官方（gpt-5 / o 系列）：没有 enable_thinking，只有 ``reasoning_effort``
+    * OpenRouter：``reasoning: {"enabled": false}``
+    * 阿里 DashScope（OpenAI 兼容模式）：顶层 ``enable_thinking: false``
+    """
+    host = urlparse(base_url).netloc.lower()
+    if "openai.com" in host:
+        return {"reasoning_effort": "minimal"}
+    if "openrouter" in host:
+        return {"reasoning": {"enabled": False}}
+    if "dashscope" in host or "aliyuncs" in host:
+        return {"enable_thinking": False}
+    # 其余（本地 / 自建 / 大多数兼容网关）：走 chat 模板开关
+    return {"chat_template_kwargs": {"enable_thinking": False}}
 
 
 def parse_lines(text: str, expected: int) -> dict[int, str] | None:
@@ -227,6 +280,8 @@ class OpenAICompatTranslator:
         self.prompt_style = prompt_style or guess_prompt_style(model)
         self.name = name
         self.stats = TranslatorStats()
+        # 服务端实际回给我们的思考字符数（用来验证「关思考」到底有没有生效）
+        self.reasoning_chars_seen = 0
 
         self._proxy = "" if (not proxy or is_local_url(base_url)) else proxy
         self._client = httpx.Client(
@@ -314,7 +369,12 @@ class OpenAICompatTranslator:
         content, usage, truncated = self._call(request, self.max_tokens)
         if content:
             if len(batch) == 1:
-                out.translations[batch[0].id] = content.strip()
+                # 单条时模型偶尔还是会带"1. "前缀（我们提示词要求不加，但它不一定听）。
+                # 能按编号解析就用解析结果，避免字幕里出现行号。
+                parsed_one = parse_numbered(content, 1) if self.prompt_style != "plain" else None
+                out.translations[batch[0].id] = (
+                    parsed_one[1] if parsed_one else content.strip()
+                )
             else:
                 parsed = (
                     parse_lines(content, len(batch))
@@ -359,6 +419,35 @@ class OpenAICompatTranslator:
             return out
 
         # ---- 第 2 级：空译文（典型是思考 token 吃光了预算）----
+        if self.disable_thinking and self.prompt_style != "plain":
+            # 2a. 先试"硬关思考"：把 /no_think 追加进提示词（Qwen 系软开关）。
+            #     实测有的服务端不吃 chat_template_kwargs，但认这个软开关。
+            log.warning("空译文（疑似思考占满预算），用 /no_think 硬关思考重试一次")
+            out.retries += 1
+            content_nt, usage_nt, _ = self._call(request, self.max_tokens, no_think=True)
+            out.prompt_tokens += usage_nt.get("prompt_tokens", 0)
+            out.completion_tokens += usage_nt.get("completion_tokens", 0)
+            if content_nt:
+                if len(batch) == 1:
+                    parsed_one = (
+                        parse_numbered(content_nt, 1) if self.prompt_style != "plain" else None
+                    )
+                    out.translations[batch[0].id] = (
+                        parsed_one[1] if parsed_one else content_nt.strip()
+                    )
+                else:
+                    parsed_nt = (
+                        parse_lines(content_nt, len(batch))
+                        if self.prompt_style == "plain"
+                        else parse_numbered(content_nt, len(batch))
+                    )
+                    if parsed_nt:
+                        for idx, seg in enumerate(batch, start=1):
+                            out.translations[seg.id] = parsed_nt[idx]
+                if out.translations:
+                    out.note = (out.note + "；" if out.note else "") + "已用 /no_think 关掉思考"
+                    return out
+
         if truncated:
             bigger = min(self.max_tokens * MAX_RETRY_MULTIPLIER, 16384)
             log.warning(
@@ -425,7 +514,7 @@ class OpenAICompatTranslator:
 
     # ------------------------------------------------------------------ #
     def _call(
-        self, request: TranslateRequest, max_tokens: int
+        self, request: TranslateRequest, max_tokens: int, no_think: bool = False
     ) -> tuple[str, dict, bool]:
         """发一次请求。
 
@@ -434,12 +523,21 @@ class OpenAICompatTranslator:
 
         ``prompt_style="plain"`` 时**只把原文发给模型**，不带任何指令——
         因为 sakura 这类微调翻译模型会把指令式 prompt 当成正文翻译回来。
+
+        ``no_think=True`` 时把 ``/no_think`` 追加到最后一条 user 消息末尾
+        （Qwen 系的软开关，实测对部分模型有效）；这只在"思考吃光了预算、
+        content 为空"的兜底重试里用，正常请求不加。
         """
         if self.prompt_style == "plain":
             joined = "\n".join(seg.text for seg in request.segments)
             messages = [{"role": "user", "content": joined}]
         else:
             messages = build_messages(request)
+
+        if no_think and messages:
+            last = dict(messages[-1])
+            last["content"] = f"{last.get('content', '')}\n/no_think"
+            messages = [*messages[:-1], last]
 
         payload: dict = {
             "model": self.model,
@@ -448,18 +546,31 @@ class OpenAICompatTranslator:
             "max_tokens": max_tokens,
             "stream": False,
         }
+        extras: dict = {}
         if self.disable_thinking and self.prompt_style != "plain":
-            # 实测：对 LM Studio 里的 qwen3.8 无效，但对其他服务端可能有效，
-            # 所以照发；真正的兜底是"空译文重试"逻辑。
-            payload["chat_template_kwargs"] = {"enable_thinking": False}
+            # 默认就要求关闭思考：字幕翻译短句要快，思考只会更慢更贵还可能空白
+            extras = thinking_extras(self.base_url, self.model)
+            payload.update(extras)
 
         r = self._client.post(f"{self.base_url}/chat/completions", json=payload)
+        if r.status_code == 400 and extras:
+            # 严格网关（OpenAI / DeepSeek 官方）会因未知字段直接 400：
+            # 去掉关思考的参数重试一次，别让一句都翻不出来
+            log.warning(
+                "端点拒绝了关思考参数（HTTP 400），去掉 %s 重试一次",
+                ", ".join(extras),
+            )
+            payload.pop("reasoning", None)
+            payload.pop("reasoning_effort", None)
+            payload.pop("enable_thinking", None)
+            payload.pop("chat_template_kwargs", None)
+            r = self._client.post(f"{self.base_url}/chat/completions", json=payload)
         r.raise_for_status()
         data = r.json()
 
         choice = (data.get("choices") or [{}])[0]
         msg = choice.get("message") or {}
-        content = (msg.get("content") or "").strip()
+        content = strip_thinking(msg.get("content") or "")
         usage = data.get("usage") or {}
         truncated = choice.get("finish_reason") == "length"
 
@@ -472,13 +583,16 @@ class OpenAICompatTranslator:
             )
             return "", usage, truncated
 
-        if not content:
-            reasoning = (msg.get("reasoning_content") or "").strip()
-            if reasoning:
-                log.warning(
-                    "模型只输出了思考内容（%d 字）而没有译文——"
-                    "推理模型的思考需要在服务端关闭", len(reasoning),
-                )
+        reasoning = (msg.get("reasoning_content") or msg.get("reasoning") or "").strip()
+        if reasoning:
+            self.reasoning_chars_seen += len(reasoning)
+        if not content and reasoning:
+            log.warning(
+                "模型只输出了思考内容（%d 字）而没有译文——"
+                "服务端没能关掉思考，将用 /no_think 兜底重试", len(reasoning),
+            )
+        elif reasoning:
+            log.debug("服务端仍返回了 %d 字思考内容（已忽略，只取 content）", len(reasoning))
         return content, usage, truncated
 
 

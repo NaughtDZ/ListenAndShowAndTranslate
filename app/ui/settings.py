@@ -437,6 +437,19 @@ class SettingsWindow(QWidget):
         lf.addRow("API Key", self.llm_key)
         lf.addRow("模型名", self.llm_model)
         lf.addRow("提示词风格", self.llm_style)
+
+        # 思考开关：默认**关**。字幕翻译不需要思考，而且思考模型常把预算烧光、
+        # content 返回空串（用户看到空白字幕）。
+        self.llm_no_think = QCheckBox("关闭思考（推荐：翻译短句不需要思考，会更快更省钱）")
+        self.llm_no_think.setChecked(getattr(llm, "disable_thinking", True))
+        self.llm_no_think.setToolTip(
+            "会按服务端类型自动选参数：chat_template_kwargs.enable_thinking=false\n"
+            "（vLLM / LM Studio / llama.cpp）、reasoning_effort=minimal（OpenAI 官方）、\n"
+            "reasoning.enabled=false（OpenRouter）、enable_thinking=false（DashScope）。\n"
+            "空译文时还会用 /no_think 软开关兜底重试；严格网关返回 400 会自动去掉这些参数。"
+        )
+        lf.addRow("", self.llm_no_think)
+
         model_hint = QLabel(
             "**模型由你自己选**，程序不替你决定——不同模型显存占用差别巨大"
             "（2B 约 2~4GB，27B 能吃到 20GB+）。<br>"
@@ -1092,6 +1105,46 @@ class SettingsWindow(QWidget):
             self.llm_model.setEditText("")
         self.llm_model.blockSignals(False)
 
+    def _test_llm_translate(self, translator) -> str:
+        """LLM 通道的真测试：**真的翻一句**，并报告思考情况。
+
+        为什么不是只 ping：ping 只证明"端口通了"。用户真正会踩的坑是
+        "模型在思考 → content 空 → 字幕空白"，所以这里跑一次真实翻译，
+        把"服务端回了多少思考字符"直接报给用户看（关思考到底有没有生效）。
+        """
+        import time as _time
+
+        from app.translate.base import Segment as _Segment
+        from app.translate.base import TranslateRequest as _TranslateRequest
+
+        sample = _Segment(id=1, text="夜の列車に乗って、彼は静かに本を読んでいた。", language="ja")
+        req = _TranslateRequest(
+            segments=[sample], source_language="ja", target_language="zh",
+            context=[], glossary={}, template="subtitle_direct", custom_prompt="",
+        )
+        t0 = _time.monotonic()
+        res = translator.translate(req)
+        dt = _time.monotonic() - t0
+        text = (res.translations.get(1) or "").strip()
+        think = getattr(translator, "reasoning_chars_seen", 0)
+        label = PROVIDER_META.get("llm", ("大模型",))[0]
+        if text:
+            head = f"✅ {label}：{dt:.1f}s 译出「{text[:40]}」"
+            if think:
+                head += (
+                    f"\n⚠️ 服务端仍然返回了 {think} 字思考内容——"
+                    "说明这个服务端不吃关思考参数（译文本身没问题，但会慢一些）。"
+                )
+            elif self.llm_no_think.isChecked():
+                head += "（已确认没有思考内容 ✓）"
+            return head
+        if think:
+            return (
+                f"❌ {label}：{dt:.1f}s 只回了 {think} 字思考、没有译文。\n"
+                "这是典型的「思考吃光预算」：把「关闭思考」勾上，或换个小一点的模型。"
+            )
+        return f"❌ {label}：{dt:.1f}s 没有译文（{res.note or '无说明'}）"
+
     def _test_translate(self) -> str:
         pid = self.provider_combo.currentData() or "none"
         if pid == "none":
@@ -1108,6 +1161,7 @@ class SettingsWindow(QWidget):
                     model=self.llm_model.currentText().strip(),
                     proxy=self.proxy_edit.text().strip(),
                     prompt_style=self.llm_style.currentData() or "",
+                    disable_thinking=self.llm_no_think.isChecked(),
                 )
             else:
                 creds = {k: e.text().strip() for k, e in self.cred_fields.items()}
@@ -1115,6 +1169,8 @@ class SettingsWindow(QWidget):
             if t is None:
                 return f"无法构造通道 {pid}"
             try:
+                if pid == "llm":
+                    return self._test_llm_translate(t)
                 ok, msg = t.ping()
                 return f"{'✅' if ok else '❌'} {PROVIDER_META.get(pid, (pid,))[0]}：{msg}"
             finally:
@@ -1145,6 +1201,7 @@ class SettingsWindow(QWidget):
         c.translate.llm.model = self.llm_model.currentText().strip()
         c.translate.llm.enabled = True
         c.translate.llm.prompt_style = self.llm_style.currentData() or ""
+        c.translate.llm.disable_thinking = self.llm_no_think.isChecked()
 
         # 术语表：内联优先，同时把路径记下来（便于用户下次继续用文件）
         glossary: dict[str, str] = {}

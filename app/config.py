@@ -386,6 +386,16 @@ class LLMConfig(BaseModel):
     timeout_s: float = Field(default=60.0, gt=0)
     stream: bool = True
 
+    disable_thinking: bool = True
+    """是否默认要求服务端**关闭思考**（推荐 True）。
+
+    字幕翻译是"短句、要快、要省钱"，思考只会更慢更贵，而且思考模型经常把
+    输出预算全烧在 ``reasoning_content`` 上、``content`` 返回空串 → 用户看到空白字幕。
+    实现见 ``app/translate/openai_compat.py``：按服务端类型选参数
+    （chat_template_kwargs / reasoning_effort / reasoning.enabled / enable_thinking），
+    空译文时再用 ``/no_think`` 软开关兜底重试；遇到严格网关 400 会自动去掉这些参数重试。
+    """
+
     prompt_style: str = ""
     """提示词风格：``""``=按模型名自动判断，``chat``=指令模型，``plain``=微调翻译模型。
 

@@ -120,6 +120,8 @@ class SubtitlePipeline(QObject):
                     timeout_s=llm.timeout_s, proxy=cfg.proxy,
                     verify_glossary=True, name="llm",
                     prompt_style=getattr(llm, "prompt_style", "") or "",
+                    # 思考默认关（字幕翻译不需要思考，且会把预算烧光导致空译文）
+                    disable_thinking=getattr(llm, "disable_thinking", True),
                 )
                 self.hub.register(t, priority=10)
                 ok, msg = t.ping()
