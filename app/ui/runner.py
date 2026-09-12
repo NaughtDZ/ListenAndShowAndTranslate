@@ -94,6 +94,8 @@ class SubtitleControlWindow(QWidget):
         self.pause_btn.setCheckable(True)
         self.pause_btn.toggled.connect(self._toggle_pause)
 
+        self.settings_btn = QPushButton("设置…")
+
         self.quit_btn = QPushButton("退出")
 
         root = QVBoxLayout(self)
@@ -106,10 +108,23 @@ class SubtitleControlWindow(QWidget):
         root.addWidget(self.hint_label)
         root.addStretch(1)
         root.addWidget(self.pause_btn)
+        root.addWidget(self.settings_btn)
         root.addWidget(self.quit_btn)
 
         # 按内容自适应尺寸（高 DPI 下字体放大，固定尺寸会把按钮挤掉）
         self.adjustSize()
+
+    def _open_settings(self) -> None:
+        """打开设置窗。**不能放在悬浮窗里**——开了点击穿透就点不动了。"""
+        from app.ui.settings import SettingsWindow
+
+        win = getattr(self, "_settings_win", None)
+        if win is not None and win.isVisible():
+            win.raise_()
+            win.activateWindow()
+            return
+        self._settings_win = SettingsWindow(self.pipeline.config)
+        self._settings_win.show()
 
     # ------------------------------------------------------------------ #
     def _set_mode(self, mode: str) -> None:
@@ -204,6 +219,7 @@ def run_subtitles(pid: int | None = None, process_name: str = "", config: AppCon
     on_status(note or "就绪")
 
     control.quit_btn.clicked.connect(app.quit)
+    control.settings_btn.clicked.connect(control._open_settings)
     overlay.show()
     control.show()
 

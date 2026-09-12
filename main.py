@@ -379,6 +379,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--meter", metavar="PID", help="打开电平表悬浮窗（RMS/PEAK 条 + 可调阈值）")
     p.add_argument("--run", metavar="PID", help="启动字幕程序：透明悬浮窗 + 实时翻译")
     p.add_argument("--process", metavar="NAME", help="配合 --run：按进程名（如 喜马拉雅.exe）")
+    p.add_argument("--settings", action="store_true", help="打开设置界面（网络/翻译/识别/外观）")
     p.add_argument(
         "--models",
         choices=["list", "status", "install", "uninstall"],
@@ -420,6 +421,15 @@ def main(argv: list[str] | None = None) -> int:
         return list_audio_processes()
     if args.models:
         return models_command(args)
+    if args.settings:
+        from PySide6.QtWidgets import QApplication
+
+        from app.ui.settings import SettingsWindow
+
+        app = QApplication.instance() or QApplication([])
+        win = SettingsWindow(AppConfig.load())
+        win.show()
+        return int(app.exec())
     if args.run or args.process:
         from app.ui.runner import run_subtitles
 

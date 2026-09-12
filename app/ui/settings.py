@@ -1,0 +1,656 @@
+"""设置界面。
+
+四个分页，都是"用户在真实使用中一定会要调"的东西：
+
+  网络  —— 程序走哪个代理（模型下载、翻译通道共用），以及一键连通性测试
+  翻译  —— 用哪个通道、凭据、上下文行数、提示词模板、术语表，以及一键测试
+  识别  —— 语言、延迟档位与五个延迟参数（每个都写清"调小/调大各会怎样"）
+  外观  —— 原文/译文/双语、滚动方式、每屏行数、字号颜色、点击穿透
+
+两个设计约束（都是踩过坑之后定的）：
+
+1. **控制项不能放在悬浮窗里** —— 一旦开启点击穿透，悬浮窗就点不动了，
+   用户会把自己锁死。所以所有设置都在这个普通窗口里。
+2. **每个旋钮都要写清作用** —— 只写"延迟相关"等于没写。
+   延迟参数的说明文字直接来自 ``app/config.py: LATENCY_KNOBS``，
+   与 docs/延迟调节.md 同源，避免两处维护。
+"""
+
+from __future__ import annotations
+
+from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtWidgets import (
+    QCheckBox,
+    QComboBox,
+    QDoubleSpinBox,
+    QFormLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QPushButton,
+    QScrollArea,
+    QSlider,
+    QSpinBox,
+    QTabWidget,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+)
+
+from app.config import LATENCY_KNOBS, LATENCY_PRESETS, AppConfig
+from app.translate.prompts import list_templates
+from app.translate.traditional.providers import ALL_PROVIDERS, WEB_PROVIDERS
+from app.utils.log import get_logger
+
+log = get_logger(__name__)
+
+# 通道 id → 展示名与需要的凭据字段
+PROVIDER_META: dict[str, tuple[str, dict[str, str]]] = {
+    "none": ("不翻译（只显示原文）", {}),
+    "llm": ("本地/在线大模型（OpenAI 兼容）", {}),
+    "web_google": ("谷歌网页版（免 key·需代理）", {}),
+    "web_bing": ("必应网页版（免 key·需代理）", {}),
+    "baidu": ("百度翻译 API", {"app_id": "APP ID", "secret_key": "密钥"}),
+    "youdao": ("有道智云 API", {"app_key": "应用 ID", "app_secret": "应用密钥"}),
+    "azure": ("微软 Azure 翻译", {"api_key": "密钥", "region": "区域（如 eastasia）"}),
+    "google": ("谷歌云翻译 API", {"api_key": "API Key"}),
+    "deepl": ("DeepL", {"api_key": "API Key"}),
+}
+
+
+class _TestThread(QThread):
+    """在后台跑连通性测试，避免界面卡死（网络请求可能几秒）。"""
+
+    done = Signal(str)
+
+    def __init__(self, fn) -> None:
+        super().__init__()
+        self._fn = fn
+
+    def run(self) -> None:  # noqa: D102
+        try:
+            self.done.emit(self._fn())
+        except Exception as exc:  # noqa: BLE001
+            self.done.emit(f"✗ 测试异常: {type(exc).__name__}: {exc}")
+
+
+class SettingsWindow(QWidget):
+    """设置窗口。改动即时写回 config 对象，由调用方负责保存。"""
+
+    def __init__(self, config: AppConfig | None = None) -> None:
+        super().__init__(None)
+        self.config = config or AppConfig.load()
+        self.setWindowTitle("听·显·译 — 设置")
+        self.resize(720, 640)
+        self.setMinimumWidth(560)
+
+        self._threads: list[_TestThread] = []
+
+        tabs = QTabWidget(self)
+        tabs.addTab(self._build_network_tab(), "网络")
+        tabs.addTab(self._build_translate_tab(), "翻译")
+        tabs.addTab(self._build_asr_tab(), "识别")
+        tabs.addTab(self._build_appearance_tab(), "外观")
+
+        self.status = QLabel("")
+        self.status.setWordWrap(True)
+        save_btn = QPushButton("保存设置")
+        save_btn.clicked.connect(self._save)
+        close_btn = QPushButton("关闭")
+        close_btn.clicked.connect(self.close)
+
+        bottom = QHBoxLayout()
+        bottom.addWidget(self.status, 1)
+        bottom.addWidget(save_btn)
+        bottom.addWidget(close_btn)
+
+        root = QVBoxLayout(self)
+        root.addWidget(tabs, 1)
+        root.addLayout(bottom)
+
+    # ------------------------------------------------------------------ #
+    # 网络
+    # ------------------------------------------------------------------ #
+    def _build_network_tab(self) -> QWidget:
+        page = QWidget()
+        outer = QVBoxLayout(page)
+
+        box = QGroupBox("网络代理")
+        form = QFormLayout(box)
+
+        self.proxy_edit = QLineEdit(self.config.proxy)
+        self.proxy_edit.setPlaceholderText("如 http://127.0.0.1:2333，留空表示直连")
+        form.addRow("代理地址", self.proxy_edit)
+
+        hint = QLabel(
+            "这个代理由<b>模型下载</b>、<b>翻译通道</b>共用。<br>"
+            "· <b>本地地址</b>（127.0.0.1 / localhost，例如 LM Studio）自动不走代理<br>"
+            "· 谷歌 / 必应网页版<b>必须走代理</b>（国内直连不通）<br>"
+            "· 内置的 5 家官方翻译 API 大多可直连，但走代理也没问题"
+        )
+        hint.setWordWrap(True)
+        form.addRow("", hint)
+
+        row = QHBoxLayout()
+        test_proxy = QPushButton("测试代理连通性")
+        test_proxy.clicked.connect(lambda: self._run_test(self._test_proxy))
+        test_all = QPushButton("测试全部通道")
+        test_all.clicked.connect(lambda: self._run_test(self._test_all))
+        row.addWidget(test_proxy)
+        row.addWidget(test_all)
+        row.addStretch(1)
+        form.addRow("", row)
+
+        outer.addWidget(box)
+
+        self.net_log = QTextEdit()
+        self.net_log.setReadOnly(True)
+        self.net_log.setMinimumHeight(220)
+        outer.addWidget(QLabel("测试结果"))
+        outer.addWidget(self.net_log, 1)
+        return page
+
+    # ------------------------------------------------------------------ #
+    # 翻译
+    # ------------------------------------------------------------------ #
+    def _build_translate_tab(self) -> QWidget:
+        page = QWidget()
+        outer = QVBoxLayout(page)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        inner = QWidget()
+        scroll.setWidget(inner)
+        outer.addWidget(scroll)
+        lay = QVBoxLayout(inner)
+
+        # --- 通道 ---
+        box = QGroupBox("翻译通道")
+        form = QFormLayout(box)
+
+        self.enable_translate = QCheckBox("启用翻译")
+        self.enable_translate.setChecked(self.config.translate.enabled)
+        form.addRow("", self.enable_translate)
+
+        self.provider_combo = QComboBox()
+        for pid, (label, _) in PROVIDER_META.items():
+            tag = "  [非官方接口]" if pid in WEB_PROVIDERS else ""
+            self.provider_combo.addItem(f"{label}{tag}", pid)
+        idx = self.provider_combo.findData(self.config.translate.provider)
+        self.provider_combo.setCurrentIndex(max(0, idx))
+        self.provider_combo.currentIndexChanged.connect(self._on_provider_changed)
+        form.addRow("通道", self.provider_combo)
+
+        self.cred_fields: dict[str, QLineEdit] = {}
+        self.cred_box = QGroupBox("凭据")
+        self.cred_form = QFormLayout(self.cred_box)
+        form.addRow(self.cred_box)
+
+        # --- LLM 专用 ---
+        self.llm_box = QGroupBox("大模型设置（OpenAI 兼容：LM Studio / Ollama / 云端）")
+        lf = QFormLayout(self.llm_box)
+        llm = self.config.translate.llm
+        self.llm_base = QLineEdit(llm.base_url)
+        self.llm_base.setPlaceholderText("http://127.0.0.1:1234/v1")
+        self.llm_key = QLineEdit(llm.api_key)
+        self.llm_key.setEchoMode(QLineEdit.Password)
+        self.llm_key.setPlaceholderText("本地模型通常留空")
+        self.llm_model = QLineEdit(llm.model)
+        self.llm_model.setPlaceholderText("如 qwen3.8-2b-uncensored")
+        self.llm_style = QComboBox()
+        self.llm_style.addItem("指令模型（chat，走完整提示词）", "chat")
+        self.llm_style.addItem("纯翻译模型（plain，只喂原文）", "plain")
+        lf.addRow("接口地址", self.llm_base)
+        lf.addRow("API Key", self.llm_key)
+        lf.addRow("模型名", self.llm_model)
+        lf.addRow("提示词风格", self.llm_style)
+        style_hint = QLabel(
+            "sakura-galtransl 这类<b>微调翻译模型</b>必须选 <b>plain</b>，"
+            "否则它会把提示词当正文翻译回来（实测踩过）。"
+        )
+        style_hint.setWordWrap(True)
+        lf.addRow("", style_hint)
+        form.addRow(self.llm_box)
+
+        # --- 通用 ---
+        self.ctx_lines = QSpinBox()
+        self.ctx_lines.setRange(0, 200)
+        self.ctx_lines.setValue(self.config.translate.context_lines)
+        self.ctx_lines.setSuffix(" 行")
+        form.addRow("带入前文", self.ctx_lines)
+        ctx_hint = QLabel("实测每行约 31 token；20 行仅占 8k 窗口的 9.7%，对译名一致帮助很大。")
+        ctx_hint.setWordWrap(True)
+        form.addRow("", ctx_hint)
+
+        self.template_combo = QComboBox()
+        for t in list_templates():
+            self.template_combo.addItem(f"{t.name} — {t.description}", t.id)
+        ti = self.template_combo.findData(self.config.translate.prompt_template)
+        self.template_combo.setCurrentIndex(max(0, ti))
+        form.addRow("提示词模板", self.template_combo)
+
+        self.glossary_edit = QLineEdit(self._glossary_path())
+        self.glossary_edit.setPlaceholderText("术语表文件（.tsv 或 .json），留空不用")
+        form.addRow("术语表", self.glossary_edit)
+
+        self.prompt_edit = QTextEdit(self.config.translate.custom_prompt)
+        self.prompt_edit.setPlaceholderText("留空使用上面的内置模板；填了就完全覆盖系统提示词")
+        self.prompt_edit.setMinimumHeight(70)
+        form.addRow("自定义提示词", self.prompt_edit)
+
+        test_btn = QPushButton("测试当前翻译通道")
+        test_btn.clicked.connect(lambda: self._run_test(self._test_translate))
+        form.addRow("", test_btn)
+
+        lay.addWidget(box)
+
+        # --- 术语表编辑 ---
+        gbox = QGroupBox("术语表（原文 → 译法，每行一条）")
+        gl = QVBoxLayout(gbox)
+        self.glossary_edit_box = QTextEdit()
+        self.glossary_edit_box.setPlaceholderText("リンファン\t林凡\n声堂\t青铜")
+        self.glossary_edit_box.setMinimumHeight(120)
+        self._load_glossary_into_box()
+        gl.addWidget(self.glossary_edit_box)
+        ghint = QLabel(
+            "只注入<b>本条字幕里真正出现</b>的术语——整表注入既费 token 又会让模型硬套无关词。"
+        )
+        ghint.setWordWrap(True)
+        gl.addWidget(ghint)
+        lay.addWidget(gbox)
+
+        self._on_provider_changed()
+        return page
+
+    # ------------------------------------------------------------------ #
+    # 识别
+    # ------------------------------------------------------------------ #
+    def _build_asr_tab(self) -> QWidget:
+        page = QWidget()
+        outer = QVBoxLayout(page)
+        form_box = QGroupBox("识别设置")
+        form = QFormLayout(form_box)
+
+        self.lang_combo = QComboBox()
+        for code, label in (
+            ("auto", "自动识别（用 LID 判断语种）"),
+            ("zh", "中文"), ("zh-en", "中英混说"), ("en", "英语"),
+            ("ja", "日语"), ("ko", "韩语"), ("yue", "粤语"),
+        ):
+            self.lang_combo.addItem(label, code)
+        li = self.lang_combo.findData(self.config.asr.language)
+        self.lang_combo.setCurrentIndex(max(0, li))
+        form.addRow("语言", self.lang_combo)
+
+        lang_hint = QLabel(
+            "⚠️ 官方<b>没有日语流式模型</b>，所以日语会走 SenseVoice 分块识别，"
+            "延迟比中文高（约 1.0~1.8s vs 中文 0.4~0.7s）。这是模型可用性的限制，不是参数问题。"
+        )
+        lang_hint.setWordWrap(True)
+        form.addRow("", lang_hint)
+
+        outer.addWidget(form_box)
+
+        # --- 延迟档位 ---
+        preset_box = QGroupBox("延迟档位")
+        pv = QVBoxLayout(preset_box)
+        row = QHBoxLayout()
+        self.preset_buttons: dict[str, QPushButton] = {}
+        for pid, label in (
+            ("realtime", "最低延迟"), ("balanced", "平衡（默认）"), ("accurate", "最准"),
+        ):
+            b = QPushButton(label)
+            b.setCheckable(True)
+            b.clicked.connect(lambda _c=False, p=pid: self._apply_preset(p))
+            self.preset_buttons[pid] = b
+            row.addWidget(b)
+        row.addStretch(1)
+        pv.addLayout(row)
+        self.preset_label = QLabel("")
+        pv.addWidget(self.preset_label)
+        outer.addWidget(preset_box)
+
+        # --- 五个延迟参数（说明文字与 docs/延迟调节.md 同源）---
+        knob_box = QGroupBox("延迟参数（拖动后档位变为自定义）")
+        kv = QVBoxLayout(knob_box)
+        self.knob_sliders: dict[str, QSlider] = {}
+
+        for knob in LATENCY_KNOBS:
+            holder = QVBoxLayout()
+            head = QHBoxLayout()
+            name = QLabel(f"<b>{knob.label}</b>")
+            value = QLabel("")
+            head.addWidget(name)
+            head.addStretch(1)
+            head.addWidget(value)
+            holder.addLayout(head)
+
+            slider = QSlider(Qt.Horizontal)
+            slider.setMinimum(50)
+            slider.setMaximum(15000 if knob.field != "partial_interval_ms" else 2000)
+            slider.setValue(self._knob_value(knob))
+            slider.valueChanged.connect(
+                lambda v, k=knob, lb=value: self._on_knob_changed(k, v, lb)
+            )
+            holder.addWidget(slider)
+
+            desc = QLabel(
+                f"调小 → {knob.smaller}<br>调大 → {knob.larger}"
+            )
+            desc.setWordWrap(True)
+            desc.setStyleSheet("color:#888;")
+            holder.addWidget(desc)
+
+            if knob.section == "asr" and self.config.asr.routing.get(
+                self.config.asr.language, {}
+            ):
+                route = self.config.asr.routing.get(self.config.asr.language)
+                if route is not None and not getattr(route, "streaming", True):
+                    slider.setEnabled(False)
+                    desc.setText(desc.text() + "<br><b>该语言使用分块识别，此项无效</b>")
+
+            self.knob_sliders[knob.field] = slider
+            value.setText(f"{slider.value()} ms")
+            kv.addLayout(holder)
+            kv.addSpacing(6)
+
+        outer.addWidget(knob_box)
+        outer.addStretch(1)
+        self._refresh_preset_label()
+        return page
+
+    # ------------------------------------------------------------------ #
+    # 外观
+    # ------------------------------------------------------------------ #
+    def _build_appearance_tab(self) -> QWidget:
+        page = QWidget()
+        form = QFormLayout(page)
+        ov = self.config.overlay
+
+        self.mode_combo = QComboBox()
+        for code, label in (("source", "只有原文"), ("target", "只有译文"), ("bilingual", "双语")):
+            self.mode_combo.addItem(label, code)
+        self.mode_combo.setCurrentIndex(max(0, self.mode_combo.findData(ov.display_mode)))
+        form.addRow("显示内容", self.mode_combo)
+
+        self.scroll_combo = QComboBox()
+        self.scroll_combo.addItem("累积上滚", "accumulate")
+        self.scroll_combo.addItem("单行替换", "replace")
+        self.scroll_combo.setCurrentIndex(max(0, self.scroll_combo.findData(ov.scroll_mode)))
+        form.addRow("滚动方式", self.scroll_combo)
+
+        self.max_lines = QSpinBox()
+        self.max_lines.setRange(1, 20)
+        self.max_lines.setValue(ov.max_lines)
+        self.max_lines.setSuffix(" 条")
+        form.addRow("每屏条数", self.max_lines)
+
+        self.lines_per_sub = QSpinBox()
+        self.lines_per_sub.setRange(1, 6)
+        self.lines_per_sub.setValue(ov.lines_per_subtitle)
+        self.lines_per_sub.setSuffix(" 行")
+        form.addRow("每条最多换行", self.lines_per_sub)
+
+        self.font_size = QSpinBox()
+        self.font_size.setRange(8, 200)
+        self.font_size.setValue(ov.font_size)
+        self.font_size.setSuffix(" pt")
+        form.addRow("字号", self.font_size)
+
+        self.outline_width = QSpinBox()
+        self.outline_width.setRange(0, 12)
+        self.outline_width.setValue(ov.outline_width)
+        form.addRow("描边粗细", self.outline_width)
+        oh = QLabel("描边保证字幕在亮暗不定的游戏画面上都能看清；设为 0 则关闭描边。")
+        oh.setWordWrap(True)
+        form.addRow("", oh)
+
+        self.win_width = QSpinBox()
+        self.win_width.setRange(200, 6000)
+        self.win_width.setValue(ov.window_width)
+        self.win_width.setSuffix(" px")
+        form.addRow("字幕窗宽度", self.win_width)
+
+        self.bg_opacity = QDoubleSpinBox()
+        self.bg_opacity.setRange(0.0, 1.0)
+        self.bg_opacity.setSingleStep(0.05)
+        self.bg_opacity.setValue(ov.background_opacity)
+        form.addRow("背景不透明度", self.bg_opacity)
+
+        self.click_through = QCheckBox("点击穿透（鼠标穿透到游戏）")
+        self.click_through.setChecked(ov.click_through)
+        form.addRow("", self.click_through)
+        ch = QLabel(
+            "开启后悬浮窗点不动，<b>要关掉请回到这个窗口</b>（所以控制项不放在悬浮窗里）。<br>"
+            "真·独占全屏游戏无法被普通窗口覆盖，请把游戏设为「无边框窗口全屏」。"
+        )
+        ch.setWordWrap(True)
+        form.addRow("", ch)
+
+        self.always_on_top = QCheckBox("始终置顶（每 2 秒重申一次，对抗游戏抢 Z 序）")
+        self.always_on_top.setChecked(ov.always_on_top)
+        form.addRow("", self.always_on_top)
+        return page
+
+    # ------------------------------------------------------------------ #
+    # 交互
+    # ------------------------------------------------------------------ #
+    def _glossary_path(self) -> str:
+        g = self.config.translate.glossary
+        return g.get("_path", "") if isinstance(g, dict) else ""
+
+    def _load_glossary_into_box(self) -> None:
+        g = self.config.translate.glossary
+        if not isinstance(g, dict):
+            return
+        lines = [f"{k}\t{v}" for k, v in g.items() if not k.startswith("_")]
+        self.glossary_edit_box.setPlainText("\n".join(lines))
+
+    def _on_provider_changed(self) -> None:
+        pid = self.provider_combo.currentData() or "none"
+        while self.cred_form.count():
+            item = self.cred_form.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        self.cred_fields.clear()
+        for key, label in PROVIDER_META.get(pid, ("", {}))[1].items():
+            edit = QLineEdit(str(self.config.translate.providers.get(pid, {}).get(key, "")))
+            if "secret" in key or "key" in key:
+                edit.setEchoMode(QLineEdit.Password)
+            self.cred_form.addRow(label, edit)
+            self.cred_fields[key] = edit
+        self.cred_box.setVisible(bool(self.cred_fields))
+        self.llm_box.setVisible(pid == "llm")
+
+    def _knob_value(self, knob) -> int:
+        if knob.section == "asr":
+            return int(getattr(self.config.asr, knob.field))
+        return int(getattr(self.config.asr.vad, knob.field))
+
+    def _on_knob_changed(self, knob, value: int, label: QLabel) -> None:
+        label.setText(f"{value} ms")
+        if knob.section == "asr":
+            setattr(self.config.asr, knob.field, value)
+        else:
+            setattr(self.config.asr.vad, knob.field, value)
+        self.config.asr.latency_preset = "custom"  # type: ignore[assignment]
+        self._refresh_preset_label()
+
+    def _apply_preset(self, preset: str) -> None:
+        self.config.asr.apply_latency_preset(preset)
+        for knob in LATENCY_KNOBS:
+            s = self.knob_sliders.get(knob.field)
+            if s is not None:
+                s.blockSignals(True)
+                s.setValue(self._knob_value(knob))
+                s.blockSignals(False)
+        self._refresh_preset_label()
+
+    def _refresh_preset_label(self) -> None:
+        cur = self.config.asr.detect_preset()
+        for pid, b in self.preset_buttons.items():
+            b.setChecked(pid == cur)
+        labels = {"realtime": "最低延迟", "balanced": "平衡", "accurate": "最准", "custom": "自定义"}
+        self.preset_label.setText(
+            f"当前档位：<b>{labels.get(cur, cur)}</b>"
+            + ("" if cur != "custom" else "（参数被手动改过）")
+        )
+
+    # ------------------------------------------------------------------ #
+    def _run_test(self, fn) -> None:
+        self.status.setText("测试中…（网络请求可能几秒）")
+        t = _TestThread(fn)
+        t.done.connect(self._on_test_done)
+        self._threads.append(t)
+        t.start()
+
+    def _on_test_done(self, text: str) -> None:
+        self.status.setText("测试完成")
+        self.net_log.append(text)
+
+    # --- 具体测试 ---
+    def _test_proxy(self) -> str:
+        import socket
+        from urllib.parse import urlparse
+
+        proxy = self.proxy_edit.text().strip()
+        if not proxy:
+            return "代理：未设置（直连）"
+        u = urlparse(proxy)
+        try:
+            s = socket.socket()
+            s.settimeout(2.0)
+            s.connect((u.hostname or "", u.port or 0))
+            s.close()
+            return f"✅ 代理 {proxy} 端口可达"
+        except Exception as exc:  # noqa: BLE001
+            return f"❌ 代理 {proxy} 不可达：{exc}"
+
+    def _test_all(self) -> str:
+        out = [self._test_proxy()]
+        proxy = self.proxy_edit.text().strip()
+        for pid in ("web_google", "web_bing"):
+            try:
+                from app.translate.traditional.providers import build_provider
+
+                t = build_provider(pid, {}, proxy=proxy, qps_limit=1.0)
+                ok, msg = t.ping() if t else (False, "无法构造")
+                out.append(f"{'✅' if ok else '❌'} {PROVIDER_META[pid][0]}：{msg}")
+                if t:
+                    t.close()
+            except Exception as exc:  # noqa: BLE001
+                out.append(f"❌ {pid}：{exc}")
+        base = self.llm_base.text().strip()
+        if base:
+            try:
+                from app.translate.openai_compat import probe_endpoint
+
+                ok, msg, models = probe_endpoint(base, self.llm_key.text().strip(), proxy)
+                out.append(f"{'✅' if ok else '❌'} 大模型 {base}：{msg}")
+                if models:
+                    out.append("     可用模型：" + "、".join(models[:6])
+                               + ("…" if len(models) > 6 else ""))
+            except Exception as exc:  # noqa: BLE001
+                out.append(f"❌ 大模型：{exc}")
+        return "\n".join(out)
+
+    def _test_translate(self) -> str:
+        pid = self.provider_combo.currentData() or "none"
+        if pid == "none":
+            return "当前选择的是「不翻译」"
+        try:
+            from app.translate.traditional.providers import build_provider
+
+            if pid in ("llm",):
+                from app.translate.openai_compat import OpenAICompatTranslator
+
+                t = OpenAICompatTranslator(
+                    base_url=self.llm_base.text().strip(),
+                    api_key=self.llm_key.text().strip(),
+                    model=self.llm_model.text().strip(),
+                    proxy=self.proxy_edit.text().strip(),
+                    prompt_style=self.llm_style.currentData() or "",
+                )
+            else:
+                creds = {k: e.text().strip() for k, e in self.cred_fields.items()}
+                t = build_provider(pid, creds, proxy=self.proxy_edit.text().strip())
+            if t is None:
+                return f"无法构造通道 {pid}"
+            try:
+                ok, msg = t.ping()
+                return f"{'✅' if ok else '❌'} {PROVIDER_META.get(pid, (pid,))[0]}：{msg}"
+            finally:
+                t.close()
+        except Exception as exc:  # noqa: BLE001
+            return f"❌ 测试失败：{type(exc).__name__}: {exc}"
+
+    # ------------------------------------------------------------------ #
+    def _save(self) -> None:
+        from pathlib import Path
+
+        c = self.config
+        c.proxy = self.proxy_edit.text().strip()
+        c.translate.enabled = self.enable_translate.isChecked()
+        c.translate.provider = self.provider_combo.currentData() or "none"
+        c.translate.context_lines = self.ctx_lines.value()
+        c.translate.prompt_template = self.template_combo.currentData() or "subtitle_direct"
+        c.translate.custom_prompt = self.prompt_edit.text()
+
+        pid = c.translate.provider
+        if self.cred_fields:
+            bucket = dict(c.translate.providers.get(pid, {}))
+            bucket.update({k: e.text().strip() for k, e in self.cred_fields.items()})
+            c.translate.providers[pid] = bucket
+
+        c.translate.llm.base_url = self.llm_base.text().strip()
+        c.translate.llm.api_key = self.llm_key.text().strip()
+        c.translate.llm.model = self.llm_model.text().strip()
+        c.translate.llm.enabled = True
+        c.translate.llm.prompt_style = self.llm_style.currentData() or ""
+
+        # 术语表：内联优先，同时把路径记下来（便于用户下次继续用文件）
+        glossary: dict[str, str] = {}
+        path = self.glossary_edit.text().strip()
+        if path:
+            glossary["_path"] = path
+        for line in self.glossary_edit_box.toPlainText().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = [x.strip() for x in line.split("\t")] if "\t" in line else line.split(None, 1)
+            if len(parts) >= 2 and parts[0] and parts[1]:
+                glossary[parts[0]] = parts[1]
+        c.translate.glossary = glossary
+
+        c.asr.language = self.lang_combo.currentData() or "auto"
+        c.overlay.display_mode = self.mode_combo.currentData() or "bilingual"
+        c.overlay.scroll_mode = self.scroll_combo.currentData() or "accumulate"
+        c.overlay.max_lines = self.max_lines.value()
+        c.overlay.lines_per_subtitle = self.lines_per_sub.value()
+        c.overlay.font_size = self.font_size.value()
+        c.overlay.outline_width = self.outline_width.value()
+        c.overlay.window_width = self.win_width.value()
+        c.overlay.background_opacity = self.bg_opacity.value()
+        c.overlay.click_through = self.click_through.isChecked()
+        c.overlay.always_on_top = self.always_on_top.isChecked()
+
+        try:
+            c.save()
+            self.status.setText("✅ 已保存到 data/config.json")
+        except Exception as exc:  # noqa: BLE001
+            self.status.setText(f"❌ 保存失败：{exc}")
+            return
+
+        # 术语表若填了路径，顺便落盘，方便用户用 Excel 维护
+        if path:
+            try:
+                from app.translate.glossary import Glossary
+
+                g = Glossary()
+                for k, v in glossary.items():
+                    if not k.startswith("_"):
+                        g.add(k, v)
+                g.to_file(Path(path))
+            except Exception as exc:  # noqa: BLE001
+                log.warning("写术语表文件失败: %s", exc)

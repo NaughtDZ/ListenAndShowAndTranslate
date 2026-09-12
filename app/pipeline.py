@@ -119,6 +119,7 @@ class SubtitlePipeline(QObject):
                     temperature=llm.temperature, max_tokens=llm.max_tokens,
                     timeout_s=llm.timeout_s, proxy=cfg.proxy,
                     verify_glossary=True, name="llm",
+                    prompt_style=getattr(llm, "prompt_style", "") or "",
                 )
                 self.hub.register(t, priority=10)
                 ok, msg = t.ping()

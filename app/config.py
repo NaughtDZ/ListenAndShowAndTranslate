@@ -366,6 +366,15 @@ class LLMConfig(BaseModel):
     timeout_s: float = Field(default=60.0, gt=0)
     stream: bool = True
 
+    prompt_style: str = ""
+    """提示词风格：``""``=按模型名自动判断，``chat``=指令模型，``plain``=微调翻译模型。
+
+    **实测事故**：sakura-galtransl-7b 是微调翻译模型，喂指令式 prompt 会把整段
+    提示词当正文吐回来（"【待翻译（共 1 条）】…请按相同编号逐条输出译文…"），
+    而且这段垃圾进上下文后会污染后续所有请求。plain 模式只发原文。
+    自动判断规则见 ``openai_compat.guess_prompt_style``。
+    """
+
 
 class TranslateConfig(BaseModel):
     enabled: bool = True
