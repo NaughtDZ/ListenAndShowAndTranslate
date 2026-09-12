@@ -50,3 +50,12 @@ packaging==26.3
 cffi==2.1.1
 pycparser==3.0
 colorama==0.4.6
+
+# --- 嵌入式 JS 引擎（内置 V8，免编译）---
+# 用途：执行各家网页版的签名 JS（例如百度的 sign）。
+# 注意：PyPI 包名是 mini-racer，但**导入名是 py_mini_racer**。
+# 现状：百度网页版的 token/gtk 是运行时由风控接口下发的，纯 HTTP + JS 引擎也拿不到
+# （详见 app/translate/traditional/web.py 的调研结论），所以目前没有通道在用它。
+# 保留依赖是为了将来接需要签名的通道时不用再动环境。
+mini-racer==0.14.1
+
