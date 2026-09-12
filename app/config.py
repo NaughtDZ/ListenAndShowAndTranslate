@@ -449,6 +449,13 @@ class OverlayConfig(BaseModel):
     resizable: bool = True
     """是否允许用鼠标拖边框/右下角调整字幕窗大小。"""
 
+    auto_font_scale: bool = True
+    """缩放窗口时字号是否自动跟着变。
+
+    用户反馈"拉大窗口字还是那么小、还得再去改字号"，所以默认开启：
+    拉开宽度就按比例放大字号（关掉则只有窗口变宽、字号不变）。
+    """
+
     window_height: int = Field(default=0, ge=0, le=2000)
     """手动调整过的高度；0 = 按条数与字号自动算。"""
 

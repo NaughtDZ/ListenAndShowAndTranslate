@@ -184,6 +184,32 @@ class SubtitlePipeline(QObject):
         )
         return True
 
+    def reload(self, timeout: float = 15.0) -> bool:
+        """就地重建识别与翻译引擎，让"设置保存后立即生效"。
+
+        用户反馈过"点了保存设置但功能没变化"——因为改完配置只写了文件，
+        而正在跑的流水线用的还是内存里那份旧配置。
+        这里停掉采集与翻译线程、重建 Hub 与 Router、再用同一个目标重启。
+
+        代价：短暂（约 1~2 秒）采集空档，比"要重启整个程序"友好得多。
+        """
+        if self._target_spec is None:
+            return False
+        spec = self._target_spec
+        log.info("正在按新配置重建识别/翻译引擎…")
+        try:
+            self.stop(timeout=timeout)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("重建前停止流水线出错（忽略并继续）: %s", exc)
+        self._stop.clear()
+        try:
+            self.prepare()
+        except Exception as exc:  # noqa: BLE001
+            log.error("按新配置重建失败，仍继续启动: %s", exc)
+        ok = self.start(spec)
+        log.info("引擎重建完成：%s", "成功" if ok else "启动失败")
+        return ok
+
     def stop(self, timeout: float = 8.0) -> None:
         self._stop.set()
         if self.capture is not None:

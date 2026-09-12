@@ -153,7 +153,40 @@ class SubtitleControlWindow(QWidget):
             win.activateWindow()
             return
         self._settings_win = SettingsWindow(self.pipeline.config)
+        # 保存后立即应用，而不是让用户重启程序（用户明确反馈过这点）
+        self._settings_win.saved.connect(self._apply_settings_live)
         self._settings_win.show()
+
+    def _apply_settings_live(self) -> None:
+        """设置保存后立刻生效。
+
+        · 外观类（字号/透明度/显示模式/滚动/描边/宽度）→ 直接刷悬浮窗
+        · 识别与翻译类 → 重建引擎（短暂空档），否则用户改了语言/通道却
+          发现"设置没保存"（其实是没生效）
+        """
+        cfg = self.pipeline.config
+        self.overlay.apply_config(cfg.overlay)
+        self._sync_toggles()
+        self.status_label.setText("设置已应用，正在按新配置重建识别/翻译…")
+        ok = self.pipeline.reload()
+        self.status_label.setText(
+            "✅ 设置已生效（识别/翻译已重建）" if ok else "⚠️ 外观已生效，但引擎重建失败，请看日志"
+        )
+
+    def _sync_toggles(self) -> None:
+        """把配置里的状态同步回控制窗控件（不触发信号，避免回环）。"""
+        cfg = self.pipeline.config
+        for widget, value in (
+            (self.click_through, cfg.overlay.click_through),
+            (self.lock_pos, cfg.overlay.lock_position),
+        ):
+            widget.blockSignals(True)
+            widget.setChecked(bool(value))
+            widget.blockSignals(False)
+        self.opacity_slider.blockSignals(True)
+        self.opacity_slider.setValue(int(cfg.overlay.window_opacity * 100))
+        self.opacity_label.setText(f"{self.opacity_slider.value()}%")
+        self.opacity_slider.blockSignals(False)
 
     # ------------------------------------------------------------------ #
     def _on_opacity(self, value: int) -> None:

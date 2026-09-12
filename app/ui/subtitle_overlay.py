@@ -121,6 +121,10 @@ class SubtitleOverlay(QWidget):
         self.setWindowTitle("听·显·译 字幕")
 
         self.setFont(_pick_cjk_font())
+        # 必须开鼠标跟踪：否则不按键时收不到 mouseMoveEvent，
+        # 光标不会变成缩放箭头，用户根本不知道哪里能拖（用户反馈过）
+        self.setMouseTracking(True)
+        self._font_spin = None
         self._drag_from: QPoint | None = None
         self._resize_edge: str = ""
         self._resize_origin: QPoint | None = None
@@ -458,9 +462,26 @@ class SubtitleOverlay(QWidget):
 
     def mouseReleaseEvent(self, _event) -> None:  # noqa: N802
         if self._resize_edge:
-            # 记下手动尺寸，下次启动沿用（横向拖动改宽度，纵向拖动改高度）
+            old_w = max(1, self.config.window_width)
+            new_w = self.width()
+            # 拉大窗口时字号跟着放大，否则用户还得再跑去改字号（用户反馈）
+            if self.config.auto_font_scale:
+                ratio = new_w / old_w
+                if abs(ratio - 1.0) > 0.02:
+                    before = self.config.font_size
+                    self.config.font_size = max(8, min(200, int(round(before * ratio))))
+                    if self._font_spin is not None:
+                        self._font_spin.blockSignals(True)
+                        self._font_spin.setValue(self.config.font_size)
+                        self._font_spin.blockSignals(False)
+                    log.info("字号随窗口缩放：%d → %d（宽 %d → %d）",
+                             before, self.config.font_size, old_w, new_w)
+                    self.config.window_height = 0
+                    self._relayout()
             self.config.window_width = self.width()
-            self.config.window_height = self.height()
-            log.info("字幕窗尺寸已记录：%dx%d", self.width(), self.height())
-        self._resize_edge = None
+            if self.config.window_height == 0:
+                self.config.window_height = self.height()
+            log.info("字幕窗尺寸已记录：%dx%d，字号 %d",
+                     self.width(), self.height(), self.config.font_size)
+        self._resize_edge = ""
         self._drag_from = None

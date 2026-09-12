@@ -78,6 +78,9 @@ class _TestThread(QThread):
 class SettingsWindow(QWidget):
     """设置窗口。改动即时写回 config 对象，由调用方负责保存。"""
 
+    saved = Signal()
+    """保存成功后发出；控制窗据此**立即应用**，而不是等重启。"""
+
     def __init__(self, config: AppConfig | None = None) -> None:
         super().__init__(None)
         self.config = config or AppConfig.load()
@@ -195,15 +198,29 @@ class SettingsWindow(QWidget):
         self.llm_key = QLineEdit(llm.api_key)
         self.llm_key.setEchoMode(QLineEdit.Password)
         self.llm_key.setPlaceholderText("本地模型通常留空")
-        self.llm_model = QLineEdit(llm.model)
-        self.llm_model.setPlaceholderText("如 qwen3.8-2b-uncensored")
+        self.llm_model = QComboBox()
+        self.llm_model.setEditable(True)   # 可下拉选，也可手打
+        self.llm_model.setMinimumWidth(260)
+        if llm.model:
+            self.llm_model.addItem(llm.model)
+            self.llm_model.setCurrentText(llm.model)
+        self.llm_model.lineEdit().setPlaceholderText("点右边「列出模型」从列表里选")
         self.llm_style = QComboBox()
         self.llm_style.addItem("指令模型（chat，走完整提示词）", "chat")
         self.llm_style.addItem("纯翻译模型（plain，只喂原文）", "plain")
+        self.llm_style.setCurrentIndex(max(0, self.llm_style.findData(llm.prompt_style or "chat")))
         lf.addRow("接口地址", self.llm_base)
         lf.addRow("API Key", self.llm_key)
         lf.addRow("模型名", self.llm_model)
         lf.addRow("提示词风格", self.llm_style)
+        model_hint = QLabel(
+            "**模型由你自己选**，程序不替你决定——不同模型显存占用差别巨大"
+            "（2B 约 2~4GB，27B 能吃到 20GB+）。<br>"
+            "点「列出模型」会把 LM Studio / Ollama 里已有的模型填进下拉框。"
+            "听小说建议用小模型（快、省显存），翻译质量不够再换大的。"
+        )
+        model_hint.setWordWrap(True)
+        lf.addRow("", model_hint)
         style_hint = QLabel(
             "sakura-galtransl 这类<b>微调翻译模型</b>必须选 <b>plain</b>，"
             "否则它会把提示词当正文翻译回来（实测踩过）。"
@@ -288,6 +305,24 @@ class SettingsWindow(QWidget):
         )
         lang_hint.setWordWrap(True)
         form.addRow("", lang_hint)
+
+        # 静音阈值：用户要求"电平设置除了开始选程序时能调，设置里也要能调"，
+        # 而且以前**根本没保存过**（关掉电平窗再开又回 -80）。
+        self.silence_db = QDoubleSpinBox()
+        self.silence_db.setRange(-100.0, -20.0)
+        self.silence_db.setSingleStep(5.0)
+        self.silence_db.setDecimals(0)
+        self.silence_db.setSuffix(" dBFS")
+        self.silence_db.setValue(self.config.audio.silence_rms_threshold_db)
+        form.addRow("静音阈值", self.silence_db)
+        sth = QLabel(
+            "低于此电平就当作「没有声音」。<b>越小越灵敏</b>（小声也算有声），"
+            "越大越严格（能过滤底噪）。<br>"
+            "实测参考：进程回环在目标不播放时给的是精确的 0，"
+            "而调小音量后的真实语音 RMS 约 -66 dBFS，所以默认取 -80。"
+        )
+        sth.setWordWrap(True)
+        form.addRow("", sth)
 
         outer.addWidget(form_box)
 
@@ -417,19 +452,41 @@ class SettingsWindow(QWidget):
         self.bg_opacity.setValue(ov.background_opacity)
         form.addRow("背景不透明度", self.bg_opacity)
 
-        self.click_through = QCheckBox("点击穿透（鼠标穿透到游戏）")
-        self.click_through.setChecked(ov.click_through)
-        form.addRow("", self.click_through)
-        ch = QLabel(
-            "开启后悬浮窗点不动，<b>要关掉请回到这个窗口</b>（所以控制项不放在悬浮窗里）。<br>"
-            "真·独占全屏游戏无法被普通窗口覆盖，请把游戏设为「无边框窗口全屏」。"
+        self.win_opacity = QDoubleSpinBox()
+        self.win_opacity.setRange(0.2, 1.0)
+        self.win_opacity.setSingleStep(0.05)
+        self.win_opacity.setValue(ov.window_opacity)
+        form.addRow("整体不透明度", self.win_opacity)
+        woh = QLabel("整个字幕窗（含文字）的淡化程度，用于让它不那么抢眼。")
+        woh.setWordWrap(True)
+        form.addRow("", woh)
+
+        self.resizable = QCheckBox("允许拖拽边缘缩放字幕窗")
+        self.resizable.setChecked(ov.resizable)
+        form.addRow("", self.resizable)
+
+        self.auto_font = QCheckBox("缩放窗口时字号自动跟着放大/缩小")
+        self.auto_font.setChecked(ov.auto_font_scale)
+        form.addRow("", self.auto_font)
+        afh = QLabel(
+            "开启后，把字幕窗拉宽，字也会跟着变大——<b>不用再去改字号</b>。"
+            "关掉则字号固定、只有窗口变宽。"
         )
-        ch.setWordWrap(True)
-        form.addRow("", ch)
+        afh.setWordWrap(True)
+        form.addRow("", afh)
 
         self.always_on_top = QCheckBox("始终置顶（每 2 秒重申一次，对抗游戏抢 Z 序）")
         self.always_on_top.setChecked(ov.always_on_top)
         form.addRow("", self.always_on_top)
+
+        # 穿透与锁定**故意不放在这里**：控制窗上已经有了。
+        # 同一个开关两个入口，改了一处另一处不同步，用户会怀疑"设置没保存"（真实反馈）。
+        dedupe_hint = QLabel(
+            "「点击穿透」「锁定位置」在<b>控制窗</b>上直接切——那是玩游戏时要随手改的开关，"
+            "放在那边更顺手；这里不重复提供，避免两处状态不一致。"
+        )
+        dedupe_hint.setWordWrap(True)
+        form.addRow("", dedupe_hint)
         return page
 
     # ------------------------------------------------------------------ #
@@ -549,11 +606,28 @@ class SettingsWindow(QWidget):
                 ok, msg, models = probe_endpoint(base, self.llm_key.text().strip(), proxy)
                 out.append(f"{'✅' if ok else '❌'} 大模型 {base}：{msg}")
                 if models:
-                    out.append("     可用模型：" + "、".join(models[:6])
-                               + ("…" if len(models) > 6 else ""))
+                    self._fill_models(models)
+                    out.append(f"     已把 {len(models)} 个模型填进上面的下拉框，"
+                               "请自己挑一个（**不会再自动替你选**——"
+                               "以前自动选列表第一个，可能直接加载一个 20GB+ 的大模型把显存吃满）")
             except Exception as exc:  # noqa: BLE001
                 out.append(f"❌ 大模型：{exc}")
         return "\n".join(out)
+
+    def _fill_models(self, models: list[str]) -> None:
+        """把可用模型填进下拉框，但**不改用户当前的选择**。"""
+        current = self.llm_model.currentText().strip()
+        self.llm_model.blockSignals(True)
+        self.llm_model.clear()
+        for m in models:
+            self.llm_model.addItem(m)
+        if current:
+            self.llm_model.setCurrentText(current)
+        elif models:
+            # 不自动选：清空当前项，让 placeholder 提示用户自己选
+            self.llm_model.setCurrentIndex(-1)
+            self.llm_model.setEditText("")
+        self.llm_model.blockSignals(False)
 
     def _test_translate(self) -> str:
         pid = self.provider_combo.currentData() or "none"
@@ -568,7 +642,7 @@ class SettingsWindow(QWidget):
                 t = OpenAICompatTranslator(
                     base_url=self.llm_base.text().strip(),
                     api_key=self.llm_key.text().strip(),
-                    model=self.llm_model.text().strip(),
+                    model=self.llm_model.currentText().strip(),
                     proxy=self.proxy_edit.text().strip(),
                     prompt_style=self.llm_style.currentData() or "",
                 )
@@ -595,7 +669,7 @@ class SettingsWindow(QWidget):
         c.translate.provider = self.provider_combo.currentData() or "none"
         c.translate.context_lines = self.ctx_lines.value()
         c.translate.prompt_template = self.template_combo.currentData() or "subtitle_direct"
-        c.translate.custom_prompt = self.prompt_edit.text()
+        c.translate.custom_prompt = self.prompt_edit.toPlainText()  # QTextEdit 没有 text()！
 
         pid = c.translate.provider
         if self.cred_fields:
@@ -605,7 +679,7 @@ class SettingsWindow(QWidget):
 
         c.translate.llm.base_url = self.llm_base.text().strip()
         c.translate.llm.api_key = self.llm_key.text().strip()
-        c.translate.llm.model = self.llm_model.text().strip()
+        c.translate.llm.model = self.llm_model.currentText().strip()
         c.translate.llm.enabled = True
         c.translate.llm.prompt_style = self.llm_style.currentData() or ""
 
@@ -624,6 +698,9 @@ class SettingsWindow(QWidget):
         c.translate.glossary = glossary
 
         c.asr.language = self.lang_combo.currentData() or "auto"
+        # 静音阈值：以前只能在电平表窗口里调，而且**根本没存过**，
+        # 关掉再开又回到 -80（用户反馈）。现在在这里也能调，并且会保存。
+        c.audio.silence_rms_threshold_db = float(self.silence_db.value())
         c.overlay.display_mode = self.mode_combo.currentData() or "bilingual"
         c.overlay.scroll_mode = self.scroll_combo.currentData() or "accumulate"
         c.overlay.max_lines = self.max_lines.value()
@@ -632,15 +709,21 @@ class SettingsWindow(QWidget):
         c.overlay.outline_width = self.outline_width.value()
         c.overlay.window_width = self.win_width.value()
         c.overlay.background_opacity = self.bg_opacity.value()
-        c.overlay.click_through = self.click_through.isChecked()
+        c.overlay.window_opacity = self.win_opacity.value()
+        c.overlay.resizable = self.resizable.isChecked()
+        c.overlay.auto_font_scale = self.auto_font.isChecked()
         c.overlay.always_on_top = self.always_on_top.isChecked()
+        # 穿透/锁定 的入口在控制窗（避免两处重复），这里不覆盖它们的值
 
         try:
             c.save()
-            self.status.setText("✅ 已保存到 data/config.json")
+            self.status.setText("✅ 已保存并即时生效（外观类立即反映；识别/翻译会重建）")
         except Exception as exc:  # noqa: BLE001
             self.status.setText(f"❌ 保存失败：{exc}")
             return
+
+        # 通知使用者立即应用（控制窗/字幕窗对接这个信号）
+        self.saved.emit()
 
         # 术语表若填了路径，顺便落盘，方便用户用 Excel 维护
         if path:

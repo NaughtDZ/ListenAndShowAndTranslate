@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.audio.capture import CaptureWorker, TargetSpec, resolve_target
+from app.config import AppConfig
 from app.audio.levels import MIN_DB, LevelState, LevelTracker, threshold_from_db, to_db
 from app.audio.process_list import get_session_volume, suggest_gain
 from app.utils import win32
@@ -310,9 +311,10 @@ class LevelMeterWindow(QWidget):
 class MeterControlWindow(QWidget):
     """阈值滑杆等控件。**故意独立于悬浮窗**，否则开了穿透就点不动。"""
 
-    def __init__(self, meter_window: LevelMeterWindow) -> None:
+    def __init__(self, meter_window: LevelMeterWindow, config=None) -> None:
         super().__init__(None)
         self.meter_window = meter_window
+        self.config = config if config is not None else AppConfig.load()
         self.setWindowTitle("听·显·译 — 电平表控制")
         self.resize(430, 250)
 
@@ -366,6 +368,13 @@ class MeterControlWindow(QWidget):
         self.threshold_value.setText(f"{value} dBFS")
         linear = threshold_from_db(float(value))
         self.meter_window.meter.set_threshold(linear)
+        # 用户反馈"设定的静音电平关掉窗口再打开又回到 -80"——
+        # 因为以前压根没往配置里写。现在改了立刻存，设置窗里也读同一个值。
+        try:
+            self.config.audio.silence_rms_threshold_db = float(value)
+            self.config.save()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("保存静音阈值失败: %s", exc)
 
     def threshold_linear(self) -> float:
         return threshold_from_db(float(self.threshold_slider.value()))
@@ -392,9 +401,11 @@ def run_meter(pid: int, threshold_db: float | None = None) -> int:
     app = QApplication.instance() or QApplication([])
 
     meter_window = LevelMeterWindow()
-    control = MeterControlWindow(meter_window)
-    if threshold_db is not None:
-        control.threshold_slider.setValue(int(threshold_db))
+    # 阈值初值优先级：命令行参数 > 配置里保存的 > 默认 -80
+    _cfg = AppConfig.load()
+    control = MeterControlWindow(meter_window, config=_cfg)
+    _saved = float(_cfg.audio.silence_rms_threshold_db)
+    control.threshold_slider.setValue(int(threshold_db if threshold_db is not None else _saved))
 
     tracker = LevelTracker(silence_threshold=control.threshold_linear())
     bridge = _Bridge()
