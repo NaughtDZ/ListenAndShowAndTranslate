@@ -180,3 +180,38 @@ def test_invalid_ballistics_rejected():
         LevelTracker(attack=0.0)
     with pytest.raises(ValueError):
         LevelTracker(release=0.0)
+
+
+# --------------------------------------------------------------------------- #
+# 标量版（设置窗里的电平表用它：字幕进程只有"算好的 RMS/峰值"，没有样本）
+# --------------------------------------------------------------------------- #
+def test_update_values_matches_sample_version():
+    """标量版与样本版必须给出一致的读数，否则设置窗和电平表窗口观感会不一致。"""
+    x = _sine(0.3, n=320)
+    inst_rms = float(np.sqrt(np.mean(np.square(x, dtype=np.float64))))
+    inst_peak = float(np.max(np.abs(x)))
+
+    by_samples = LevelTracker()
+    by_values = LevelTracker()
+    for _ in range(10):
+        a = by_samples.update_with_dt(x, 0.1)
+        b = by_values.update_values(inst_rms, inst_peak, 0.1)
+
+    assert a.db_rms == pytest.approx(b.db_rms, abs=1e-9)
+    assert a.db_peak == pytest.approx(b.db_peak, abs=1e-9)
+    assert a.db_peak_hold == pytest.approx(b.db_peak_hold, abs=1e-9)
+    assert a.is_silent == b.is_silent
+
+
+def test_update_values_respects_threshold():
+    """同一份读数，阈值调高就变静音——"用户可调"在设置窗里同样成立。"""
+    t = LevelTracker(silence_threshold=1e-6)
+    assert not t.update_values(1e-5, 2e-5, 0.1).is_silent
+    t.set_threshold(1e-3)
+    assert t.update_values(1e-5, 2e-5, 0.1).is_silent
+
+
+def test_update_values_zero_dt_is_ignored():
+    t = LevelTracker()
+    t.update_values(0.5, 0.9, 0.0)
+    assert t.snapshot().rms == 0.0

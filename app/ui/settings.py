@@ -4,7 +4,8 @@
 
   网络  —— 程序走哪个代理（模型下载、翻译通道共用），以及一键连通性测试
   翻译  —— 用哪个通道、凭据、上下文行数、提示词模板、术语表，以及一键测试
-  识别  —— 语言、延迟档位与五个延迟参数（每个都写清"调小/调大各会怎样"）
+  识别  —— 语言、静音阈值（带**实时电平表 + 阈值线 + 实测参考线**）、
+          延迟档位与五个延迟参数（每个都写清"调小/调大各会怎样"）
   外观  —— 原文/译文/双语、滚动方式、每屏行数、字号颜色、点击穿透
 
 两个设计约束（都是踩过坑之后定的）：
@@ -18,7 +19,9 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, QThread, Signal
+from typing import Callable
+
+from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -38,12 +41,26 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app.audio.levels import LevelState, LevelTracker, threshold_from_db
 from app.config import LATENCY_KNOBS, LATENCY_PRESETS, AppConfig
 from app.translate.prompts import list_templates
 from app.translate.traditional.providers import ALL_PROVIDERS, WEB_PROVIDERS
+from app.ui.meter import LevelMeterWidget
 from app.utils.log import get_logger
 
 log = get_logger(__name__)
+
+LEVEL_POLL_MS = 100
+"""设置窗里实时电平的刷新间隔（和独立电平表窗口一个量级）。"""
+
+MEASURED_SPEECH_DB = -66.0
+"""实测：把目标程序音量调小之后，真实语音的 RMS 大约在这个水平。
+
+（见 docs/P1-实测记录.md：所以静音阈值不能取太高，默认 -80 是安全的。）
+"""
+
+LevelSource = Callable[[], "tuple[float, float] | None"]
+"""实时电平来源：返回 ``(rms, peak)``（线性幅度），没有数据就返回 None。"""
 
 # 通道 id → 展示名与需要的凭据字段
 PROVIDER_META: dict[str, tuple[str, dict[str, str]]] = {
@@ -81,7 +98,12 @@ class SettingsWindow(QWidget):
     saved = Signal()
     """保存成功后发出；控制窗据此**立即应用**，而不是等重启。"""
 
-    def __init__(self, config: AppConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: AppConfig | None = None,
+        *,
+        level_source: LevelSource | None = None,
+    ) -> None:
         super().__init__(None)
         self.config = config or AppConfig.load()
         self.setWindowTitle("听·显·译 — 设置")
@@ -89,6 +111,20 @@ class SettingsWindow(QWidget):
         self.setMinimumWidth(560)
 
         self._threads: list[_TestThread] = []
+
+        # 实时电平：来源由调用方给（字幕进程给采集线程的读数；启动窗口没有采集，
+        # 就不给来源，电平表只显示阈值线和参考线）。
+        self._level_source = level_source
+        self._level_tracker = LevelTracker(
+            silence_threshold=threshold_from_db(
+                float(self.config.audio.silence_rms_threshold_db)
+            )
+        )
+        self._level_status = ""
+        self._level_idle = False
+        self._level_timer = QTimer(self)
+        self._level_timer.setInterval(LEVEL_POLL_MS)
+        self._level_timer.timeout.connect(self._poll_level)
 
         tabs = QTabWidget(self)
         tabs.addTab(self._build_network_tab(), "网络")
@@ -118,6 +154,60 @@ class SettingsWindow(QWidget):
     def showEvent(self, event) -> None:  # noqa: N802 - Qt 命名
         super().showEvent(event)
         self._sync_live_fields()
+        # 只在窗口可见时轮询电平：设置窗常年开着不该白烧 CPU
+        if self._level_source is not None:
+            self._level_timer.start()
+            self._poll_level()
+
+    def hideEvent(self, event) -> None:  # noqa: N802 - Qt 命名
+        self._level_timer.stop()
+        super().hideEvent(event)
+
+    def _on_silence_db_changed(self, value: float) -> None:
+        """阈值数值一变，电平表上的橙色虚线和"算不算静音"立刻跟着变。"""
+        linear = threshold_from_db(float(value))
+        self.threshold_meter.set_threshold(linear)
+        self._level_tracker.set_threshold(linear)
+
+    def _poll_level(self) -> None:
+        """把实时读数喂给电平表（采集线程算好的 RMS/峰值，读两个 float）。"""
+        reading = None
+        if self._level_source is not None:
+            try:
+                reading = self._level_source()
+            except Exception as exc:  # noqa: BLE001 - 读数失败不该影响设置界面
+                log.debug("读取实时电平失败: %s", exc)
+                reading = None
+
+        if reading is None:
+            # 清一次就够：没有数据时不必 10Hz 重画
+            if not self._level_idle:
+                self._level_idle = True
+                self.threshold_meter.set_level(LevelState())
+            self._set_level_status(
+                "未采集（字幕没在运行时没有实时数据；启动窗口的「电平表」可单独看）"
+            )
+            return
+
+        self._level_idle = False
+        rms, peak = reading
+        state = self._level_tracker.update_values(
+            rms, peak, dt=self._level_timer.interval() / 1000.0
+        )
+        self.threshold_meter.set_level(state)
+        if state.clipping:
+            self._set_level_status("⚠ 削波（音量太大，识别可能出错）")
+        elif state.is_silent:
+            self._set_level_status("静音（低于阈值，不会送去识别）")
+        else:
+            self._set_level_status("有声")
+
+    def _set_level_status(self, text: str) -> None:
+        """只在文案变化时重画，避免 10Hz 无意义刷新。"""
+        if text == self._level_status:
+            return
+        self._level_status = text
+        self.threshold_meter.set_texts("当前采集目标 · 实时电平", text)
 
     def _sync_live_fields(self) -> None:
         """从配置里回读那些**在别处也会被改**的值。
@@ -150,6 +240,13 @@ class SettingsWindow(QWidget):
             combo.blockSignals(True)
             combo.setCurrentIndex(max(0, combo.findData(value)))
             combo.blockSignals(False)
+
+        # 静音阈值：独立电平表窗口里也有一根滑杆改的是同一个配置项，
+        # 所以这里要回读，并且把电平表上的阈值线一起挪过去
+        self.silence_db.blockSignals(True)
+        self.silence_db.setValue(float(self.config.audio.silence_rms_threshold_db))
+        self.silence_db.blockSignals(False)
+        self._on_silence_db_changed(self.silence_db.value())
 
     # ------------------------------------------------------------------ #
     # 网络
@@ -354,9 +451,24 @@ class SettingsWindow(QWidget):
         self.silence_db.setSuffix(" dBFS")
         self.silence_db.setValue(self.config.audio.silence_rms_threshold_db)
         form.addRow("静音阈值", self.silence_db)
+
+        # 电平表 + 阈值线：用户反馈"启动时给了电平表 UI，设置里反而不给"。
+        # 这里直接复用独立电平表窗口那个控件（同一套观感），阈值线跟着上面的
+        # 数值实时移动；字幕在跑时还能看到实时电平（level_source）。
+        self.threshold_meter = LevelMeterWidget()
+        self.threshold_meter.set_threshold(
+            threshold_from_db(float(self.silence_db.value()))
+        )
+        self.threshold_meter.set_markers(
+            [(MEASURED_SPEECH_DB, f"实测：音量调小后的真实语音 ≈ {MEASURED_SPEECH_DB:.0f} dBFS")]
+        )
+        self.threshold_meter.set_texts("当前采集目标 · 实时电平", "未采集")
+        form.addRow("", self.threshold_meter)
+        self.silence_db.valueChanged.connect(self._on_silence_db_changed)
+
         sth = QLabel(
             "低于此电平就当作「没有声音」。<b>越小越灵敏</b>（小声也算有声），"
-            "越大越严格（能过滤底噪）。<br>"
+            "越大越严格（能过滤底噪）——橙色虚线就是当前阈值，蓝色虚线是实测参考。<br>"
             "实测参考：进程回环在目标不播放时给的是精确的 0，"
             "而调小音量后的真实语音 RMS 约 -66 dBFS，所以默认取 -80。"
         )

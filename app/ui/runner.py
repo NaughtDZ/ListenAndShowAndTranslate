@@ -39,6 +39,21 @@ if TYPE_CHECKING:  # 只为类型标注，运行时不导入（设置窗是懒�
 log = get_logger(__name__)
 
 
+def capture_level(pipeline: SubtitlePipeline) -> tuple[float, float] | None:
+    """设置窗里"实时电平"的读数来源：采集线程每块已经算好的 RMS / 峰值。
+
+    为什么不用 ``capture.snapshot()``：那里的 ``peak`` 是**整段采集的高水位**，
+    拿它画 PEAK 条会一直顶在最右边。这里读的是**最近一块**的 RMS / 峰值。
+
+    返回 None 表示当前没有在采集（设置窗会显示"未采集"）。
+    """
+    cap = getattr(pipeline, "capture", None)
+    if cap is None:
+        return None
+    stats = cap.pipeline_stats()
+    return float(stats.last_rms), float(stats.last_peak)
+
+
 class SubtitleControlWindow(QWidget):
     """控制窗：所有可点的东西都放这里。"""
 
@@ -158,7 +173,11 @@ class SubtitleControlWindow(QWidget):
 
         # 保存后立即应用，而不是让用户重启程序（用户明确反馈过这点）
         win = open_settings_window(
-            self, self.pipeline.config, on_saved=self._apply_settings_live
+            self,
+            self.pipeline.config,
+            on_saved=self._apply_settings_live,
+            # 设置窗里的电平表要有实时读数（用户反馈"启动时给了电平表，设置里不给"）
+            options={"level_source": lambda: capture_level(self.pipeline)},
         )
         # 拉宽字幕窗时字号会跟着变大：把设置窗里的"字号"框接上，
         # 用户正开着设置窗时也能看到新值（否则要关掉再开才刷新）

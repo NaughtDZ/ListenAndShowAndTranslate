@@ -45,6 +45,22 @@ def test_downmix_averages_channels():
     assert abs(pipe.stats.peak - 0.5) < 1e-3, pipe.stats.peak
 
 
+def test_last_peak_is_current_chunk_not_high_water():
+    """``last_peak`` 必须是**最近一块**的峰值。
+
+    设置窗里的实时电平表靠它画 PEAK 条：拿 ``peak``（整段高水位）会一直顶在
+    最右边，用户会以为一直在削波。
+    """
+    pipe = AudioPipeline()
+    pipe.process(np.ones(4800, dtype=np.float32))          # 满幅一块
+    assert abs(pipe.stats.last_peak - 1.0) < 1e-6
+    assert abs(pipe.stats.peak - 1.0) < 1e-6
+
+    pipe.process(np.zeros(4800, dtype=np.float32))          # 紧接着一块静音
+    assert pipe.stats.last_peak < 1e-6, pipe.stats.last_peak
+    assert abs(pipe.stats.peak - 1.0) < 1e-6, "高水位不该被静音块清掉"
+
+
 def test_downmix_ignores_incomplete_frame():
     """单声道样本数是奇数时应丢掉尾部半帧，而不是抛异常。"""
     pipe = AudioPipeline()

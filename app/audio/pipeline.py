@@ -47,7 +47,15 @@ class PipelineStats:
     input_samples: int = 0
     output_samples: int = 0
     peak: float = 0.0
+    """整段采集以来的峰值（高水位，不衰减）。"""
+
     last_rms: float = 0.0
+    last_peak: float = 0.0
+    """**最近一块**的 RMS / 峰值。
+
+    与 ``peak``（高水位）区分开：设置窗里的实时电平表要画"当前"的峰值，
+    拿高水位会把 PEAK 条永久顶在最右边。
+    """
 
     silent_chunks: int = 0
     """连续静音块数（每次遇到有声块就清零）。"""
@@ -219,6 +227,7 @@ class AudioPipeline:
         if samples.size == 0:
             return
         peak = float(np.max(np.abs(samples)))
+        self.stats.last_peak = peak
         if peak > self.stats.peak:
             self.stats.peak = peak
 

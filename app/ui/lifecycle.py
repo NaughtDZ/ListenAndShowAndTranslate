@@ -70,6 +70,7 @@ def open_settings_window(
     *,
     attr: str = "_settings_win",
     on_saved: Callable[[], None] | None = None,
+    options: dict[str, Any] | None = None,
 ) -> Any:
     """打开（或复用）设置窗，返回该窗口。
 
@@ -77,12 +78,14 @@ def open_settings_window(
     销毁它会出事；而且反复开关会堆出一打藏起来的窗口。
 
     ``attr``：窗口挂在 owner 上的属性名，控制窗和主窗口各用各的。
+    ``options``：只在**首次创建**时传给 ``SettingsWindow``（例如实时电平来源
+    ``level_source``）——复用旧窗口时忽略。
     """
     from app.ui.settings import SettingsWindow
 
     win = getattr(owner, attr, None)
     if win is None:
-        win = SettingsWindow(config)
+        win = SettingsWindow(config, **(options or {}))
         setattr(owner, attr, win)
 
     # 只接一次（窗口是复用的）：接两次的话，点一次「保存设置」会重建两遍引擎

@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QSizePolicy,
     QSlider,
     QVBoxLayout,
     QWidget,
@@ -35,7 +36,11 @@ from app.utils.log import get_logger
 log = get_logger(__name__)
 
 # 电平表显示范围（dBFS）
-DB_MIN = -70.0
+#
+# 下限取 -90 而不是 -70：静音阈值本身可以在 -100~-20 之间调（默认 -80），
+# 显示范围比阈值还窄的话，用户在设置窗里看到的阈值线会**贴在左边缘**，
+# 分不出 -80 和 -70。见 docs/字幕窗尺寸与字号.md 同批的静音阈值说明。
+DB_MIN = -90.0
 DB_MAX = 0.0
 
 # 阈值滑杆范围（dBFS）
@@ -51,6 +56,16 @@ COLOR_WARN = QColor(255, 170, 60)
 COLOR_THRESHOLD = QColor(255, 150, 40)
 COLOR_HOLD = QColor(255, 255, 255, 230)
 COLOR_CLIP = QColor(255, 70, 70)
+COLOR_MARKER = QColor(120, 190, 255)
+"""参考线（实测基准，例如"小声语音 ≈ -66 dBFS"）的颜色：蓝，与橙色阈值线区分。"""
+
+MARKER_ROW_H = 14
+"""每条参考线说明文字占的高度。"""
+
+
+def _base_height(marker_count: int = 0) -> int:
+    """控件高度：固定部分 104px + 参考线的说明行。"""
+    return 104 + MARKER_ROW_H * marker_count
 
 
 def _level_color(db: float) -> QColor:
@@ -97,7 +112,12 @@ def _pick_cjk_font() -> QFont:
 
 
 class LevelMeterWidget(QWidget):
-    """纯绘制的电平条：RMS 主条 + PEAK 细条 + 峰值保持标记 + 用户阈值线。"""
+    """纯绘制的电平条：RMS 主条 + PEAK 细条 + 峰值保持标记 + 用户阈值线。
+
+    除了浮在游戏上的独立电平表窗口，它也被**嵌进设置窗**（识别 → 静音阈值），
+    所以额外支持 :meth:`set_markers` —— 画出"实测参考线"（例如
+    "音量调小后的真实语音 ≈ -66 dBFS"），让用户一眼看出阈值取在哪比较合适。
+    """
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -106,7 +126,11 @@ class LevelMeterWidget(QWidget):
         self.title = ""
         self.status = ""
         self.warning = ""
-        self.setMinimumHeight(104)
+        self.markers: list[tuple[float, str]] = []
+        """参考线：``[(dBFS, 说明文字), ...]``。"""
+        self.setMinimumHeight(_base_height())
+        self.setMinimumWidth(320)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
         # 显式指定中文字体族：否则绘制文字用的 QFont() 不带族名，
         # 在缺少默认字体配置的环境下中文会渲染成方块（tofu）。
@@ -132,6 +156,12 @@ class LevelMeterWidget(QWidget):
         self.title = title
         self.status = status
         self.warning = warning
+        self.update()
+
+    def set_markers(self, markers: list[tuple[float, str]]) -> None:
+        """设置参考线（dBFS + 说明）。每条线占一行说明文字，控件会自动长高。"""
+        self.markers = list(markers)
+        self.setMinimumHeight(_base_height(len(self.markers)))
         self.update()
 
     # ------------------------------------------------------------------ #
@@ -201,26 +231,42 @@ class LevelMeterWidget(QWidget):
         p.setPen(COLOR_TEXT_DIM)
         p.setFont(self._font(7))
         tick_y = pk_y + pk_h + 4
-        for db in (-60, -40, -20, -12, -6, 0):
+        for db in (-80, -60, -40, -20, -12, -6, 0):
             x = self._x_for_db(db, x0, x1)
             p.drawLine(int(x), int(tick_y), int(x), int(tick_y + 3))
             p.drawText(int(x) - 12, int(tick_y + 4), 24, 10, Qt.AlignCenter, f"{db}")
 
-        # ---- ⑤ 数值读数（独立一行，右对齐）----
+        # ---- ⑤ 参考线（实测基准，例如"小声语音 ≈ -66 dBFS"）----
+        # 每条占一行说明文字，控件已经按条数长高（见 set_markers）
+        for i, (db, label) in enumerate(self.markers):
+            mx = self._x_for_db(db, x0, x1)
+            p.setPen(QPen(COLOR_MARKER, 1.0, Qt.DotLine))
+            p.drawLine(int(mx), int(rms_y - 3), int(mx), int(tick_y + 2))
+            row_y = int(tick_y + 16 + MARKER_ROW_H * i)
+            p.setPen(COLOR_MARKER)
+            p.setFont(self._font(7))
+            p.drawText(
+                int(x0), row_y, avail, MARKER_ROW_H,
+                Qt.AlignLeft | Qt.AlignVCenter,
+                fm_small.elidedText(f"┆ {label}", Qt.ElideRight, avail),
+            )
+
+        # ---- ⑥ 数值读数（独立一行，右对齐）----
         p.setFont(self._font(8))
         p.setPen(COLOR_TEXT)
         readout = f"RMS {self.level.db_rms:6.1f} dB    PEAK {self.level.db_peak:6.1f} dB"
         if self.level.peak_hold > 0:
             readout += f"    HOLD {self.level.db_peak_hold:6.1f} dB"
         readout = fm_small.elidedText(readout, Qt.ElideRight, avail)
-        p.drawText(int(x0), int(tick_y + 16), avail, 13, Qt.AlignLeft | Qt.AlignVCenter, readout)
+        readout_y = int(tick_y + 16 + MARKER_ROW_H * len(self.markers))
+        p.drawText(int(x0), readout_y, avail, 13, Qt.AlignLeft | Qt.AlignVCenter, readout)
 
-        # ---- ⑥ 警告（独占一行，否则会压住标题）----
+        # ---- ⑦ 警告（独占一行，否则会压住标题）----
         if self.warning:
             p.setFont(self._font(8))
             p.setPen(COLOR_WARN)
             p.drawText(
-                int(x0), int(tick_y + 30), avail, 14, Qt.AlignLeft | Qt.AlignVCenter,
+                int(x0), readout_y + 14, avail, 14, Qt.AlignLeft | Qt.AlignVCenter,
                 fm_small.elidedText("⚠ " + self.warning, Qt.ElideRight, avail),
             )
 

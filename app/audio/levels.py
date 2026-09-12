@@ -107,7 +107,21 @@ class LevelTracker:
 
         inst_peak = float(np.max(np.abs(x)))
         inst_rms = float(np.sqrt(np.mean(np.square(x, dtype=np.float64))))
+        return self._apply(inst_rms, inst_peak, dt)
 
+    def update_values(self, rms: float, peak: float, dt: float = 0.1) -> LevelState:
+        """喂**已经算好**的 RMS / 峰值，而不是原始样本。
+
+        为什么需要它：字幕进程里能直接拿到的是采集线程每块算好的
+        ``last_rms`` / ``last_peak``，没有样本可喂。走这条路，设置窗里的
+        电平表才能和独立电平表窗口有**完全一样的平滑与峰值保持观感**。
+        """
+        if dt <= 0:
+            return self.snapshot()
+        return self._apply(max(0.0, float(rms)), max(0.0, float(peak)), dt)
+
+    def _apply(self, inst_rms: float, inst_peak: float, dt: float) -> LevelState:
+        """平滑 + 峰值保持的共同实现（样本版与标量版都走这里）。"""
         # 平滑系数按时间步长归一化（假定系数是按 20ms 一块标定的）
         ref = 0.02
         a = 1.0 - (1.0 - self.attack) ** (dt / ref)
