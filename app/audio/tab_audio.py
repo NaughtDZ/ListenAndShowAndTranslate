@@ -54,6 +54,9 @@ HELLO_TIMEOUT_S = 5.0
 STATE_STALE_SECONDS = 5.0
 """多久没收到音频就提示"目标好像没在放音"（与进程回环的语义保持一致）。"""
 
+BUSY_NOTE_SECONDS = 60.0
+"""「另一个浏览器的扩展也在连、本条被忽略」这条提示保留多久。"""
+
 
 # --------------------------------------------------------------------------- #
 # 数据结构
@@ -128,6 +131,9 @@ class TabAudioStats:
     connections: int = 0
     last_error: str = ""
     connected_at: float = 0.0
+    peer_note: str = ""
+    """有多个扩展实例同时连上来时的提示（实测真的会发生：用户日常浏览器里装了扩展，
+    临时跑测试的浏览器又装了一份，两边都连同一个端口）。"""
 
     @property
     def likely_playing(self) -> bool:
@@ -140,7 +146,8 @@ class TabAudioStats:
             return f"扩展已连接（{self.browser or '浏览器'}），等待开始采集…"
         tab = self.tab.short_title or f"tab {self.tab.id}"
         extra = "" if self.likely_playing else "（当前没在放音）"
-        return f"标签页: {tab}{extra}"
+        note = f" · {self.peer_note}" if self.peer_note else ""
+        return f"标签页: {tab}{extra}{note}"
 
 
 # --------------------------------------------------------------------------- #
@@ -192,6 +199,12 @@ class TabAudioServer:
         self._watchdog: threading.Thread | None = None
         self._control: WSClient | None = None
         self._audio: WSClient | None = None
+        self._control_capturing = False
+        """控制连接报告的"在采集"状态——**只在没有音频连接时才采信**。"""
+
+        self._busy_note = ""
+        self._busy_note_at = 0.0
+        """最近一次"另一个浏览器的扩展被忽略"的提示（要留一会儿给用户看）。"""
 
         self._ws = WSServer(
             host=host,
@@ -205,7 +218,10 @@ class TabAudioServer:
             # 音频**不走扩展端口转发**——实测 ArrayBuffer 经 chrome.runtime 端口的
             # 那一跳会变成 null（于是 ws.send(null) 发出去的是字符串 "[object Object]"），
             # 而且那样还要多一次拷贝。
-            max_clients=2,
+            #
+            # 上限给 4 而不是 2：实测用户日常浏览器里装的那份扩展也会连上来
+            # （另一个配置文件/另一份拷贝），卡在 2 会把正在送音频的那条挤掉。
+            max_clients=4,
         )
 
     # ------------------------------------------------------------------ #
@@ -284,8 +300,11 @@ class TabAudioServer:
             self.stats.connections += 1
             self.stats.connected_at = time.time()
             self.stats.last_error = ""
-            self.stats.capturing = False
             self.stats.extension_id = client.origin.removeprefix("chrome-extension://").rstrip("/")
+            # ⚠️ 这里**刻意不动 ``capturing``**：新连接不代表采集停了。
+            # 实测踩过：另一个扩展实例（用户日常浏览器里那份）一连上来就把
+            # 状态重置成"没在采集"，界面上看起来就像音频发送暂停了。
+            self._refresh_note_locked()
         log.info("浏览器扩展已连接：%s（Origin=%s）", client.addr, client.origin)
         self._emit_state()
         return True
@@ -302,7 +321,7 @@ class TabAudioServer:
         elif kind == "format":
             self._handle_format(msg)
         elif kind == "status":
-            self._handle_status(msg)
+            self._handle_status(client, msg)
         elif kind == "log":
             log.info("[扩展] %s", msg.get("message") or "")
         elif kind == "error":
@@ -311,6 +330,20 @@ class TabAudioServer:
                 self.stats.last_error = message
             log.warning("扩展报告错误：%s", message)
             self._emit_state()
+
+    def _is_authoritative(self, client: WSClient) -> bool:
+        """这条连接有没有资格改"当前音源"的状态。
+
+        规则：**正在送音频的那条说了算**；没有音频连接时，才轮到控制连接。
+        这样"另一个浏览器里也装了扩展、也连上来了"就不会把正在进行的采集搅乱
+        （实测：它 report capturing=false，界面就显示成"等待开始采集"了）。
+        """
+        if client.meta.get("legacy"):
+            # 旧版扩展没办法区分 SW/offscreen，谁报都算
+            return True
+        if self._audio is not None:
+            return client is self._audio
+        return client is self._control
 
     def _handle_hello(self, client: WSClient, msg: dict) -> None:
         version = int(msg.get("protocol") or 0)
@@ -340,22 +373,87 @@ class TabAudioServer:
             self._emit_state()
             return
 
-        role = str(msg.get("role") or "both").lower()
+        role_raw = msg.get("role")
+        role = str(role_raw or "both").lower()
         if role not in ("control", "audio", "both"):
             role = "both"
+        legacy = role_raw is None
+        """没带 role 字段 = 旧版扩展（本程序加 role 之前的版本）。
+
+        实测踩过：用户日常浏览器里装的是旧版，它一 hello 就被当成"两个角色都占"，
+        把正在送音频的那条顶掉——用户看到的就是"音频发送暂停，得手动再点一次"。
+        这里只标记出来并提示（协议本身向后兼容），真正防止顶掉的是下面的"同源才替换"。
+        """
         client.meta["role"] = role
+        client.meta["legacy"] = legacy
         client.meta["hello_at"] = time.time()
+        client.greeted = True
 
         fmt = AudioFormat.from_dict(msg.get("format"))
         tab = _tab_from_payload(msg.get("tab"))
         browser = str((msg.get("browser") or {}).get("name") or "")
 
-        # 音频连接：格式以它为准（PCM 是从这条连接来的）
+        # ---- 跨源保护：不许"另一个浏览器里的扩展"顶掉正在工作的连接 ----
+        # 同一个源（同一个浏览器）重连是正常的（SW 会被回收），照旧替换；
+        # 不同源且对方还活着 → 拒绝新来的，而不是把干活的踢掉。
+        for slot_name, slot in (("audio", self._audio), ("control", self._control)):
+            if (
+                slot is not None
+                and not slot.closing
+                and slot.origin != client.origin
+                and role in (slot_name, "both")
+            ):
+                msg_text = (
+                    f"已有另一个浏览器扩展在当 {slot_name}"
+                    f"（{slot.origin.removeprefix('chrome-extension://')[:8]}…），"
+                    "本条连接被忽略"
+                )
+                log.warning("%s（新连接 %s）", msg_text, client.addr)
+                with self._lock:
+                    self.stats.last_error = msg_text
+                    # 这条提示要活一会儿：被拒的连接随后会触发 _on_close，
+                    # 而 _refresh_note_locked 会把"多实例"提示清掉——
+                    # 用户还没来得及看见，提示就没了（实测就是这么丢的）。
+                    self._busy_note = msg_text
+                    self._busy_note_at = time.time()
+                    self._refresh_note_locked()
+                client.send_json({"type": "error", "code": "busy", "message": msg_text})
+                self._ws.drop_client(client, 1008, "another extension is active")
+                self._emit_state()
+                return
+
+        # 音频连接：格式以它为准（PCM 是从这条连接来的），状态也以它为准
+        if legacy and any(
+            c is not client and c.greeted and not c.closing and c.origin == client.origin
+            for c in self._ws.clients
+        ):
+            # 旧版扩展的 SW 与 offscreen 都发不带 role 的 hello，两条长得一模一样，
+            # 无从区分角色。若还按"同角色替换"处理，它们会互相顶成死循环；
+            # 所以旧版连接一律**并存**：谁送音频都算，谁报状态都听
+            # （等价于加 role 之前的历史行为）。
+            with self._lock:
+                self.stats.connected = True
+                self.stats.format = fmt
+                self._refresh_note_locked()
+            client.send_json(
+                {
+                    "type": "welcome",
+                    "protocol": PROTOCOL_VERSION,
+                    "ok": True,
+                    "role": "both",
+                    "format": fmt.as_dict(),
+                    "out_rate": self.out_rate,
+                }
+            )
+            log.warning("旧版扩展又连了一条（hello 缺 role）——按并存处理；建议在 edge://extensions 重新加载")
+            self._emit_state()
+            return
+
         if role in ("audio", "both"):
             old = self._audio
             self._audio = client
             if old is not None and old is not client:
-                old.close(CLOSE_REPLACED, "audio connection replaced")
+                self._ws.drop_client(old, CLOSE_REPLACED, "audio connection replaced")
             self._pipeline = AudioPipeline(
                 in_rate=fmt.rate,
                 in_channels=fmt.channels,
@@ -367,15 +465,28 @@ class TabAudioServer:
             old = self._control
             self._control = client
             if old is not None and old is not client:
-                old.close(CLOSE_REPLACED, "control connection replaced")
+                self._ws.drop_client(old, CLOSE_REPLACED, "control connection replaced")
+            self._control_capturing = bool(msg.get("capturing"))
+
+        audio_origin = self._audio.origin if self._audio is not None else None
+        same_as_audio = audio_origin is not None and client.origin == audio_origin
 
         with self._lock:
             self.stats.connected = True
-            if role in ("control", "both"):
+            if self._audio is not None:
+                # 正在送音频，状态就由它说了算：只有音频连接本身、或与它同源的
+                # 连接（同一个浏览器）才有资格改"目标标签页/浏览器"。
+                # 否则另一个浏览器里的同名扩展一连上来就会把标题换掉。
+                self.stats.capturing = True
+                if role in ("audio", "both") or same_as_audio:
+                    self.stats.tab = tab
+                    self.stats.browser = browser
+            elif role in ("control", "both"):
                 self.stats.capturing = bool(msg.get("capturing"))
+                self.stats.tab = tab
                 self.stats.browser = browser
-            self.stats.tab = tab
             self.stats.format = fmt
+            self._refresh_note_locked()
         self._last_audio_at = time.time()
 
         client.send_json(
@@ -417,12 +528,18 @@ class TabAudioServer:
         log.info("按扩展报告的格式重建管线：%dHz/%dch/%s", fmt.rate, fmt.channels, fmt.dtype)
         self._emit_state()
 
-    def _handle_status(self, msg: dict) -> None:
+    def _handle_status(self, client: WSClient, msg: dict) -> None:
+        if not self._is_authoritative(client):
+            log.debug("忽略非权威连接的状态消息（可能是另一个浏览器扩展）")
+            return
         tab = _tab_from_payload(msg.get("tab")) if msg.get("tab") else None
         with self._lock:
             if tab is not None:
                 self.stats.tab = tab
             if "capturing" in msg:
+                # 权威连接自己报的状态要采信：
+                # 它是音频连接（或没有音频连接时的控制连接），"我停了"就是真停了。
+                self._control_capturing = bool(msg.get("capturing"))
                 self.stats.capturing = bool(msg.get("capturing"))
             if msg.get("message"):
                 self.stats.last_error = str(msg["message"])
@@ -440,6 +557,8 @@ class TabAudioServer:
 
         with self._lock:
             self.stats.running = True
+            # 有帧到 = 铁证"正在采集"。任何连接的状态消息都不该把它改回去。
+            self.stats.capturing = True
             self.stats.frames += 1
             self.stats.bytes_in += len(data)
             self.stats.samples_out += int(out.size)
@@ -468,14 +587,34 @@ class TabAudioServer:
         still_here = any(c.meta.get("hello_at") for c in self._ws.clients if c is not client)
         with self._lock:
             self.stats.connected = bool(still_here)
-            if role in ("audio", "both"):
-                # 送音频的那条断了：音频必然停了
-                self.stats.capturing = False if not still_here else self.stats.capturing
+            if role in ("audio", "both") or client.meta.get("legacy"):
+                # 送音频的那条断了：音频必然停了；但若控制连接还在，
+                # 采集状态还要看它怎么说（可能正在重连）
                 self.stats.running = False
+                self.stats.capturing = self._control_capturing if still_here else False
+            self._refresh_note_locked()
             if not greeted and not self.stats.last_error:
                 self.stats.last_error = "连接在握手前断开（可能是扩展版本不匹配）"
         log.info("浏览器扩展连接断开（role=%s code=%s）", role or "?", code)
         self._emit_state()
+
+    def _refresh_note_locked(self) -> None:
+        """记录"是不是有多个扩展实例/旧版扩展连上来了"（调用方须已持锁）。"""
+        clients = [c for c in self._ws.clients if c.meta.get("hello_at")]
+        origins = {c.origin for c in clients if c.origin}
+        legacy = [c for c in clients if c.meta.get("legacy")]
+        notes: list[str] = []
+        busy = bool(getattr(self, "_busy_note", "")) and (
+            time.time() - getattr(self, "_busy_note_at", 0.0) < BUSY_NOTE_SECONDS
+        )
+        if busy:
+            notes.append(self._busy_note)
+        elif len(origins) > 1:
+            # 与上面那条 busy 提示说的是同一件事，别重复刷屏
+            notes.append(f"另有 {len(origins) - 1} 个浏览器扩展也连上来了（音频以正在送的那条为准）")
+        if legacy:
+            notes.append("检测到旧版扩展：请在 edge://extensions 里点【重新加载】")
+        self.stats.peer_note = "；".join(notes)
 
     # ------------------------------------------------------------------ #
     # 状态

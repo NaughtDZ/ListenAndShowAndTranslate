@@ -82,3 +82,20 @@ def test_save_writes_overlay_fields(win):
 def test_save_keeps_autoshink_default_on(win):
     win._save()
     assert win.config.overlay.auto_shrink_font is True
+
+
+def test_show_syncs_context_lines(win):
+    """「带入前文」行数也要回读。
+
+    以前只在建页时读一次：别处改过（手改配置 / 向导）→ 打开设置窗显示旧值 →
+    一按保存就把旧值写回去，表现和"改了配置没生效"一模一样。
+    """
+    win.config.translate.context_lines = 7
+    win.show()  # showEvent → _sync_live_fields()
+    assert win.ctx_lines.value() == 7
+
+
+def test_save_writes_context_lines(win):
+    win.ctx_lines.setValue(9)
+    win._save()
+    assert win.config.translate.context_lines == 9

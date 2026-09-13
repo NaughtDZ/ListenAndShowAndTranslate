@@ -333,8 +333,40 @@ async function startCapture(tabId) {
   log(`开始采集 tab=${targetId} ${capturing.rate}Hz/${capturing.channels}ch`);
 }
 
-async function stopCapture(reason) {
-  if (stopTimer) {
+/**
+ * 音轨结束后的自动恢复。
+ *
+ * 为什么需要：``chrome.tabCapture`` 的音频音轨会在目标标签页"不再出声"时结束
+ * （视频播完 / 暂停 / 播放器换曲），以前我们收到 ended 就直接停止采集，
+ * 用户必须再点一次扩展图标才能继续——实测反馈就是"发送会暂停，还得手动再点一次"。
+ *
+ * 自动重试不需要用户再授权（那次授权还在这个标签页上），所以绝大多数情况能自愈；
+ * 只有标签页被关掉、或浏览器要求重新触发时，才去求人（并把原因讲清楚）。
+ */
+async function resumeAfterTrackEnded(tabId) {
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    await new Promise((r) => setTimeout(r, 1200));
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (!tab) {
+      send({ type: "log", message: `标签页 ${tabId} 已关闭，停止采集` });
+      await stopCapture("tab-closed");
+      return;
+    }
+    send({ type: "log", message: `音轨结束，自动尝试恢复采集（第 ${attempt}/3 次）` });
+    await startCapture(tabId);
+    if (capturing) {
+      send({ type: "log", message: "已自动恢复采集，无需手动再点" });
+      return;
+    }
+  }
+  error(
+    "resume-failed",
+    "音轨结束后自动恢复失败",
+    "请在浏览器里再点一次扩展图标（或按 Ctrl+Shift+U）"
+  );
+}
+
+async function stopCapture(reason) {  if (stopTimer) {
     clearTimeout(stopTimer);
     stopTimer = null;
   }
@@ -397,7 +429,14 @@ chrome.runtime.onConnect.addListener((port) => {
     }
     if (msg.type === "ended") {
       log("目标标签页的音频结束了");
-      stopCapture("track-ended");
+      // 音轨结束 ≠ 用户想停：最常见的场景是"视频播完了 / 暂停了一下"，
+      // 以前这里直接 stopCapture，用户就得再点一次扩展图标。
+      // 现在自动重试几次（授权仍在，不用用户再点），真的不行才去求人。
+      if (capturing && capturing.tabId) {
+        resumeAfterTrackEnded(capturing.tabId);
+      } else {
+        stopCapture("track-ended");
+      }
     } else if (msg.type === "failed") {
       error("offscreen-failed", msg.message || "offscreen 报错");
     }

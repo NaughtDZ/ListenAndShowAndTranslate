@@ -148,6 +148,12 @@ def main() -> int:
     ap.add_argument("--keep", action="store_true")
     ap.add_argument("--seconds", type=float, default=10.0)
     ap.add_argument("--no-console", action="store_true", help="不抓扩展控制台（默认抓，便于排错）")
+    ap.add_argument(
+        "--show-gesture-rejection",
+        action="store_true",
+        help="额外跑一遍「不带旁路」的启动，用真实浏览器复现「必须用户亲手触发」那条错误"
+        "（慢一倍；平台规则已写进 docs/浏览器标签页.md，默认不再跑）",
+    )
     args = ap.parse_args()
 
     edge = find_edge()
@@ -158,6 +164,10 @@ def main() -> int:
     from app.audio.capture import CaptureWorker, TargetSpec
     from app.audio.tab_audio import TabAudioServer
     from cdp_console import ConsoleTap
+    from ext_id import unpacked_extension_id
+
+    ext_id = unpacked_extension_id(EXT)
+    print(f"扩展 ID（离线算得）: {ext_id}")
 
     tap = None
     if not args.no_console:
@@ -176,41 +186,35 @@ def main() -> int:
     print(f"标签页通道   : ws://127.0.0.1:{server.port}/lst/tab")
     print(f"测试页       : {pages.url('/a.html')}(441Hz 目标) / {pages.url('/b.html')}(883Hz 陪跑)\n")
 
-    # ---------------- 第一遍：如实暴露浏览器的拒绝 ----------------
-    print("① 第一遍启动：不施加任何旁路，看浏览器会不会拒绝（预期会）…")
-    launch(edge, pages.url("/b.html"))
-    time.sleep(3.0)
-    open_second_tab(edge, pages.url("/a.html"))
+    # ---------------- 第一遍（可选）：如实暴露浏览器的拒绝 ----------------
+    if args.show_gesture_rejection:
+        print("① 第一遍启动：不施加任何旁路，看浏览器会不会拒绝（预期会）…")
+        launch(edge, pages.url("/b.html"))
+        time.sleep(3.0)
+        open_second_tab(edge, pages.url("/a.html"))
 
-    connected = wait_for(lambda: server.snapshot().connected, 25)
-    snap = server.snapshot()
-    ext_id = snap.extension_id
-    print(f"   扩展连上={connected} 扩展 ID={ext_id or '（没拿到）'}")
-    time.sleep(4.0)
-    snap = server.snapshot()
-    print(f"   采集中={snap.capturing}")
-    if snap.last_error:
-        print(f"   浏览器拒绝原文：{snap.last_error}")
+        connected = wait_for(lambda: server.snapshot().connected, 60)
+        snap = server.snapshot()
+        print(f"   扩展连上={connected}")
+        time.sleep(4.0)
+        snap = server.snapshot()
+        print(f"   采集中={snap.capturing}")
+        if snap.last_error:
+            print(f"   浏览器拒绝原文：{snap.last_error}")
 
-    if not ext_id:
-        print("❌ 拿不到扩展 ID，后面的旁路实验做不了")
-        server.stop()
-        pages.stop()
+        print("\n② 关掉这一遍（下面用 --allowlisted-extension-id 旁路掉「人手」这一步）…")
         kill_probe_edge()
-        return 2
+        time.sleep(3.0)
 
-    print("\n② 关掉这一遍（下面用 --allowlisted-extension-id 旁路掉「人手」这一步）…")
-    kill_probe_edge()
-    time.sleep(3.0)
-
-    # ---------------- 第二遍：放行后验证音频通路 ----------------
-    print("③ 第二遍启动：带 --allowlisted-extension-id=" + ext_id)
+    # ---------------- 放行后验证音频通路 ----------------
+    print("③ 启动（带 --allowlisted-extension-id）…")
     launch(edge, pages.url("/b.html"), f"--allowlisted-extension-id={ext_id}")
     time.sleep(3.0)
     open_second_tab(edge, pages.url("/a.html"))
 
-    started = wait_for(lambda: server.snapshot().capturing, 30)
+    started = wait_for(lambda: server.snapshot().capturing, 90)
     snap = server.snapshot()
+    connected = bool(snap.extension_id)
     print(f"   连接={snap.connected} 采集中={snap.capturing} 目标={snap.tab.title!r}")
     if snap.tab.url:
         print(f"   来源 URL: {snap.tab.url}")

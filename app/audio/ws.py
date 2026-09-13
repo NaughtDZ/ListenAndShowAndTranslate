@@ -60,7 +60,8 @@ MAX_HANDSHAKE_BYTES = 16 * 1024
 class WSClient:
     """一条已握手的连接。带上层想挂的任何状态（用 ``meta``）。"""
 
-    __slots__ = ("addr", "origin", "path", "meta", "connected_at", "closing", "_sock", "_send_lock")
+    __slots__ = ("addr", "origin", "path", "meta", "connected_at", "closing", "greeted",
+                 "_sock", "_send_lock")
 
     def __init__(self, addr: tuple[str, int], origin: str, path: str, sock: socket.socket) -> None:
         self.addr = addr
@@ -71,6 +72,9 @@ class WSClient:
         self.closing = False
         """请求关闭：读线程看到它就退出（不然被拒绝的连接会一直挂着，
         ``connected`` 永远为 True）。"""
+        self.greeted = False
+        """上层是否已经完成握手。淘汰连接时**优先踢没握手的**
+        （它们多半是陌生连接/刚断线的僵尸，不能为了给它们腾地方把正在干活的踢掉）。"""
         self._sock = sock
         self._send_lock = threading.Lock()
 
@@ -183,6 +187,20 @@ class WSServer:
         with self._client_lock:
             return list(self._clients)
 
+    def drop_client(
+        self, client: WSClient, code: int = CLOSE_REPLACED, reason: str = ""
+    ) -> None:
+        """把连接**立刻**从登记表摘掉并关闭。
+
+        用于"同一角色的新连接替换旧的"：socket 关闭与读线程退出是异步的，
+        但我们的簿记不该还挂着一个已经作废的连接（曾经因此把正在送音频的那条
+        当成"僵尸"或反过来把它挤掉）。
+        """
+        with self._client_lock:
+            if client in self._clients:
+                self._clients.remove(client)
+        client.close(code, reason)
+
     @property
     def is_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
@@ -287,14 +305,30 @@ class WSServer:
                     log.error("on_close 回调抛异常: %s", exc)
 
     def _install_client(self, client: WSClient) -> None:
-        """登记连接；超过 ``max_clients`` 就踢掉最旧的（默认模式 = 新连接替换旧连接）。"""
+        """登记连接；超过 ``max_clients`` 就腾地方。
+
+        **淘汰顺序很重要**：先踢"还没握手"的连接（陌生连接、刚断线的僵尸），
+        再踢最旧的。以前一律"最旧的先踢"，结果实测踩到过：
+        另一个浏览器配置文件里的同名扩展也在连（它还没握手/不在采集），
+        新连接一到就把**正在送音频的那条**踢了——表现为"音频突然断一下"。
+        """
         with self._client_lock:
             self._clients.append(client)
-            overflow = self._clients[: max(0, len(self._clients) - self.max_clients)]
-            if overflow:
-                del self._clients[: len(overflow)]
-        for old in overflow:
-            log.info("连接数超限，踢掉旧连接 %s（新连接 %s）", old.addr, client.addr)
+            victims: list[WSClient] = []
+            while len(self._clients) > self.max_clients:
+                others = [c for c in self._clients if c is not client]
+                if not others:
+                    break
+                victim = next((c for c in others if not c.greeted), others[0])
+                self._clients.remove(victim)
+                victims.append(victim)
+        for old in victims:
+            log.info(
+                "连接数超限，踢掉%s %s（新连接 %s）",
+                "未握手的" if not old.greeted else "最旧的",
+                old.addr,
+                client.addr,
+            )
             old.close(CLOSE_REPLACED, "replaced by a newer connection")
 
     def _read_handshake(self, conn: socket.socket) -> tuple[str, dict[str, str]] | None:

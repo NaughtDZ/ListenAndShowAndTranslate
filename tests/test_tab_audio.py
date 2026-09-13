@@ -59,18 +59,21 @@ class Rig:
         fmt: dict | None = None,
         tab: dict | None = None,
         capturing: bool = True,
+        role: str = "both",
+        legacy: bool = False,
     ) -> dict:
-        cli.send_json(
-            {
-                "type": "hello",
-                "protocol": protocol,
-                "token": token,
-                "format": fmt or {"rate": RATE, "channels": CHANNELS, "dtype": "float32"},
-                "tab": tab if tab is not None else {"id": 7, "title": "测试标签页", "url": "https://x/y"},
-                "browser": {"name": "Edge 153"},
-                "capturing": capturing,
-            }
-        )
+        payload = {
+            "type": "hello",
+            "protocol": protocol,
+            "token": token,
+            "format": fmt or {"rate": RATE, "channels": CHANNELS, "dtype": "float32"},
+            "tab": tab if tab is not None else {"id": 7, "title": "测试标签页", "url": "https://x/y"},
+            "browser": {"name": "Edge 153"},
+            "capturing": capturing,
+        }
+        if not legacy:
+            payload["role"] = role
+        cli.send_json(payload)
         return cli.recv_json(timeout=3)
 
     def stop(self) -> None:
@@ -445,6 +448,169 @@ def test_audio_hello_sets_format(rig: Rig):
     audio.recv_json(timeout=3)
     snap = rig.server.snapshot()
     assert snap.format.rate == 16000 and snap.format.channels == 1
+
+
+# --------------------------------------------------------------------------- #
+# 多实例：另一个浏览器里也装了同一个扩展（实测真的会发生）
+# --------------------------------------------------------------------------- #
+def test_second_extension_cannot_pause_or_kick_the_live_one(rig: Rig):
+    """实测现场（2026-09-13）：用户日常浏览器里那份扩展也连上来，
+
+    它以 control 身份 report ``capturing=false``（因为它没在采集），
+    结果程序状态被改成"等待开始采集"——看起来就像音频发送暂停了。
+    它还会把正在送音频的那条挤掉（旧的淘汰策略是"最旧先踢"）。
+
+    现在的规则：**别的浏览器里的扩展不能顶掉正在工作的那条**——
+    新连接会被明确拒绝（busy），并如实告诉用户发生了什么。
+    """
+    control = rig.client()
+    _hello_role(control, "control")
+    audio = rig.client()
+    _hello_role(audio, "audio", tab_id=11)
+    audio.send_binary(_pcm())
+    time.sleep(0.3)
+    assert rig.server.snapshot().capturing is True
+
+    # 另一个扩展实例（不同 Origin）连上来，说自己没在采集、目标是别的标签页
+    other = rig.client(origin="chrome-extension://another-extension-instance")
+    other.send_json(
+        {
+            "type": "hello",
+            "protocol": 1,
+            "role": "control",
+            "format": {"rate": RATE, "channels": CHANNELS, "dtype": "float32"},
+            "tab": {"id": 999, "title": "别人的标签页"},
+            "browser": {"name": "Edge"},
+            "capturing": False,
+        }
+    )
+    msg = other.recv_json(timeout=3)
+    assert msg["type"] == "error" and msg["code"] == "busy"
+    kind, code = other.recv(timeout=3)
+    assert kind == "close" and code == 1008
+
+    snap = rig.server.snapshot()
+    assert snap.capturing is True, "不能因为别人说自己没采集，就把我们的采集说成停了"
+    assert snap.tab.id == 11, "目标标签页不能被别人的状态覆盖"
+    assert "另一个浏览器扩展" in snap.peer_note and "被忽略" in snap.peer_note
+    # 我们自己的两条连接一个都没掉
+    assert [c.meta.get("role") for c in rig.server._ws.clients] == ["control", "audio"]
+    # 音频连接还在，继续送帧依旧有效
+    audio.send_binary(_pcm())
+    deadline = time.time() + 3
+    while time.time() < deadline and rig.server.snapshot().frames < 2:
+        time.sleep(0.02)
+    assert rig.server.snapshot().frames >= 2
+    assert rig.server.snapshot().capturing is True
+
+
+def test_same_origin_reconnect_still_replaces(rig: Rig):
+    """同一个浏览器（同源）重连是正常的——SW 会被回收，必须还能顶掉旧的。"""
+    control = rig.client()
+    _hello_role(control, "control")
+    audio = rig.client()
+    _hello_role(audio, "audio", tab_id=11)
+
+    control2 = rig.client()  # 同源（rig.client 默认同一个 origin）
+    _hello_role(control2, "control")
+    kind, code = control.recv(timeout=3)
+    assert kind == "close" and code == 4001
+
+
+def test_legacy_extension_is_flagged_with_actionable_hint(rig: Rig):
+    """旧版扩展（hello 里没有 role 字段）会被当成 both 接受，但要提示用户重新加载。
+
+    实测：用户日常浏览器里装的那份就是旧版（本程序加 role 之前装的），
+    它一 hello 就把正在送音频的那条顶掉，表现为"音频发送暂停，还得手动再点"。
+    """
+    legacy = rig.client()
+    legacy.send_json(
+        {
+            "type": "hello",
+            "protocol": 1,
+            "format": {"rate": RATE, "channels": CHANNELS, "dtype": "float32"},
+            "tab": {"id": 5, "title": "旧版扩展"},
+            "browser": {"name": "Edge"},
+            "capturing": False,
+        }
+    )
+    assert legacy.recv_json(timeout=3)["type"] == "welcome"
+    snap = rig.server.snapshot()
+    assert "旧版扩展" in snap.peer_note
+    assert "重新加载" in snap.peer_note
+
+
+def test_foreign_status_message_is_ignored(rig: Rig):
+    """非权威连接的 status 也不能改状态。"""
+    control = rig.client()
+    _hello_role(control, "control")
+    audio = rig.client()
+    _hello_role(audio, "audio", tab_id=11)
+
+    other = rig.client(origin="chrome-extension://another-extension-instance")
+    other.send_json(
+        {
+            "type": "hello",
+            "protocol": 1,
+            "role": "control",
+            "format": {"rate": RATE, "channels": CHANNELS, "dtype": "float32"},
+            "tab": {"id": 999, "title": "别人的标签页"},
+            "capturing": False,
+        }
+    )
+    other.recv_json(timeout=3)
+    other.send_json({"type": "status", "capturing": False, "tab": {"id": 999, "title": "改了"}})
+    time.sleep(0.4)
+
+    snap = rig.server.snapshot()
+    assert snap.capturing is True
+    assert snap.tab.id == 11
+
+
+def test_eviction_prefers_unauthenticated_connections(rig: Rig):
+    """连接数超限时先踢"还没握手"的，绝不能把正在工作的音频连接踢掉。"""
+    control = rig.client()
+    _hello_role(control, "control")
+    audio = rig.client()
+    _hello_role(audio, "audio", tab_id=11)
+    audio.send_binary(_pcm())
+    time.sleep(0.2)
+
+    # 塞两条陌生连接（不握手），把容量（4）占满
+    strangers = [rig.client() for _ in range(2)]
+    # 再来一条 → 超限，被踢的应是"还没握手"的那条
+    late = rig.client()
+    time.sleep(0.4)
+
+    roles = [c.meta.get("role") for c in rig.server._ws.clients]
+    assert "audio" in roles, "正在送音频的那条绝不能被踢"
+    assert "control" in roles
+    # 音频仍然可用
+    audio.send_binary(_pcm())
+    time.sleep(0.3)
+    assert rig.server.snapshot().frames >= 2
+    late.close()
+    for s in strangers:
+        s.close()
+
+
+def test_audio_disconnect_falls_back_to_control_state(rig: Rig):
+    """音频那条断了之后，采集状态以控制连接的说法为准。"""
+    control = rig.client()
+    _hello_role(control, "control")
+    audio = rig.client()
+    _hello_role(audio, "audio", tab_id=11)
+    audio.close()
+    deadline = time.time() + 3
+    while time.time() < deadline and rig.server.snapshot().capturing:
+        time.sleep(0.02)
+    assert rig.server.snapshot().capturing is False
+    # 控制连接 report 又开始采集 → 状态跟上
+    control.send_json({"type": "status", "capturing": True, "tab": {"id": 12, "title": "新的"}})
+    deadline = time.time() + 3
+    while time.time() < deadline and not rig.server.snapshot().capturing:
+        time.sleep(0.02)
+    assert rig.server.snapshot().capturing is True
 
 
 # --------------------------------------------------------------------------- #

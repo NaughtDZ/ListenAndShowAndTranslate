@@ -324,6 +324,12 @@ class SettingsWindow(QWidget):
         if idx >= 0 and idx != self.provider_combo.currentIndex():
             self.provider_combo.setCurrentIndex(idx)  # 让它重建凭据字段
 
+        # 「带入前文」行数也要回读：以前只在建页时读一次，别处改过（如手改配置/向导）
+        # 打开设置窗看到的还是旧值，一按保存就把旧值写回去（"改了配置没生效"那类坑）。
+        self.ctx_lines.blockSignals(True)
+        self.ctx_lines.setValue(int(self.config.translate.context_lines))
+        self.ctx_lines.blockSignals(False)
+
         # 识别模型：向导可能刚补下了模型，"未下载"标记要跟着刷新
         self._refresh_model_choices()
         self._sync_latency_fields()
