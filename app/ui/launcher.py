@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QPushButton,
+    QRadioButton,
     QVBoxLayout,
     QWidget,
 )
@@ -50,6 +51,22 @@ class LauncherWindow(QWidget):
         )
         self.hint.setWordWrap(True)
 
+        # 音源模式：进程 / 浏览器标签页
+        self.mode_process = QRadioButton("程序进程（小说软件 / 播放器）")
+        self.mode_process.setChecked(True)
+        self.mode_tab = QRadioButton("浏览器标签页（只听某一个标签页）")
+        self.mode_tab.setToolTip(
+            "浏览器把整个实例的音频混在一起，操作系统层分不出标签页。\n"
+            "所以这条模式需要装一个很小的浏览器扩展，由它把目标标签页的音频\n"
+            "经本机回环（127.0.0.1）送过来。详见「扩展与安装说明」。"
+        )
+        self.mode_process.toggled.connect(self._sync_mode)
+        self.mode_tab.toggled.connect(self._sync_mode)
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(self.mode_process)
+        mode_row.addWidget(self.mode_tab)
+        mode_row.addStretch(1)
+
         self.list = QListWidget()
         self.list.setSelectionMode(QAbstractItemView.SingleSelection)
         self.list.itemDoubleClicked.connect(lambda _i: self._start())
@@ -70,10 +87,15 @@ class LauncherWindow(QWidget):
         self.wizard_btn.clicked.connect(self._open_wizard)
         self.meter_btn = QPushButton("电平表")
         self.meter_btn.clicked.connect(self._open_meter)
+        self.guide_btn = QPushButton("扩展与安装说明…")
+        self.guide_btn.setToolTip("浏览器标签页模式需要先装一个扩展；点这里看步骤")
+        self.guide_btn.clicked.connect(self._open_extension_guide)
+        self.guide_btn.hide()  # 只有标签页模式才需要
 
         row = QHBoxLayout()
         row.addWidget(self.refresh_btn)
         row.addStretch(1)
+        row.addWidget(self.guide_btn)
         row.addWidget(self.meter_btn)
         row.addWidget(self.wizard_btn)
         row.addWidget(self.settings_btn)
@@ -81,6 +103,7 @@ class LauncherWindow(QWidget):
 
         lay = QVBoxLayout(self)
         lay.addWidget(self.hint)
+        lay.addLayout(mode_row)
         lay.addWidget(self.list, 1)
         lay.addWidget(self.empty_hint)
         lay.addLayout(row)
@@ -90,9 +113,39 @@ class LauncherWindow(QWidget):
         self._timer.timeout.connect(self.refresh)
         self._timer.start(3000)
         self.refresh()
+        self._sync_mode()
 
     # ------------------------------------------------------------------ #
+    def _sync_mode(self) -> None:
+        """按音源模式切换界面：进程模式看列表，标签页模式看说明。"""
+        tab_mode = self.mode_tab.isChecked()
+        self.list.setVisible(not tab_mode)
+        self.empty_hint.setVisible(not tab_mode)
+        self.guide_btn.setVisible(tab_mode)
+        self.meter_btn.setEnabled(not tab_mode)
+        self.meter_btn.setToolTip(
+            "电平表基于进程采集；标签页模式的电平请看字幕窗里的状态" if tab_mode else ""
+        )
+        self.refresh_btn.setEnabled(not tab_mode)
+        if tab_mode:
+            self.hint.setText(
+                "浏览器标签页模式：<b>只字幕你指定的那一个标签页</b>，别的标签页照常有声。<br>"
+                "① 先点「开始字幕」；② 在浏览器里切到要字幕的标签页；"
+                "③ 点工具栏里的扩展图标（或按 Ctrl+Shift+U）。"
+            )
+            self.start_btn.setText("开始字幕（浏览器标签页）")
+            self.empty_hint.setText("")
+        else:
+            self.hint.setText(
+                "选一个正在播放的<b>小说软件</b>，点「开始字幕」。<br>"
+                "游戏的声音不会被采集——程序只监听你选中的这一个进程。"
+            )
+            self.start_btn.setText("开始字幕")
+            self.refresh()
+
     def refresh(self) -> None:
+        if self.mode_tab.isChecked():
+            return  # 标签页模式不看进程列表，别再无谓地枚举音频会话
         try:
             procs = enumerate_audio_processes(include_inactive=False)
         except Exception as exc:  # noqa: BLE001
@@ -168,6 +221,9 @@ class LauncherWindow(QWidget):
             return None
 
     def _start(self) -> None:
+        if self.mode_tab.isChecked():
+            self._start_tab_mode()
+            return
         pid = self._selected_pid()
         if pid is None:
             self.empty_hint.setText("请先在列表里选一个程序。")
@@ -190,6 +246,23 @@ class LauncherWindow(QWidget):
         )
         QTimer.singleShot(1500, lambda: self._finish_start(proc))
 
+    def _start_tab_mode(self) -> None:
+        """浏览器标签页模式：起字幕子进程，音频等扩展送来。"""
+        proc = self._spawn_child(["--tab"])
+        if proc is None:
+            return
+        self._timer.stop()
+        self.start_btn.setEnabled(False)
+        self.refresh_btn.setEnabled(False)
+        self.mode_tab.setEnabled(False)
+        self.mode_process.setEnabled(False)
+        self.hint.setText(
+            "字幕已启动（浏览器标签页模式）。<br>"
+            "请在浏览器里切到要字幕的<b>那个标签页</b>，再点工具栏里的扩展图标"
+            "（或按 <b>Ctrl+Shift+U</b>）——浏览器规定必须由你亲手触发一次。"
+        )
+        QTimer.singleShot(1500, lambda: self._finish_start(proc))
+
     def _finish_start(self, proc) -> None:
         code = proc.poll()
         if code is None:
@@ -198,13 +271,81 @@ class LauncherWindow(QWidget):
             return
         self.start_btn.setEnabled(True)
         self.refresh_btn.setEnabled(True)
+        self.mode_tab.setEnabled(True)
+        self.mode_process.setEnabled(True)
         self._timer.start(3000)
+        self._sync_mode()
+        if self.mode_tab.isChecked():
+            self.empty_hint.setText(
+                f"❌ 字幕进程启动后立刻退出了（exit {code}）。<br>"
+                "常见原因：端口 38991 被别的程序占用（设置里可改）、或配置有误。"
+                "日志见 data\\logs\\lst.log。"
+            )
+            return
         self.hint.setText("选一个正在播放的<b>小说软件</b>，点「开始字幕」。")
         self.empty_hint.setText(
             f"❌ 字幕进程启动后立刻退出了（exit {code}）。<br>"
             "常见原因：这个进程其实没在发声（浏览器/Electron 选错子进程）、"
             "或者配置有误。日志见 data\\logs\\lst.log。"
         )
+
+    def _open_extension_guide(self) -> None:
+        """浏览器标签页模式的扩展安装说明。
+
+        为什么必须有这一步：浏览器规定"取标签页音频"要由用户亲手触发过扩展
+        （activeTab / kTabCaptureForTab 是按标签页授予的），程序代替不了；
+        而扩展必须由用户自己侧载——我们能做的是把路径和步骤摆清楚。
+        """
+        import os
+        from pathlib import Path
+
+        from PySide6.QtGui import QGuiApplication
+        from PySide6.QtWidgets import QMessageBox
+
+        from app.paths import ROOT
+
+        ext_dir = Path(ROOT) / "browser_extension"
+        box = QMessageBox(self)
+        box.setWindowTitle("浏览器标签页：扩展安装说明")
+        box.setTextFormat(Qt.RichText)
+        box.setText(
+            "<b>为什么要装扩展：</b>浏览器把整个实例的音频混成一个流，"
+            "操作系统层分不出标签页（实测两个标签页同时出声，音频会话仍只有 1 个）。"
+            "标签页边界只有浏览器内部知道，所以由这个小扩展把目标标签页的音频"
+            "经 <code>127.0.0.1</code> 送过来。<br><br>"
+            "<b>步骤：</b><br>"
+            "① 地址栏打开 <code>edge://extensions</code>（Chrome 是 <code>chrome://extensions</code>），"
+            "打开左下角「开发人员模式」；<br>"
+            "② 点「加载解压缩的扩展」，选中下面这个文件夹；<br>"
+            f"<code>{ext_dir}</code><br>"
+            "③ 回到本程序点「开始字幕」；<br>"
+            "④ 在浏览器里切到要字幕的标签页，点工具栏里的扩展图标"
+            "（或按 <b>Ctrl+Shift+U</b>）。<br><br>"
+            "<b>注意：</b>第 ④ 步必须你亲手做——浏览器要求由用户触发一次"
+            "（授权是按标签页给的），这是它的安全策略，不是本程序的 bug。"
+            "换标签页需要再触发一次。<br>"
+            "音频只走本机回环，不联网、不上传。"
+        )
+        open_btn = box.addButton("打开扩展文件夹", QMessageBox.ActionRole)
+        copy_btn = box.addButton("复制 edge://extensions", QMessageBox.ActionRole)
+        box.addButton("关闭", QMessageBox.RejectRole)
+        box.exec()
+
+        clicked = box.clickedButton()
+        if clicked is open_btn:
+            try:
+                if os.name == "nt":
+                    os.startfile(str(ext_dir))  # noqa: S606 - 打开用户自己的目录
+                else:
+                    from PySide6.QtCore import QUrl
+                    from PySide6.QtGui import QDesktopServices
+
+                    QDesktopServices.openUrl(QUrl.fromLocalFile(str(ext_dir)))
+            except Exception as exc:  # noqa: BLE001
+                self.empty_hint.setText(f"打不开目录：{exc}（路径：{ext_dir}）")
+        elif clicked is copy_btn:
+            QGuiApplication.clipboard().setText("edge://extensions")
+            self.empty_hint.setText("已复制 edge://extensions，粘到地址栏即可。")
 
     def _open_meter(self) -> None:
         pid = self._selected_pid()

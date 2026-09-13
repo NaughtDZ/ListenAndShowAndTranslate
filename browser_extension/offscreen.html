@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>听·显·译 · 标签页音频</title>
+  </head>
+  <body>
+    <!--
+      offscreen 文档：看不见的页面，只为拿 Web Audio / getUserMedia。
+      MV3 的 service worker 里没有 DOM，所以必须借它。
+      音频全在这里处理：取流 → 回放给你听 → 分流一路给 AudioWorklet 出 PCM。
+    -->
+    <script src="offscreen.js"></script>
+  </body>
+</html>

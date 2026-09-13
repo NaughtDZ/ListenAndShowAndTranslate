@@ -1,0 +1,198 @@
+:root {
+  color-scheme: light dark;
+  --fg: #1b1d1f;
+  --muted: #6b7280;
+  --line: #e3e6ea;
+  --accent: #2e7d32;
+  --danger: #b3261e;
+  --bg: #ffffff;
+  --sel: #eef7ef;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg: #e8eaed;
+    --muted: #9aa0a6;
+    --line: #3c4043;
+    --bg: #202124;
+    --sel: #23331f;
+  }
+}
+
+body {
+  width: 340px;
+  margin: 0;
+  padding: 12px;
+  font: 13px/1.5 "Microsoft YaHei", "Segoe UI", system-ui, sans-serif;
+  color: var(--fg);
+  background: var(--bg);
+}
+
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.title .sub {
+  color: var(--muted);
+  font-weight: normal;
+}
+
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #c4c7cc;
+}
+
+.dot.on {
+  background: var(--accent);
+}
+
+.dot.off {
+  background: var(--danger);
+}
+
+.status {
+  margin: 8px 0;
+  color: var(--muted);
+}
+
+.hint {
+  margin: 8px 0;
+  padding: 8px 10px;
+  border-left: 3px solid var(--danger);
+  background: color-mix(in srgb, var(--danger) 8%, transparent);
+  border-radius: 4px;
+  white-space: pre-wrap;
+}
+
+.list {
+  max-height: 240px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  margin: 8px 0;
+}
+
+.item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 9px;
+  cursor: pointer;
+  border-bottom: 1px solid var(--line);
+}
+
+.item:last-child {
+  border-bottom: none;
+}
+
+.item:hover {
+  background: color-mix(in srgb, var(--fg) 5%, transparent);
+}
+
+.item.selected {
+  background: var(--sel);
+}
+
+.item img {
+  width: 16px;
+  height: 16px;
+  flex: none;
+}
+
+.item .name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.item .tag {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 11px;
+  flex: none;
+}
+
+.empty {
+  padding: 14px 10px;
+  color: var(--muted);
+  text-align: center;
+}
+
+.row {
+  display: flex;
+  gap: 8px;
+  margin: 8px 0;
+}
+
+button {
+  font: inherit;
+  padding: 7px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+
+button.primary {
+  flex: 1;
+  border-color: var(--accent);
+  background: var(--accent);
+  color: #fff;
+}
+
+button.primary:disabled,
+button.danger:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+button.danger {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+button.ghost {
+  border: none;
+  padding: 4px 8px;
+}
+
+.advanced {
+  margin: 10px 0;
+  border-top: 1px solid var(--line);
+  padding-top: 8px;
+}
+
+.advanced label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 6px 0;
+}
+
+.advanced input {
+  flex: 1;
+  font: inherit;
+  padding: 4px 6px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+}
+
+.tiny {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+}

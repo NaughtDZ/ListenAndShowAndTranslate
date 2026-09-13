@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <link rel="stylesheet" href="popup.css" />
+    <title>听·显·译 · 标签页音频</title>
+  </head>
+  <body>
+    <header>
+      <div class="title">
+        <span class="dot" id="dot"></span>
+        <strong>听·显·译</strong>
+        <span class="sub">标签页音频</span>
+      </div>
+      <button id="refresh" class="ghost" title="重新连接 / 刷新列表">↻</button>
+    </header>
+
+    <p class="status" id="status">正在检查与本程序的连接…</p>
+
+    <div class="hint" id="hint" hidden></div>
+
+    <div class="list" id="list"></div>
+
+    <div class="row">
+      <button id="start" class="primary">开始字幕</button>
+      <button id="stop" class="danger" disabled>停止</button>
+    </div>
+
+    <details class="advanced">
+      <summary>高级：端口 / 配对码</summary>
+      <label>端口 <input id="port" type="number" min="1" max="65535" /></label>
+      <label>配对码 <input id="token" type="text" placeholder="留空表示不校验" /></label>
+      <button id="save" class="ghost">保存并重连</button>
+      <p class="tiny">
+        端口要和「听·显·译」设置里的一致（默认 38991）。配对的目的是不让别的本机程序随便往里塞音频。
+      </p>
+    </details>
+
+    <p class="tiny">
+      需要先在本程序里选「浏览器标签页」并点开始，这个扩展才连得上。<br />
+      音频只走本机 127.0.0.1，不联网、不上传。
+    </p>
+
+    <script src="popup.js"></script>
+  </body>
+</html>

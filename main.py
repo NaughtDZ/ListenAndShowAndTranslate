@@ -379,6 +379,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--meter", metavar="PID", help="打开电平表悬浮窗（RMS/PEAK 条 + 可调阈值）")
     p.add_argument("--run", metavar="PID", help="启动字幕程序：透明悬浮窗 + 实时翻译")
     p.add_argument("--process", metavar="NAME", help="配合 --run：按进程名（如 喜马拉雅.exe）")
+    p.add_argument(
+        "--tab",
+        action="store_true",
+        help="启动字幕程序（浏览器标签页模式）：音频由浏览器扩展经本机 WebSocket 送来",
+    )
     p.add_argument("--settings", action="store_true", help="打开设置界面（网络/翻译/识别/外观）")
     p.add_argument("--wizard", action="store_true", help="重新运行首次运行向导（硬件/档位/模型/翻译）")
     p.add_argument(
@@ -437,12 +442,13 @@ def main(argv: list[str] | None = None) -> int:
         from app.ui.wizard import run_wizard
 
         return run_wizard(AppConfig.load())
-    if args.run or args.process:
+    if args.run or args.process or args.tab:
         from app.ui.runner import run_subtitles
 
         return run_subtitles(
             pid=int(args.run) if args.run else None,
             process_name=args.process or "",
+            tab_mode=bool(args.tab),
         )
     if args.meter:
         from app.ui.meter import run_meter

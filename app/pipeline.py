@@ -55,6 +55,8 @@ class SubtitlePipeline(QObject):
     statusChanged = Signal(str)
     errorOccurred = Signal(str)
     statsChanged = Signal(dict)
+    tabStateChanged = Signal(dict)
+    """浏览器标签页通道的状态（连接/断开/目标标签页变化）。参数是 TabAudioStats 的字段字典。"""
 
     def __init__(
         self,
@@ -72,6 +74,9 @@ class SubtitlePipeline(QObject):
         # 采集
         self.capture: CaptureWorker | None = None
         self._target_spec: TargetSpec | None = None
+        # 浏览器标签页音频（扩展 → 本机 WebSocket → 同一条 AudioPipeline）
+        self.tab_server: "TabAudioServer | None" = None
+        self._owns_tab_server = False
 
         # 翻译
         self.hub: TranslatorHub | None = None
@@ -186,6 +191,78 @@ class SubtitlePipeline(QObject):
         )
         return True
 
+    def start_tab_audio(self, server=None) -> bool:
+        """浏览器标签页模式：音频由扩展经本机 WebSocket 送来。
+
+        与进程模式共用同一条 AudioPipeline（扩展送的就是 48k/立体声/float32，
+        和 proc-tap 的输出格式一致），所以识别/翻译全链路零改动。
+
+        Args:
+            server: 复用外部已经跑着的 :class:`TabAudioServer`；不传就按配置新建一个。
+        """
+        from app.audio.tab_audio import TabAudioServer
+
+        if self.router is None or self.hub is None:
+            self.prepare()
+
+        cfg = self.config.tab_audio
+        self._stop.clear()
+        self.started_at = time.time()
+
+        # 翻译线程
+        self._trans_thread = threading.Thread(
+            target=self._translate_loop, name="lst-translate", daemon=True
+        )
+        self._trans_thread.start()
+
+        if server is None:
+            server = TabAudioServer(
+                port=cfg.port,
+                token=cfg.token,
+                require_extension_origin=cfg.require_extension_origin,
+                on_chunk=self._on_audio,
+                on_state=self._on_tab_state,
+            )
+            self._owns_tab_server = True
+            try:
+                server.start()
+            except OSError as exc:
+                self.errorOccurred.emit(f"端口 {cfg.port} 被占用，无法监听：{exc}")
+                return False
+        else:
+            self._owns_tab_server = False
+            server.set_on_chunk(self._on_audio)
+            server.set_on_state(self._on_tab_state)
+
+        self.tab_server = server
+        self.statusChanged.emit(
+            f"等待浏览器扩展连接 · 本机端口 {server.port} · 语言={self.config.asr.language}"
+        )
+        return True
+
+    def _on_tab_state(self, stats) -> None:
+        """在 WebSocket 读线程里被调用——只 emit 信号，不碰 Qt 控件。"""
+        try:
+            payload = {
+                "connected": stats.connected,
+                "capturing": stats.capturing,
+                "tab_title": stats.tab.title,
+                "tab_id": stats.tab.id,
+                "browser": stats.browser,
+                "extension_id": stats.extension_id,
+                "likely_playing": stats.likely_playing,
+                "last_error": stats.last_error,
+                "describe": stats.describe(),
+            }
+        except Exception as exc:  # noqa: BLE001
+            log.debug("标签页状态转换失败: %s", exc)
+            return
+        self.tabStateChanged.emit(payload)
+        if stats.last_error:
+            self.errorOccurred.emit(stats.last_error)
+        else:
+            self.statusChanged.emit(stats.describe())
+
     def reload(self, timeout: float = 15.0) -> bool:
         """就地重建识别与翻译引擎，让"设置保存后立即生效"。
 
@@ -217,6 +294,17 @@ class SubtitlePipeline(QObject):
         if self.capture is not None:
             self.capture.stop()
             self.capture = None
+        if self.tab_server is not None:
+            try:
+                # 先摘掉回调，避免停止过程中还有音频进来喂已经停了的识别器
+                self.tab_server.set_on_chunk(None)
+                self.tab_server.set_on_state(None)
+                if self._owns_tab_server:
+                    self.tab_server.stop()
+            except Exception as exc:  # noqa: BLE001 - 停不干净也不能拦住退出
+                log.warning("停止标签页通道出错（忽略）: %s", exc)
+            finally:
+                self.tab_server = None
         t = self._trans_thread
         if t is not None and t.is_alive():
             t.join(timeout=timeout)
@@ -227,6 +315,20 @@ class SubtitlePipeline(QObject):
                 self._dispatch(ev)
         if self.hub is not None:
             self.hub.close()
+
+    # ------------------------------------------------------------------ #
+    # 状态
+    # ------------------------------------------------------------------ #
+    def pipeline_stats(self):
+        """当前音源管线的统计（设置窗里的电平表用）。没在采集时返回 None。
+
+        进程模式与标签页模式共用同一套 AudioPipeline，所以这里只是按音源转发一下。
+        """
+        if self.capture is not None:
+            return self.capture.pipeline_stats()
+        if self.tab_server is not None:
+            return self.tab_server.pipeline_stats()
+        return None
 
     # ------------------------------------------------------------------ #
     # 采集线程

@@ -40,17 +40,17 @@ log = get_logger(__name__)
 
 
 def capture_level(pipeline: SubtitlePipeline) -> tuple[float, float] | None:
-    """设置窗里"实时电平"的读数来源：采集线程每块已经算好的 RMS / 峰值。
+    """设置窗里"实时电平"的读数来源：音源管线每块已经算好的 RMS / 峰值。
 
     为什么不用 ``capture.snapshot()``：那里的 ``peak`` 是**整段采集的高水位**，
     拿它画 PEAK 条会一直顶在最右边。这里读的是**最近一块**的 RMS / 峰值。
 
-    返回 None 表示当前没有在采集（设置窗会显示"未采集"）。
+    进程模式与浏览器标签页模式共用同一套 AudioPipeline，所以这里统一走
+    ``pipeline.pipeline_stats()``。返回 None 表示当前没有在采集。
     """
-    cap = getattr(pipeline, "capture", None)
-    if cap is None:
+    stats = pipeline.pipeline_stats()
+    if stats is None:
         return None
-    stats = cap.pipeline_stats()
     return float(stats.last_rms), float(stats.last_peak)
 
 
@@ -340,17 +340,28 @@ class SubtitleControlWindow(QWidget):
         )
 
 
-def run_subtitles(pid: int | None = None, process_name: str = "", config: AppConfig | None = None) -> int:
-    """启动字幕程序。返回进程退出码。"""
-    cfg = config or AppConfig.load()
-    spec = TargetSpec(pid=pid) if pid else TargetSpec(process_name=process_name)
+def run_subtitles(
+    pid: int | None = None,
+    process_name: str = "",
+    config: AppConfig | None = None,
+    tab_mode: bool = False,
+) -> int:
+    """启动字幕程序。返回进程退出码。
 
-    target = resolve_target(spec)
-    if target is None:
-        print(f"未找到活跃音频会话：{spec.describe()}")
-        print("提示：先运行 `python main.py --list-audio` 查看正在发声的进程与 PID。")
-        print("      注意：浏览器/Electron 应用要选**真正发声的那个子进程**。")
-        return 2
+    ``tab_mode=True`` 走浏览器标签页：音频由浏览器扩展经本机 WebSocket 送来，
+    不需要 PID（``docs/浏览器标签页.md``）。
+    """
+    cfg = config or AppConfig.load()
+    spec: TargetSpec | None = None
+    target = None
+    if not tab_mode:
+        spec = TargetSpec(pid=pid) if pid else TargetSpec(process_name=process_name)
+        target = resolve_target(spec)
+        if target is None:
+            print(f"未找到活跃音频会话：{spec.describe()}")
+            print("提示：先运行 `python main.py --list-audio` 查看正在发声的进程与 PID。")
+            print("      注意：浏览器/Electron 应用要选**真正发声的那个子进程**。")
+            return 2
 
     # Qt 自己会设置 DPI 感知，这里不要抢（见 app/utils/win32.py 的说明）
     app = QApplication.instance() or QApplication([])
@@ -397,7 +408,31 @@ def run_subtitles(pid: int | None = None, process_name: str = "", config: AppCon
     pipeline.errorOccurred.connect(on_error)
     pipeline.statsChanged.connect(control.update_stats)
 
-    control.target_label.setText(f"目标: {target.name} (PID {target.pid})\n{target.executable}")
+    if tab_mode:
+        def on_tab_state(state: dict) -> None:
+            title = state.get("tab_title") or "（等待你在浏览器里指定）"
+            ext = state.get("extension_id") or "未连接"
+            control.target_label.setText(
+                f"目标: 浏览器标签页 — {title}\n扩展: {ext}"
+            )
+            if state.get("capturing"):
+                control.status_label.setText(f"状态: 正在接收「{title}」的音频")
+            elif state.get("connected"):
+                control.status_label.setText("状态: 扩展已连接，等待开始采集")
+            else:
+                control.status_label.setText("状态: 等待浏览器扩展连接…")
+
+        pipeline.tabStateChanged.connect(on_tab_state)
+        control.target_label.setText("目标: 浏览器标签页（等待扩展连接…）")
+        control.hint_label.setText(
+            "浏览器标签页模式：<br>"
+            "1. 在浏览器里切到你要字幕的那个标签页；<br>"
+            "2. 点工具栏里的扩展图标（或按 Ctrl+Shift+U）。<br>"
+            "浏览器规定必须由你亲手触发一次，程序代替不了——这是它的安全策略，不是 bug。<br>"
+            "音频只走本机 127.0.0.1，不联网、不上传。"
+        )
+    else:
+        control.target_label.setText(f"目标: {target.name} (PID {target.pid})\n{target.executable}")
 
     ok, note = pipeline.prepare()
     on_status(note or "就绪")
@@ -407,7 +442,11 @@ def run_subtitles(pid: int | None = None, process_name: str = "", config: AppCon
     overlay.show()
     control.show()
 
-    if not pipeline.start(spec):
+    if tab_mode:
+        ok = pipeline.start_tab_audio()
+        if not ok:
+            control.status_label.setText("状态: 启动失败（端口可能被占用，见日志）")
+    elif not pipeline.start(spec):
         control.status_label.setText("状态: 启动失败")
 
     # 字幕落定后滚动到底（累积模式下自动往下走）
@@ -415,7 +454,11 @@ def run_subtitles(pid: int | None = None, process_name: str = "", config: AppCon
     scroll_timer.timeout.connect(lambda: overlay.update())
     scroll_timer.start(500)
 
-    print(f"字幕已启动，目标: {target.name} (PID {target.pid})")
+    if tab_mode:
+        print("字幕已启动（浏览器标签页模式）。")
+        print("请在浏览器里切到要字幕的标签页，然后点扩展图标或按 Ctrl+Shift+U。")
+    else:
+        print(f"字幕已启动，目标: {target.name} (PID {target.pid})")
     print("控制窗里可切显示模式/穿透/暂停。关掉控制窗即退出。")
     print("想把控制窗收起来就点「最小化到托盘」；单独关掉设置窗不会退出程序。")
 

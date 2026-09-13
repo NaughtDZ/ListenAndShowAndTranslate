@@ -34,8 +34,9 @@ _SENSITIVE_HINTS = ("key", "secret", "token", "password", "passwd", "credential"
 class AudioConfig(BaseModel):
     """音频来源配置（对应构想 1：只抓指定程序的音频）。"""
 
-    source_mode: Literal["process", "device"] = "process"
-    """process = WASAPI 进程回环（主路径）；device = 全设备回环（降级备选）。"""
+    source_mode: Literal["process", "device", "tab"] = "process"
+    """process = WASAPI 进程回环（主路径）；device = 全设备回环（降级备选）；
+    tab = 浏览器标签页（由浏览器扩展经本机 WebSocket 送来，见 docs/浏览器标签页.md）。"""
 
     target_process_name: str = ""
     """目标进程名，如 "喜马拉雅.exe"。按名字跟随比按 PID 更稳（进程重启后 PID 会变）。"""
@@ -539,6 +540,32 @@ class OverlayConfig(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
+# 浏览器标签页音频（浏览器扩展 → 本机 WebSocket）
+# --------------------------------------------------------------------------- #
+class TabAudioConfig(BaseModel):
+    """浏览器标签页音频通道（`docs/浏览器标签页.md` 有完整原理与实测）。
+
+    为什么要这条通道：Chromium 在 Windows 上**一个浏览器实例只建一个音频会话**
+    （实测两个标签页同时出声，音频会话仍然只有 1 个），所以进程回环物理上分不出
+    标签页。标签页边界只有浏览器内部（``chrome.tabCapture``）才知道，
+    于是让一个很小的扩展把目标标签页的音频经本机回环 WebSocket 送过来。
+    """
+
+    enabled: bool = True
+    port: int = Field(default=38991, ge=1024, le=65535)
+    """本程序监听的本机端口；扩展里要填一样的。"""
+
+    token: str = ""
+    """配对码：留空 = 不校验（本机回环，风险低）。填了则扩展必须填一样的。
+
+    校验开与不开的区别：不开时，本机任何程序都能连上来说"我是扩展"并塞音频；
+    影响仅限于字幕内容被伪造，改不了磁盘上的东西。多人共用电脑时建议填一个。"""
+
+    require_extension_origin: bool = True
+    """只接受 Origin 为 chrome-extension:// 的连接（默认开）。"""
+
+
+# --------------------------------------------------------------------------- #
 # 电平表
 # --------------------------------------------------------------------------- #
 class MeterConfig(BaseModel):
@@ -577,6 +604,7 @@ class AppConfig(BaseModel):
 
     first_run_done: bool = False
     audio: AudioConfig = Field(default_factory=AudioConfig)
+    tab_audio: TabAudioConfig = Field(default_factory=TabAudioConfig)
     asr: ASRConfig = Field(default_factory=ASRConfig)
     translate: TranslateConfig = Field(default_factory=TranslateConfig)
     overlay: OverlayConfig = Field(default_factory=OverlayConfig)

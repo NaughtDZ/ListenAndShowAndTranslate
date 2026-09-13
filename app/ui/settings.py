@@ -308,6 +308,17 @@ class SettingsWindow(QWidget):
         self.proxy_edit.setText(self.config.proxy)
         self.proxy_edit.blockSignals(False)
 
+        # 浏览器标签页通道也回读（端口/配对码可能被手改过配置文件）
+        self.tab_enabled.blockSignals(True)
+        self.tab_enabled.setChecked(bool(self.config.tab_audio.enabled))
+        self.tab_enabled.blockSignals(False)
+        self.tab_port.blockSignals(True)
+        self.tab_port.setValue(int(self.config.tab_audio.port))
+        self.tab_port.blockSignals(False)
+        self.tab_token.blockSignals(True)
+        self.tab_token.setText(self.config.tab_audio.token)
+        self.tab_token.blockSignals(False)
+
         # 翻译通道也回读：向导（重跑）会改它
         idx = self.provider_combo.findData(self.config.translate.provider)
         if idx >= 0 and idx != self.provider_combo.currentIndex():
@@ -370,6 +381,42 @@ class SettingsWindow(QWidget):
         form.addRow("", row)
 
         outer.addWidget(box)
+
+        # ---- 浏览器标签页通道（扩展 → 本机 WebSocket）----
+        tab_box = QGroupBox("浏览器标签页通道（音频由浏览器扩展送来）")
+        tab_form = QFormLayout(tab_box)
+
+        self.tab_enabled = QCheckBox("启用这条通道（主窗口「浏览器标签页」模式用）")
+        self.tab_enabled.setChecked(self.config.tab_audio.enabled)
+        tab_form.addRow("", self.tab_enabled)
+
+        self.tab_port = QSpinBox()
+        self.tab_port.setRange(1024, 65535)
+        self.tab_port.setValue(int(self.config.tab_audio.port))
+        self.tab_port.setToolTip("本程序在本机监听的端口；浏览器扩展里要填一样的")
+        tab_form.addRow("本机端口", self.tab_port)
+
+        self.tab_token = QLineEdit(self.config.tab_audio.token)
+        self.tab_token.setPlaceholderText("留空 = 不校验（仅本机回环，风险低）")
+        self.tab_token.setEchoMode(QLineEdit.Password)
+        self.tab_token.setToolTip(
+            "非空时，扩展里也要填一模一样的，否则拒收它送来的音频。\n"
+            "不填也能用：不校验时本机任何程序都能连上来说自己是扩展（只会伪造字幕内容）。"
+        )
+        tab_form.addRow("配对码", self.tab_token)
+
+        tab_hint = QLabel(
+            "浏览器把整个实例的音频混成一个流，操作系统层分不出标签页"
+            "（实测两个标签页同时出声，音频会话仍只有 1 个），所以这条通道靠一个"
+            "很小的扩展把目标标签页的音频经本机回环送过来。<br>"
+            "· 扩展目录：<code>browser_extension</code>（主窗口「扩展与安装说明…」里有步骤）<br>"
+            "· <b>必须由你在浏览器里亲手触发一次</b>（点扩展图标或按 Ctrl+Shift+U）"
+            "——这是浏览器的安全策略，授权是按标签页给的<br>"
+            "· 这条通道只连 127.0.0.1，不联网、不上传"
+        )
+        tab_hint.setWordWrap(True)
+        tab_form.addRow("", tab_hint)
+        outer.addWidget(tab_box)
 
         self.net_log = QTextEdit()
         self.net_log.setReadOnly(True)
@@ -1184,6 +1231,9 @@ class SettingsWindow(QWidget):
 
         c = self.config
         c.proxy = self.proxy_edit.text().strip()
+        c.tab_audio.enabled = self.tab_enabled.isChecked()
+        c.tab_audio.port = int(self.tab_port.value())
+        c.tab_audio.token = self.tab_token.text().strip()
         c.translate.enabled = self.enable_translate.isChecked()
         c.translate.provider = self.provider_combo.currentData() or "none"
         c.translate.context_lines = self.ctx_lines.value()

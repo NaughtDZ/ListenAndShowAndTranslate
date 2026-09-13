@@ -1,0 +1,34 @@
+{
+  "manifest_version": 3,
+  "name": "听·显·译 · 标签页音频",
+  "version": "0.1.0",
+  "description": "把指定浏览器标签页的音频送给本机的「听·显·译」做实时字幕。只与本机 127.0.0.1 通信，不联网、不上传。",
+  "minimum_chrome_version": "116",
+  "permissions": [
+    "tabCapture",
+    "offscreen",
+    "tabs",
+    "storage",
+    "alarms"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "听·显·译：把这个标签页送给字幕"
+  },
+  "commands": {
+    "lst-toggle": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+Y"
+      },
+      "description": "把当前标签页送给「听·显·译」/ 停止（需要当前标签页是活动标签页）"
+    },
+    "_execute_action": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+U"
+      }
+    }
+  }
+}

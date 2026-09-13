@@ -206,20 +206,24 @@ class _FakePipelineStats:
     last_peak = 0.456
 
 
-class _FakeCapture:
-    def pipeline_stats(self):
-        return _FakePipelineStats()
-
-
 class _FakePipeline:
-    def __init__(self, capture):
-        self.capture = capture
+    """电平读数现在统一走 ``pipeline.pipeline_stats()``。
+
+    进程模式与浏览器标签页模式共用同一套 AudioPipeline，
+    所以 runner 不再直接摸 ``pipeline.capture``。
+    """
+
+    def __init__(self, stats):
+        self._stats = stats
+
+    def pipeline_stats(self):
+        return self._stats
 
 
 def test_capture_level_reads_current_chunk_not_high_water():
     """必须读**最近一块**的峰值：``CaptureStats.peak`` 是整段高水位，
     拿它画 PEAK 条会一直顶在最右边。"""
-    assert capture_level(_FakePipeline(_FakeCapture())) == (0.0123, 0.456)
+    assert capture_level(_FakePipeline(_FakePipelineStats())) == (0.0123, 0.456)
 
 
 def test_capture_level_is_none_when_not_capturing():
