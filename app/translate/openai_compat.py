@@ -608,6 +608,38 @@ def probe_endpoint(base_url: str, api_key: str = "", proxy: str = "") -> tuple[b
         t.close()
 
 
+# --------------------------------------------------------------------------- #
+# 模型名单过滤：不是每个"模型"都能翻译
+# --------------------------------------------------------------------------- #
+_NON_CHAT_HINTS = ("embed", "rerank", "bge", "whisper", "tts", "clip", "vae")
+"""名字里带这些词的，基本不是对话模型。
+
+实测（本机 LM Studio 16 个模型）：``/v1/models`` 会把**嵌入模型**
+（``text-embedding-qwen3-embedding-0.6b``、``bge-m3``）、**重排模型**
+（``qwen3-reranker-0.6b``）一起列出来。把它们当翻译模型用只会报错，
+所以在任何"让用户选模型"的地方都先滤掉。
+"""
+
+
+def is_chat_model(name: str) -> bool:
+    """粗略判断一个模型名能不能拿来翻译。
+
+    判定刻意保守（只按名字关键词，不确定的一律算可用）——
+    宁可多列一个，也不要把用户真正想用的模型藏起来。
+    """
+    n = (name or "").strip().lower()
+    if not n:
+        return False
+    return not any(hint in n for hint in _NON_CHAT_HINTS)
+
+
+def split_model_list(models: list[str]) -> tuple[list[str], list[str]]:
+    """把模型列表拆成 ``(能翻译的, 其它)``，两边都保持原顺序。"""
+    chat = [m for m in models if is_chat_model(m)]
+    others = [m for m in models if not is_chat_model(m)]
+    return chat, others
+
+
 def dumps_for_log(obj) -> str:
     """调试用：安全的 JSON 序列化（不打印密钥）。"""
     try:

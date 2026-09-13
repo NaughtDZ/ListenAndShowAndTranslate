@@ -559,8 +559,6 @@ class TranslatePage(QWizardPage):
         return wiz.proxy() if isinstance(wiz, FirstRunWizard) else ""
 
     def _list_models(self) -> None:
-        from app.translate.openai_compat import probe_endpoint
-
         self.result.setPlainText("查询中…")
         base = self.base_url.text().strip()
         t = _CheckThread(lambda: self._do_list(base))
@@ -569,14 +567,29 @@ class TranslatePage(QWizardPage):
         self._t = t
 
     def _do_list(self, base: str) -> str:
+        # 导入必须放在**真正使用它的这个函数里**：
+        # 以前放在 _list_models 里（局部导入只在该函数作用域可见），
+        # 而干活的是这个 _do_list，于是点「列出模型」就报
+        # NameError: name 'probe_endpoint' is not defined。
+        from app.translate.openai_compat import probe_endpoint, split_model_list
+
         ok, msg, models = probe_endpoint(base, self.api_key.text().strip(), self._proxy())
         if not ok:
             return f"❌ {msg}\n\n提示：LM Studio 需要在「Developer」里开启 Local Server。"
-        self._models = models
-        text = [f"✅ {msg}", "", "可用模型（复制到上面「模型名」）："]
-        text += [f"  · {m}" for m in models[:20]]
-        if len(models) > 20:
-            text.append(f"  … 另有 {len(models) - 20} 个")
+        chat_models, others = split_model_list(models)
+        self._models = chat_models
+        text = [f"✅ {msg}", "", "可翻译的模型（复制到上面「模型名」）："]
+        text += [f"  · {m}" for m in chat_models[:20]]
+        if len(chat_models) > 20:
+            text.append(f"  … 另有 {len(chat_models) - 20} 个")
+        if others:
+            text.append(
+                f"\n（已滤掉 {len(others)} 个嵌入/重排/语音模型："
+                f"{'、'.join(others[:3])}{'…' if len(others) > 3 else ''}"
+                "——它们不能用来翻译）"
+            )
+        if not chat_models:
+            text.append("\n⚠️ 这个端点里没有可翻译的对话模型，请先在 LM Studio 里加载一个。")
         return "\n".join(text)
 
     def _test(self) -> None:
@@ -593,14 +606,22 @@ class TranslatePage(QWizardPage):
             if pid == "none":
                 return "已选择「不翻译」，跳过测试。"
             if pid == "llm":
-                from app.translate.openai_compat import probe_endpoint
+                from app.translate.openai_compat import probe_endpoint, split_model_list
 
                 ok, msg, models = probe_endpoint(
                     self.base_url.text().strip(), self.api_key.text().strip(), proxy
                 )
-                if models and not self.model.text().strip():
-                    self.model.setText(models[0])
-                return f"{'✅' if ok else '❌'} {msg}"
+                chat_models, others = split_model_list(models)
+                hint = ""
+                if not self.model.text().strip():
+                    # **不自动替用户选**：LM Studio 的列表第一个常常是嵌入模型，
+                    # 自动填进去只会让人以为是程序坏了。列表里给名字，让他自己挑。
+                    hint = "\n可用模型：" + "、".join(chat_models[:5]) + (
+                        "…" if len(chat_models) > 5 else ""
+                    )
+                if others:
+                    hint += f"\n（已滤掉 {len(others)} 个嵌入/重排模型）"
+                return f"{'✅' if ok else '❌'} {msg}{hint}"
             from app.translate.traditional.providers import build_provider
 
             t = build_provider(pid, {}, proxy=proxy, qps_limit=1.0)

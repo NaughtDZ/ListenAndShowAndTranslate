@@ -1124,13 +1124,19 @@ class SettingsWindow(QWidget):
         base = self.llm_base.text().strip()
         if base:
             try:
-                from app.translate.openai_compat import probe_endpoint
+                from app.translate.openai_compat import probe_endpoint, split_model_list
 
                 ok, msg, models = probe_endpoint(base, self.llm_key.text().strip(), proxy)
+                chat_models, others = split_model_list(models)
                 out.append(f"{'✅' if ok else '❌'} 大模型 {base}：{msg}")
-                if models:
-                    self._fill_models(models)
-                    out.append(f"     已把 {len(models)} 个模型填进上面的下拉框，"
+                if others:
+                    out.append(
+                        f"     已滤掉 {len(others)} 个嵌入/重排/语音模型"
+                        "（它们不能用来翻译）"
+                    )
+                if chat_models:
+                    self._fill_models(chat_models)
+                    out.append(f"     已把 {len(chat_models)} 个模型填进上面的下拉框，"
                                "请自己挑一个（**不会再自动替你选**——"
                                "以前自动选列表第一个，可能直接加载一个 20GB+ 的大模型把显存吃满）")
             except Exception as exc:  # noqa: BLE001
