@@ -77,6 +77,8 @@ class SubtitlePipeline(QObject):
         # 浏览器标签页音频（扩展 → 本机 WebSocket → 同一条 AudioPipeline）
         self.tab_server: "TabAudioServer | None" = None
         self._owns_tab_server = False
+        self.tab_source = False
+        """当前音源是不是"浏览器标签页"（restart 时用它决定怎么重新开工）。"""
 
         # 翻译
         self.hub: TranslatorHub | None = None
@@ -164,10 +166,15 @@ class SubtitlePipeline(QObject):
         if self.router is None or self.hub is None:
             self.prepare()
 
+        self.tab_source = False
         resolved = resolve_target(target)
         if resolved is None:
-            self.errorOccurred.emit(f"未找到活跃音频会话：{target.describe()}")
-            return False
+            # **不因为"现在没在发声"就拒绝启动**：
+            # 用户完全可能"先开字幕窗、再开播放器"，CaptureWorker 本来就会每
+            # reconnect_interval_s 重试一次（follow=True），所以这里先跑起来、
+            # 把状态如实报出去，等目标出声就自动接上。
+            log.info("目标 %s 现在没有输出音频，先启动并等待", target.describe())
+            self.statusChanged.emit(f"等待「{target.describe()}」开始播放…（会自动重连）")
 
         self._target_spec = target
         self._stop.clear()
@@ -186,9 +193,10 @@ class SubtitlePipeline(QObject):
         )
         self.capture.start()
 
-        self.statusChanged.emit(
-            f"已开始 · {resolved.name} (PID {resolved.pid}) · 语言={self.config.asr.language}"
-        )
+        if resolved is not None:
+            self.statusChanged.emit(
+                f"已开始 · {resolved.name} (PID {resolved.pid}) · 语言={self.config.asr.language}"
+            )
         return True
 
     def start_tab_audio(self, server=None) -> bool:
@@ -235,6 +243,7 @@ class SubtitlePipeline(QObject):
             server.set_on_state(self._on_tab_state)
 
         self.tab_server = server
+        self.tab_source = True
         self.statusChanged.emit(
             f"等待浏览器扩展连接 · 本机端口 {server.port} · 语言={self.config.asr.language}"
         )
@@ -268,26 +277,62 @@ class SubtitlePipeline(QObject):
 
         用户反馈过"点了保存设置但功能没变化"——因为改完配置只写了文件，
         而正在跑的流水线用的还是内存里那份旧配置。
-        这里停掉采集与翻译线程、重建 Hub 与 Router、再用同一个目标重启。
+        这里停掉采集与翻译线程、重建 Hub 与 Router、再用同一个音源重启。
 
         代价：短暂（约 1~2 秒）采集空档，比"要重启整个程序"友好得多。
         """
-        if self._target_spec is None:
+        if self._target_spec is None and not self.tab_source:
             return False
-        spec = self._target_spec
         log.info("正在按新配置重建识别/翻译引擎…")
+        ok = self.restart(timeout=timeout)
+        log.info("引擎重建完成：%s", "成功" if ok else "启动失败")
+        return ok
+
+    def switch_source(
+        self,
+        spec: TargetSpec | None = None,
+        tab_mode: bool = False,
+        timeout: float = 15.0,
+    ) -> bool:
+        """**运行中换音频来源**（进程 ↔ 浏览器标签页），不需要重启程序。
+
+        用户的疑问："为什么只有启动时能选监听模式和目标，进了程序反而调不了？"
+        原因只是历史包袱（启动窗口把 PID 写进命令行、子进程只有一个入口），
+        不是技术限制——换音源本质上就是"停掉当前采集 → 重建引擎 → 按新音源开工"，
+        和"设置保存后立即生效"走的是同一条路（``restart``）。
+
+        Args:
+            spec: 进程模式的新目标。
+            tab_mode: True = 换成浏览器标签页模式（忽略 ``spec``）。
+        """
+        self.tab_source = bool(tab_mode)
+        self._target_spec = None if tab_mode else spec
+        log.info(
+            "切换音频来源：%s",
+            "浏览器标签页" if tab_mode else (spec.describe() if spec else "（未指定）"),
+        )
+        ok = self.restart(timeout=timeout)
+        if not ok:
+            self.errorOccurred.emit("切换音源失败（见日志）")
+        return ok
+
+    def restart(self, timeout: float = 15.0) -> bool:
+        """停掉当前音源与引擎，重建，再按**当前**音源开工。"""
         try:
             self.stop(timeout=timeout)
         except Exception as exc:  # noqa: BLE001
-            log.warning("重建前停止流水线出错（忽略并继续）: %s", exc)
+            log.warning("重启前停止流水线出错（忽略并继续）: %s", exc)
         self._stop.clear()
+        self._lang_reported = False  # 换了音源/配置，语言要重新报一次
         try:
             self.prepare()
         except Exception as exc:  # noqa: BLE001
-            log.error("按新配置重建失败，仍继续启动: %s", exc)
-        ok = self.start(spec)
-        log.info("引擎重建完成：%s", "成功" if ok else "启动失败")
-        return ok
+            log.error("重建失败，仍继续启动: %s", exc)
+        if self.tab_source:
+            return self.start_tab_audio()
+        if self._target_spec is None:
+            return False
+        return self.start(self._target_spec)
 
     def stop(self, timeout: float = 8.0) -> None:
         self._stop.set()
@@ -319,6 +364,11 @@ class SubtitlePipeline(QObject):
     # ------------------------------------------------------------------ #
     # 状态
     # ------------------------------------------------------------------ #
+    @property
+    def current_source(self) -> tuple[TargetSpec | None, bool]:
+        """当前音源：``(进程目标, 是否浏览器标签页模式)``。UI 用来显示"当前"用。"""
+        return (self._target_spec, self.tab_source)
+
     def pipeline_stats(self):
         """当前音源管线的统计（设置窗里的电平表用）。没在采集时返回 None。
 

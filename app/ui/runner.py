@@ -136,6 +136,13 @@ class SubtitleControlWindow(QWidget):
         self.pause_btn.setCheckable(True)
         self.pause_btn.toggled.connect(self._toggle_pause)
 
+        self.source_btn = QPushButton("换音频来源…")
+        self.source_btn.setToolTip(
+            "运行中换音源：换成别的程序，或换成「浏览器标签页」。\n"
+            "换的时候识别/翻译引擎会重建，约 1~2 秒空档，字幕窗不会关。"
+        )
+        self.source_btn.clicked.connect(self._switch_source)
+
         self.tray_btn = QPushButton("最小化到托盘")
         self.settings_btn = QPushButton("设置…")
 
@@ -154,6 +161,7 @@ class SubtitleControlWindow(QWidget):
         root.addWidget(self.hint_label)
         root.addStretch(1)
         root.addWidget(self.pause_btn)
+        root.addWidget(self.source_btn)
         root.addWidget(self.tray_btn)
         root.addWidget(self.settings_btn)
         root.addWidget(self.quit_btn)
@@ -198,6 +206,44 @@ class SubtitleControlWindow(QWidget):
         ok = self.pipeline.reload()
         self.status_label.setText(
             "✅ 设置已生效（识别/翻译已重建）" if ok else "⚠️ 外观已生效，但引擎重建失败，请看日志"
+        )
+
+    def _switch_source(self) -> None:
+        """运行中换音频来源：别的程序，或浏览器标签页。
+
+        用户问过"为什么进了程序就调不了监听目标"——那只是历史包袱
+        （启动窗口把 PID 写进命令行、子进程只有一个入口）。这里补上入口：
+        停掉当前采集 → 重建引擎 → 按新音源开工，字幕窗全程不关。
+        """
+        from PySide6.QtWidgets import QDialog
+
+        from app.ui.source_picker import SourcePickerDialog
+
+        spec, tab_active = self.pipeline.current_source
+        dlg = SourcePickerDialog(
+            self,
+            current_pid=spec.pid if spec else None,
+            tab_active=bool(tab_active),
+        )
+        if dlg.exec() != QDialog.Accepted or dlg.choice is None:
+            return
+
+        kind, pid = dlg.choice
+        self.status_label.setText("正在切换音频来源（约 1~2 秒）…")
+        if kind == "tab":
+            ok = self.pipeline.switch_source(tab_mode=True)
+            desc = "浏览器标签页（在浏览器里点扩展图标 / Ctrl+Shift+U 才会开始送音频）"
+        else:
+            resolved = resolve_target(TargetSpec(pid=pid)) if pid else None
+            desc = f"{resolved.name} (PID {resolved.pid})" if resolved else f"PID {pid}"
+            ok = self.pipeline.switch_source(TargetSpec(pid=pid))
+
+        # 旧字幕属于旧音源，留着会让人以为是新的
+        self.pipeline.state.clear()
+        self.overlay.update_state(self.pipeline.state)
+        self.target_label.setText(f"目标: {desc}")
+        self.status_label.setText(
+            f"✅ 已切换到 {desc}" if ok else "⚠️ 切换失败，详见日志"
         )
 
     def _sync_toggles(self) -> None:
@@ -358,10 +404,12 @@ def run_subtitles(
         spec = TargetSpec(pid=pid) if pid else TargetSpec(process_name=process_name)
         target = resolve_target(spec)
         if target is None:
-            print(f"未找到活跃音频会话：{spec.describe()}")
-            print("提示：先运行 `python main.py --list-audio` 查看正在发声的进程与 PID。")
-            print("      注意：浏览器/Electron 应用要选**真正发声的那个子进程**。")
-            return 2
+            # **不再"找不到就退出"**：用户完全可能先开字幕窗、再开播放器。
+            # CaptureWorker 会每 2 秒重试一次，目标一开始出声就自动接上；
+            # 同时控制窗里有「换音频来源…」可以立刻换一个。
+            print(f"目标现在没有在输出音频：{spec.describe()}")
+            print("提示：先开着字幕窗，等它开始播放会自动接上；")
+            print("      也可以点控制窗里的「换音频来源…」立刻换一个。")
 
     # Qt 自己会设置 DPI 感知，这里不要抢（见 app/utils/win32.py 的说明）
     app = QApplication.instance() or QApplication([])
@@ -432,7 +480,15 @@ def run_subtitles(
             "音频只走本机 127.0.0.1，不联网、不上传。"
         )
     else:
-        control.target_label.setText(f"目标: {target.name} (PID {target.pid})\n{target.executable}")
+        if target is not None:
+            control.target_label.setText(
+                f"目标: {target.name} (PID {target.pid})\n{target.executable}"
+            )
+        else:
+            control.target_label.setText(
+                f"目标: {spec.describe() if spec else '未指定'}（现在没有在发声，等待中）\n"
+                "可以点「换音频来源…」换一个"
+            )
 
     ok, note = pipeline.prepare()
     on_status(note or "就绪")
@@ -457,10 +513,12 @@ def run_subtitles(
     if tab_mode:
         print("字幕已启动（浏览器标签页模式）。")
         print("请在浏览器里切到要字幕的标签页，然后点扩展图标或按 Ctrl+Shift+U。")
-    else:
+    elif target is not None:
         print(f"字幕已启动，目标: {target.name} (PID {target.pid})")
-    print("控制窗里可切显示模式/穿透/暂停。关掉控制窗即退出。")
-    print("想把控制窗收起来就点「最小化到托盘」；单独关掉设置窗不会退出程序。")
+    else:
+        print("字幕已启动，正在等待目标开始播放…（也可以点「换音频来源…」换一个）")
+    print("控制窗里可切显示模式/穿透/暂停，也可以「换音频来源…」换监听目标。")
+    print("关掉控制窗即退出；想把控制窗收起来就点「最小化到托盘」。")
 
     try:
         return int(app.exec())
