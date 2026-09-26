@@ -14,6 +14,7 @@ from typing import Callable
 
 from app import __version__, paths
 from app.config import AppConfig
+from app.utils.console import enable_utf8_console
 from app.utils.log import get_logger, install_excepthook
 
 log = get_logger("main")
@@ -411,6 +412,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # 必须在 argparse 之前：Windows 控制台默认 GBK，连 --help 的中文帮助、
+    # 以及模型列表里的 ✓/✗ 都会把它弄崩。见 app/utils/console.py。
+    enable_utf8_console()
     args = build_parser().parse_args(argv)
 
     if args.config:

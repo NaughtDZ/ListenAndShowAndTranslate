@@ -149,4 +149,7 @@ def report(results: list[tuple[bool, str]], proc) -> int:
 
 
 if __name__ == "__main__":
+    from app.utils.console import enable_utf8_console
+
+    enable_utf8_console()
     raise SystemExit(main())
