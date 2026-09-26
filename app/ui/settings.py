@@ -757,6 +757,25 @@ class SettingsWindow(QWidget):
         model_form.addRow("", model_box_hint)
         outer.addWidget(model_box)
 
+        # --- VAD（语音活动检测）---
+        # 用户要的：轻声/耳语被默认 VAD 当静音漏掉，所以给一个**可切换的 VAD 后端**。
+        # VAD 不出字幕（它只决定"这句从哪到哪"），所以独立成一组，混进按语言的
+        # 识别模型下拉框会让人以为它能识别。
+        vad_box = QGroupBox("语音活动检测（VAD）")
+        vad_form = QFormLayout(vad_box)
+        self.vad_combo = QComboBox()
+        self.vad_combo.setToolTip(
+            "VAD 决定「哪一段是人声」——音频被它判成静音就根本不会送去识别。\n"
+            "默认 Silero 快且通用；轻声/耳语（ASMR、悄悄话）常被它漏掉，"
+            "这时换「Whisper-VAD ASMR」（需要 onnxruntime，CPU 占用更高）。"
+        )
+        self.vad_combo.currentIndexChanged.connect(self._refresh_model_hints)
+        vad_form.addRow("VAD 模型", self.vad_combo)
+        self.vad_hint = QLabel("")
+        self.vad_hint.setWordWrap(True)
+        vad_form.addRow("", self.vad_hint)
+        outer.addWidget(vad_box)
+
         # --- 语言包：下载/删除模型（重新运行首次运行向导）---
         wizard_box = QGroupBox("语言包与下载")
         wv = QVBoxLayout(wizard_box)
@@ -850,7 +869,34 @@ class SettingsWindow(QWidget):
             combo.setCurrentIndex(idx if idx >= 0 else 0)
             combo.blockSignals(False)
 
+        self._refresh_vad_choices(downloader)
         self._refresh_model_hints()
+
+    VAD_CHOICES: tuple[str, ...] = ("silero-vad", "whisper-vad-asmr")
+    """可选的 VAD 后端（与 ``VADConfig.model`` 的 Literal 一一对应）。"""
+
+    def _refresh_vad_choices(self, downloader) -> None:
+        """填 VAD 下拉框；未下载的标出来（它不在「按语言」那组里，得单独管）。"""
+        from app.models.registry import MODELS
+
+        current = self.config.asr.vad.model
+        self.vad_combo.blockSignals(True)
+        self.vad_combo.clear()
+        for model_id in self.VAD_CHOICES:
+            spec = MODELS.get(model_id)
+            label = spec.display_name if spec else model_id
+            ok = self._is_installed(downloader, model_id)
+            self._model_installed[model_id] = ok
+            self.vad_combo.addItem(label + ("" if ok else "（未下载）"), model_id)
+            if spec is not None:
+                self.vad_combo.setItemData(
+                    self.vad_combo.count() - 1,
+                    f"{spec.note}\n体积约 {spec.total_mb:.0f} MB",
+                    Qt.ToolTipRole,
+                )
+        idx = self.vad_combo.findData(current)
+        self.vad_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.vad_combo.blockSignals(False)
 
     def _refresh_model_hints(self) -> None:
         """把"选了但没下载"和"配置里的模型不支持该语言"直接写在界面上。"""
@@ -876,6 +922,21 @@ class SettingsWindow(QWidget):
                 "它不能识别这门语言（或不是识别模型），运行时会被忽略并改回默认；"
                 "这里选「自动」再保存即可修正。"
             )
+
+        vad_id = self.vad_combo.currentData()
+        if vad_id and vad_id != "silero-vad" and not self._model_installed.get(vad_id, False):
+            spec = MODELS.get(vad_id)
+            name = spec.display_name if spec else vad_id
+            pack = pack_for_model(vad_id)
+            lines.append(
+                f"⚠️ 选的 VAD「{name}」还没下载。"
+                + (f"点下面「重新运行「首次运行向导」…」勾选 {pack} 语言包即可下载。" if pack else "")
+            )
+        self.vad_hint.setText(
+            "VAD 不产生字幕，只决定「哪一段送去识别」。\n"
+            "轻声/耳语被漏掉时换 Whisper-VAD ASMR；它每步都要算满 30 秒窗口，"
+            "CPU 占用明显高于 Silero。"
+        )
         self.model_hint.setText("\n".join(lines))
 
     def reset_model_choices(self) -> None:
@@ -897,6 +958,8 @@ class SettingsWindow(QWidget):
                 asr.set_route(lang, route_kwargs_for(model_id))
             else:
                 asr.set_route(lang, asr.default_route_for(lang))
+        # VAD 与语言路由无关，单独写
+        asr.vad.model = self.vad_combo.currentData() or "silero-vad"
 
     # ------------------------------------------------------------------ #
     # 外观

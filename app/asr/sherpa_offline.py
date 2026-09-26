@@ -51,6 +51,8 @@ class SherpaOfflineEngine(BaseEngine):
         min_silence_ms: int = 350,
         min_speech_ms: int = 250,
         max_segment_ms: int = 8000,
+        speech_pad_ms: int = 120,
+        vad_model: str = "silero-vad",
     ) -> None:
         super().__init__(language=language)
         self.model_id = model_id
@@ -61,6 +63,8 @@ class SherpaOfflineEngine(BaseEngine):
         self.min_silence_ms = min_silence_ms
         self.min_speech_ms = min_speech_ms
         self.max_segment_ms = max_segment_ms
+        self.speech_pad_ms = speech_pad_ms
+        self.vad_model = vad_model
 
         self._recognizer: sherpa_onnx.OfflineRecognizer | None = None
         self._vad: VadSegmenter | None = None
@@ -71,7 +75,10 @@ class SherpaOfflineEngine(BaseEngine):
             min_silence_ms=self.min_silence_ms,
             min_speech_ms=self.min_speech_ms,
             max_speech_ms=self.max_segment_ms,
+            speech_pad_ms=self.speech_pad_ms,
+            vad_model=self.vad_model,
             num_threads=1,
+            provider=self.provider,
             models_dir=self.models_dir,
         )
         self._vad.load()

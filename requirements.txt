@@ -22,6 +22,13 @@ psutil==7.2.2
 sherpa-onnx==1.13.8
 sherpa-onnx-core==1.13.8
 
+# --- 耳语/轻声 VAD（可切换的 Whisper-VAD ASMR 用它跑 ONNX）---
+# 默认 Silero VAD 走 sherpa-onnx 内置实现、不需要它；
+# 只有在设置 → 模型 → VAD 里选了「Whisper-VAD ASMR」时才真正用到。
+onnxruntime==1.30.0
+flatbuffers==25.12.19
+protobuf==7.36.2
+
 # --- 音频处理 ---
 numpy==2.5.3
 scipy==1.18.1

@@ -151,6 +151,8 @@ class LanguageRouter:
             min_silence_ms=vad.min_silence_ms,
             min_speech_ms=vad.min_speech_ms,
             max_segment_ms=vad.max_segment_ms,
+            speech_pad_ms=vad.speech_pad_ms,
+            vad_model=vad.model,
         )
 
     def _fallback_chain(self, language: str) -> list[str]:
@@ -216,6 +218,7 @@ class LanguageRouter:
             models_dir=self.models_dir,
             min_silence_ms=vad.min_silence_ms, min_speech_ms=vad.min_speech_ms,
             max_segment_ms=vad.max_segment_ms,
+            speech_pad_ms=vad.speech_pad_ms, vad_model=vad.model,
         )
 
     def _ensure_engine(self, language: str) -> ASREngine | None:

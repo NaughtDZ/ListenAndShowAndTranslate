@@ -83,6 +83,16 @@ class VADConfig(BaseModel):
     """
 
     enabled: bool = True
+
+    model: Literal["silero-vad", "whisper-vad-asmr"] = "silero-vad"
+    """用哪个 VAD 后端。
+
+    - ``silero-vad``（默认）：sherpa-onnx 内置，快、通用，按正常音量训练；
+    - ``whisper-vad-asmr``：**轻声/耳语特化**（Whisper-VAD ASMR，119MB，需要
+      onnxruntime）。Silero 会把轻声说话判成静音、音频根本不进识别引擎，
+      这种情况才值得换它——代价是每次前向都要算满 30 秒窗口，CPU 占用明显更高。
+    """
+
     threshold: float = Field(default=0.5, ge=0.0, le=1.0)
     """VAD 判定"这是人声"的置信度阈值。调低更灵敏（小声也算），但可能把音乐/音效当人声。"""
 

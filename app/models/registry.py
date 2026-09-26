@@ -299,6 +299,27 @@ MODELS: dict[str, ModelSpec] = {
         ),
         note="必装：静音段跳过识别，低端机 CPU 占用能降一个量级",
     ),
+    # 轻声/耳语特化 VAD（2025-11 的 TransWithAI 模型）。
+    # ⚠️ 它不是 sherpa-onnx 原生 VAD 类型（sherpa-onnx 只认 silero / ten-vad），
+    # 所以走 app/asr/whisper_vad.py 里的自实现推理，并且**需要 onnxruntime**。
+    "whisper-vad-asmr": ModelSpec(
+        id="whisper-vad-asmr",
+        display_name="Whisper-VAD ASMR（耳语/轻声，ONNX）",
+        kind="vad",
+        engine="vad",
+        factory="whisper_vad",
+        languages=("*",),
+        repo="TransWithAI/Whisper-Vad-EncDec-ASMR-onnx",
+        files=(
+            ModelFile("model.onnx", 119137398),
+        ),
+        note=(
+            "**耳语/轻声专用**：whisper-base encoder + 2 层解码器，用约 500 小时"
+            "日语 ASMR 录音训练，专门解决「轻声说话被 Silero VAD 当成静音漏掉」"
+            "（Silero 是按正常音量训练的）。20ms 帧级、判别式模型不会吐幻觉文本。"
+            "需要 onnxruntime（pip install onnxruntime）。"
+        ),
+    ),
 }
 
 
@@ -388,6 +409,17 @@ PACKS: dict[str, LanguagePack] = {
         display_name="中文候选：FireRedASR2 CTC（可选）",
         description="740MB、分块；实测中文 96.2%（低于流式 97.6%），可拿来试方言/嘈杂音",
         model_ids=("fire-red-asr2-ctc-zh_en-int8",),
+    ),
+    # ---- 耳语/轻声特化 VAD（可选：装上后可在设置 →识别 里切换） ----
+    "vad-asmr": LanguagePack(
+        id="vad-asmr",
+        display_name="轻声/耳语 VAD：Whisper-VAD ASMR（可选）",
+        description=(
+            "把「轻声说话被当成静音漏掉」的场景交给它：基于 whisper-base、"
+            "用 500 小时日语 ASMR 训练，119MB，需要 onnxruntime。"
+            "正常音量的内容仍建议用默认的 Silero（更快）"
+        ),
+        model_ids=("whisper-vad-asmr",),
     ),
     "lid": LanguagePack(
         id="lid",
