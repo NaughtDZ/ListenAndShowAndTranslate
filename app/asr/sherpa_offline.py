@@ -34,6 +34,96 @@ _CTC_FACTORIES: tuple[str, ...] = (
 """单文件（model.onnx + tokens.txt）+ ``from_<factory>`` 的离线识别器家族。"""
 
 
+def guess_factory(model_id: str) -> str:
+    """注册表没写 factory 时的兜底推断（兼容老配置/手写模型 id）。"""
+    name = model_id.lower()
+    if "whisper" in name:
+        return "whisper"
+    if "parakeet" in name:
+        return "nemo_ctc"
+    if "dolphin" in name:
+        return "dolphin_ctc"
+    if "omnilingual" in name:
+        return "omnilingual_asr_ctc"
+    if "fire" in name:
+        return "fire_red_asr_ctc"
+    return ""
+
+
+def build_offline_recognizer(
+    model_id: str,
+    language: str = "auto",
+    num_threads: int = 2,
+    provider: str = "cpu",
+    models_dir: Path | None = None,
+    use_itn: bool = True,
+) -> sherpa_onnx.OfflineRecognizer:
+    """按注册表构造一个 sherpa-onnx 离线识别器。
+
+    **实时引擎与离线字幕工具共用这一份**：模型族的文件结构差别很大
+    （Whisper 是 encoder+decoder，CTC 家族是单个 model.onnx + tokens.txt），
+    但"用哪个工厂"由注册表的 ``ModelSpec.factory`` 说了算。
+    两边各写一套的话，加新模型时必漏一处。
+    """
+    spec = MODELS.get(model_id)
+    factory = (spec.factory if spec else "") or guess_factory(model_id)
+
+    if factory == "whisper":
+        roles = ("encoder", "decoder", "tokens")
+    elif factory in ("sense_voice", *_CTC_FACTORIES):
+        roles = ("model", "tokens")
+    else:
+        raise ValueError(f"不认识的模型：{model_id}（factory={factory or '未声明'}）")
+
+    paths = require(model_id, models_dir, roles=roles)
+
+    if factory == "whisper":
+        # 注意：from_whisper **不接受** sample_rate / feature_dim
+        recognizer = sherpa_onnx.OfflineRecognizer.from_whisper(
+            encoder=str(paths["encoder"]),
+            decoder=str(paths["decoder"]),
+            tokens=str(paths["tokens"]),
+            num_threads=num_threads,
+            language=language if language not in ("zh-en", "") else "auto",
+            task="transcribe",
+            decoding_method="greedy_search",
+            provider=provider,
+        )
+    elif factory == "sense_voice":
+        # SenseVoice：language 支持 auto/zh/en/ja/ko/yue，自带语种识别与标点
+        recognizer = sherpa_onnx.OfflineRecognizer.from_sense_voice(
+            model=str(paths["model"]),
+            tokens=str(paths["tokens"]),
+            num_threads=num_threads,
+            sample_rate=SAMPLE_RATE,
+            feature_dim=FEATURE_DIM,
+            decoding_method="greedy_search",
+            language=language if language != "zh-en" else "auto",
+            use_itn=use_itn,
+            provider=provider,
+        )
+    else:
+        # NeMo CTC / Dolphin / Omnilingual / FireRedASR CTC 这一族：
+        # 单个 model.onnx + tokens.txt，参数完全一致（语言信息在模型内部）。
+        build = getattr(sherpa_onnx.OfflineRecognizer, f"from_{factory}", None)
+        if build is None:
+            raise ValueError(
+                f"当前 sherpa-onnx 不支持 factory={factory}（模型 {model_id}）"
+            )
+        recognizer = build(
+            model=str(paths["model"]),
+            tokens=str(paths["tokens"]),
+            num_threads=num_threads,
+            provider=provider,
+        )
+
+    log.info(
+        "加载分块识别器：model=%s factory=%s language=%s provider=%s",
+        model_id, factory, language, provider,
+    )
+    return recognizer
+
+
 class SherpaOfflineEngine(BaseEngine):
     """VAD 分句 + 离线识别器（SenseVoice / Whisper）。"""
 
@@ -53,6 +143,7 @@ class SherpaOfflineEngine(BaseEngine):
         max_segment_ms: int = 8000,
         speech_pad_ms: int = 120,
         vad_model: str = "silero-vad",
+        vad_hop_ms: int = 1000,
     ) -> None:
         super().__init__(language=language)
         self.model_id = model_id
@@ -65,6 +156,7 @@ class SherpaOfflineEngine(BaseEngine):
         self.max_segment_ms = max_segment_ms
         self.speech_pad_ms = speech_pad_ms
         self.vad_model = vad_model
+        self.vad_hop_ms = vad_hop_ms
 
         self._recognizer: sherpa_onnx.OfflineRecognizer | None = None
         self._vad: VadSegmenter | None = None
@@ -76,6 +168,7 @@ class SherpaOfflineEngine(BaseEngine):
             min_speech_ms=self.min_speech_ms,
             max_speech_ms=self.max_segment_ms,
             speech_pad_ms=self.speech_pad_ms,
+            hop_ms=self.vad_hop_ms,
             vad_model=self.vad_model,
             num_threads=1,
             provider=self.provider,
@@ -83,85 +176,14 @@ class SherpaOfflineEngine(BaseEngine):
         )
         self._vad.load()
 
-        # 用哪个 sherpa-onnx 工厂由**注册表**说了算（ModelSpec.factory）：
-        # 模型族的文件结构差别很大（Whisper 是 encoder+decoder，CTC 家族是单个
-        # model.onnx + tokens.txt），但"引擎大类"只有流式/分块两种，所以这层映射
-        # 放注册表，避免 LanguageRoute.engine 的 Literal 一直膨胀。
-        spec = MODELS.get(self.model_id)
-        factory = (spec.factory if spec else "") or self._guess_factory()
-
-        if factory == "whisper":
-            roles = ("encoder", "decoder", "tokens")
-        elif factory == "sense_voice":
-            roles = ("model", "tokens")
-        elif factory in _CTC_FACTORIES:
-            roles = ("model", "tokens")
-        else:
-            raise ValueError(
-                f"分块引擎不认识这个模型：{self.model_id}（factory={factory or '未声明'}）"
-            )
-
-        paths = require(self.model_id, self.models_dir, roles=roles)
-
-        if factory == "whisper":
-            # 注意：from_whisper **不接受** sample_rate / feature_dim
-            self._recognizer = sherpa_onnx.OfflineRecognizer.from_whisper(
-                encoder=str(paths["encoder"]),
-                decoder=str(paths["decoder"]),
-                tokens=str(paths["tokens"]),
-                num_threads=self.num_threads,
-                language=self.language if self.language not in ("zh-en", "") else "auto",
-                task="transcribe",
-                decoding_method="greedy_search",
-                provider=self.provider,
-            )
-        elif factory == "sense_voice":
-            # SenseVoice：language 支持 auto/zh/en/ja/ko/yue，自带语种识别与标点
-            lang = self.language if self.language != "zh-en" else "auto"
-            self._recognizer = sherpa_onnx.OfflineRecognizer.from_sense_voice(
-                model=str(paths["model"]),
-                tokens=str(paths["tokens"]),
-                num_threads=self.num_threads,
-                sample_rate=SAMPLE_RATE,
-                feature_dim=FEATURE_DIM,
-                decoding_method="greedy_search",
-                language=lang,
-                use_itn=self.use_itn,
-                provider=self.provider,
-            )
-        else:
-            # NeMo CTC / Dolphin / Omnilingual / FireRedASR CTC 这一族：
-            # 单个 model.onnx + tokens.txt，参数完全一致（语言信息在模型内部）。
-            build = getattr(sherpa_onnx.OfflineRecognizer, f"from_{factory}", None)
-            if build is None:
-                raise ValueError(
-                    f"当前 sherpa-onnx 不支持 factory={factory}（模型 {self.model_id}）"
-                )
-            self._recognizer = build(
-                model=str(paths["model"]),
-                tokens=str(paths["tokens"]),
-                num_threads=self.num_threads,
-                provider=self.provider,
-            )
-        log.info(
-            "加载分块识别器：model=%s factory=%s language=%s provider=%s",
-            self.model_id, factory, self.language, self.provider,
+        self._recognizer = build_offline_recognizer(
+            model_id=self.model_id,
+            language=self.language,
+            num_threads=self.num_threads,
+            provider=self.provider,
+            models_dir=self.models_dir,
+            use_itn=self.use_itn,
         )
-
-    def _guess_factory(self) -> str:
-        """注册表没写 factory 时的兜底推断（兼容老配置/手写模型 id）。"""
-        name = self.model_id.lower()
-        if "whisper" in name:
-            return "whisper"
-        if "parakeet" in name:
-            return "nemo_ctc"
-        if "dolphin" in name:
-            return "dolphin_ctc"
-        if "omnilingual" in name:
-            return "omnilingual_asr_ctc"
-        if "fire" in name:
-            return "fire_red_asr_ctc"
-        return ""
 
     # ------------------------------------------------------------------ #
     def _feed(self, samples: np.ndarray) -> list[ASREvent]:

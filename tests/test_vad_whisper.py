@@ -18,6 +18,7 @@ import pytest
 from app.asr.whisper_vad import (
     FRAME_SAMPLES,
     MEL_FRAMES,
+    SAMPLE_RATE,
     WhisperVadSegmenter,
     mel_filterbank,
     whisper_log_mel,
@@ -134,6 +135,46 @@ def test_default_vad_is_still_silero():
     assert AppConfig().asr.vad.model == "silero-vad"
 
 
+def test_hop_defaults_and_bounds():
+    """步进：默认 1000ms，范围受 Field 约束（太小会跟不上实时）。
+
+    注意 pydantic v2 **赋值时不校验**，所以边界要用构造/加载来验
+    （手改 config.json 走的正是 model_validate 这条路）。
+    """
+    from app.config import VADConfig
+
+    vad = AppConfig().asr.vad
+    assert vad.hop_ms == 1000
+    vad.hop_ms = 2000
+    assert vad.hop_ms == 2000
+
+    assert VADConfig(hop_ms=500).hop_ms == 500
+    assert VADConfig(hop_ms=5000).hop_ms == 5000
+    with pytest.raises(Exception):
+        VADConfig(hop_ms=100)      # 低于下限
+    with pytest.raises(Exception):
+        VADConfig(hop_ms=9000)     # 高于上限
+
+
+def test_hop_reaches_the_whisper_segmenter():
+    """配置里的 hop 必须真的落到 WhisperVAD 上（否则旋钮是假的）。"""
+    fast = WhisperVadSegmenter(hop_ms=500)
+    slow = WhisperVadSegmenter(hop_ms=2000)
+    assert fast._hop_samples == SAMPLE_RATE * 500 // 1000
+    assert slow._hop_samples == SAMPLE_RATE * 2000 // 1000
+    # 再小也不会到 0（构造里对下限做了保护）
+    assert WhisperVadSegmenter(hop_ms=1)._hop_samples >= FRAME_SAMPLES
+
+
+def test_silero_backend_ignores_hop():
+    """Silero 是逐帧判断的，hop 不该影响它（只被存下来、不参与加载）。"""
+    from app.asr.vad import VadSegmenter
+
+    seg = VadSegmenter(vad_model="silero-vad", hop_ms=2000)
+    assert seg.hop_ms == 2000
+    assert seg.vad_model == "silero-vad"
+
+
 def test_vad_config_accepts_asmr_backend():
     assert AppConfig().asr.vad.model == "silero-vad"
     cfg = AppConfig().asr.vad
@@ -210,6 +251,55 @@ def test_settings_marks_undownloaded_vad(qapp, monkeypatch):
         win.vad_combo.setCurrentIndex(idx)
         assert "还没下载" in win.model_hint.text()
         assert "vad-asmr" in win.model_hint.text()
+    finally:
+        win.hide()
+        win.deleteLater()
+
+
+def test_settings_hop_knob_writes_through(qapp, monkeypatch):
+    """步进旋钮要真的写进配置，而不是只在界面上好看。"""
+    from app.models.downloader import ModelDownloader
+    from app.ui.settings import SettingsWindow
+
+    monkeypatch.setattr(AppConfig, "save", lambda self: None, raising=True)
+    monkeypatch.setattr(ModelDownloader, "status", lambda self, mid: "installed", raising=True)
+
+    win = SettingsWindow(AppConfig())
+    try:
+        assert win.vad_hop.value() == 1000
+        win.vad_hop.setValue(2000)
+        win._save()
+        assert win.config.asr.vad.hop_ms == 2000
+    finally:
+        win.hide()
+        win.deleteLater()
+
+
+def test_settings_hop_is_explained_and_greyed_for_silero(qapp, monkeypatch):
+    """用户要的：这个调节是干嘛的，必须写在界面上。"""
+    from app.models.downloader import ModelDownloader
+    from app.ui.settings import SettingsWindow
+
+    monkeypatch.setattr(AppConfig, "save", lambda self: None, raising=True)
+    monkeypatch.setattr(ModelDownloader, "status", lambda self, mid: "installed", raising=True)
+
+    win = SettingsWindow(AppConfig())
+    try:
+        win.vad_combo.setCurrentIndex(win.vad_combo.findData("silero-vad"))
+        assert not win.vad_hop.isEnabled(), "Silero 不看步进，旋钮该置灰"
+        silent_text = win.vad_hop_hint.text()
+        assert "单核" in silent_text and "不生效" in silent_text
+
+        win.vad_combo.setCurrentIndex(win.vad_combo.findData("whisper-vad-asmr"))
+        assert win.vad_hop.isEnabled()
+        active_text = win.vad_hop_hint.text()
+        assert "单核" in active_text and "不生效" not in active_text
+
+        # 拧到跟不上实时的档位要给出警告，而不是默默变卡
+        win.vad_hop.setValue(500)
+        assert "跟不上" in win.vad_hop_hint.text()
+        win.vad_hop.setValue(5000)
+        assert "跟不上" not in win.vad_hop_hint.text()
     finally:
         win.hide()
         win.deleteLater()

@@ -52,6 +52,7 @@ class VadSegmenter:
         max_speech_ms: int = 8000,
         threshold: float = 0.5,
         speech_pad_ms: int = 120,
+        hop_ms: int = 1000,
         vad_model: str = VAD_MODEL_ID,
         num_threads: int = 1,
         provider: str = "cpu",
@@ -63,6 +64,7 @@ class VadSegmenter:
         self.max_speech_ms = max_speech_ms
         self.threshold = threshold
         self.speech_pad_ms = speech_pad_ms
+        self.hop_ms = hop_ms
         self.vad_model = vad_model or VAD_MODEL_ID
         self.num_threads = num_threads
         self.provider = provider
@@ -84,6 +86,7 @@ class VadSegmenter:
                 max_speech_ms=self.max_speech_ms,
                 threshold=self.threshold,
                 speech_pad_ms=self.speech_pad_ms,
+                hop_ms=self.hop_ms,
                 num_threads=self.num_threads,
                 provider=self.provider,
                 models_dir=self.models_dir,

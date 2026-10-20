@@ -386,8 +386,15 @@ class WhisperVadSegmenter:
         return out
 
     def flush(self) -> list[SpeechSegment]:
-        """音频结束：把尾巴上还没断句的语音也定稿。"""
+        """音频结束：把尾巴上还没断句的语音也定稿。
+
+        这里必须**强制再推理一次**：正常路径只在攒够一个 ``hop`` 时才判断，
+        所以结尾不足一个 hop 的音频永远拿不到概率，最后那截语音会被整段丢掉
+        （hop 调大时尤其明显，实测 hop=2000 会少掉 1.4 秒）。
+        """
         self._drain()
+        if self._model is not None and self._audio.size >= FRAME_SAMPLES:
+            self._infer()
         if self._triggered:
             self._emit(self._seg_start, max(self._seg_start + 1, self._next_frame))
             self._triggered = False

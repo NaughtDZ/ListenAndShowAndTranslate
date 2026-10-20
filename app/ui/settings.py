@@ -763,6 +763,8 @@ class SettingsWindow(QWidget):
         # 识别模型下拉框会让人以为它能识别。
         vad_box = QGroupBox("语音活动检测（VAD）")
         vad_form = QFormLayout(vad_box)
+        # 让下拉框占满一行，跟上面「识别模型」那组视觉对齐（默认为按内容定宽，会显得参差）
+        vad_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
         self.vad_combo = QComboBox()
         self.vad_combo.setToolTip(
             "VAD 决定「哪一段是人声」——音频被它判成静音就根本不会送去识别。\n"
@@ -771,6 +773,23 @@ class SettingsWindow(QWidget):
         )
         self.vad_combo.currentIndexChanged.connect(self._refresh_model_hints)
         vad_form.addRow("VAD 模型", self.vad_combo)
+
+        self.vad_hop = QSpinBox()
+        self.vad_hop.setRange(500, 5000)
+        self.vad_hop.setSingleStep(100)
+        self.vad_hop.setSuffix(" ms")
+        self.vad_hop.setValue(self.config.asr.vad.hop_ms)
+        self.vad_hop.setToolTip(
+            "Whisper-VAD 每隔多久重新判断一次「有没有人声」。\n"
+            "它每次都要算满 30 秒窗口，所以调小=字幕更跟手但更吃 CPU。"
+        )
+        vad_form.addRow("轻声 VAD 步进", self.vad_hop)
+
+        self.vad_hop_hint = QLabel("")
+        self.vad_hop_hint.setWordWrap(True)
+        vad_form.addRow("", self.vad_hop_hint)
+        self.vad_hop.valueChanged.connect(self._refresh_hop_hint)
+
         self.vad_hint = QLabel("")
         self.vad_hint.setWordWrap(True)
         vad_form.addRow("", self.vad_hint)
@@ -937,7 +956,44 @@ class SettingsWindow(QWidget):
             "轻声/耳语被漏掉时换 Whisper-VAD ASMR；它每步都要算满 30 秒窗口，"
             "CPU 占用明显高于 Silero。"
         )
+
+        if hasattr(self, "vad_hop"):
+            # 步进只对 Whisper-VAD 有意义，选 Silero 时直接置灰，省得用户白拧
+            self.vad_hop.setEnabled(vad_id == "whisper-vad-asmr")
+            self._refresh_hop_hint()
+
         self.model_hint.setText("\n".join(lines))
+
+    HOP_FORWARD_S = 0.534
+    """单次前向（30 秒窗口、CPU 单线程）的实测耗时——见 docs/耳语VAD.md。"""
+
+    def _refresh_hop_hint(self) -> None:
+        """把这个步进大概要吃多少 CPU **直接算给用户看**。
+
+        公式来自本机实测：每 ``hop_ms`` 毫秒就要付一次 ``HOP_FORWARD_S`` 的前向开销，
+        所以单核占用 ≈ ``HOP_FORWARD_S / (hop_ms / 1000)``。
+        这是估的，不是测的——但它能立刻告诉用户"拧小会不会跑不动"。
+        """
+        hop = max(1, int(self.vad_hop.value()))
+        pct = self.HOP_FORWARD_S * 1000.0 / hop * 100.0
+        if pct >= 95:
+            tail = "⚠️ 已经跟不上实时了：字幕会越积越慢，建议调大"
+        elif pct >= 65:
+            tail = "CPU 吃得多，低端机建议调大"
+        else:
+            tail = "占用可以接受"
+
+        head = (
+            "Whisper-VAD 每隔上面这个时长才重新判断一次「有没有人声」。"
+            "它每次都要算满 30 秒窗口，所以这是<b>「字幕快一点」和「CPU 少一点」</b>的"
+            "直接交换：调小更跟手、更费 CPU，调大正好相反。"
+        )
+        if (self.vad_combo.currentData() or "") != "whisper-vad-asmr":
+            head += "当前选的是 Silero（逐帧判断），<b>这一项不生效</b>。"
+
+        self.vad_hop_hint.setText(
+            head + f"<br><b>按本机实测估算</b>：{hop} ms 约占 {pct:.0f}% 单核 · {tail}"
+        )
 
     def reset_model_choices(self) -> None:
         """全部恢复成「自动」= 程序实测挑出来的默认模型。"""
@@ -960,6 +1016,7 @@ class SettingsWindow(QWidget):
                 asr.set_route(lang, asr.default_route_for(lang))
         # VAD 与语言路由无关，单独写
         asr.vad.model = self.vad_combo.currentData() or "silero-vad"
+        asr.vad.hop_ms = int(self.vad_hop.value())
 
     # ------------------------------------------------------------------ #
     # 外观
