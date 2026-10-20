@@ -388,6 +388,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--settings", action="store_true", help="打开设置界面（网络/翻译/识别/外观）")
     p.add_argument("--wizard", action="store_true", help="重新运行首次运行向导（硬件/档位/模型/翻译）")
     p.add_argument(
+        "--studio",
+        action="store_true",
+        help="打开「字幕工坊」：把音频/视频离线转写成 srt/vtt/lrc（可选 LLM 翻译）",
+    )
+    p.add_argument(
         "--models",
         choices=["list", "status", "install", "uninstall"],
         help="模型管理：list 看清单、status 看状态、install/uninstall 装或删",
@@ -442,6 +447,10 @@ def main(argv: list[str] | None = None) -> int:
         win = SettingsWindow(AppConfig.load())
         win.show()
         return int(app.exec())
+    if args.studio:
+        from app.ui.studio import run_studio
+
+        return run_studio(AppConfig.load())
     if args.wizard:
         from app.ui.wizard import run_wizard
 

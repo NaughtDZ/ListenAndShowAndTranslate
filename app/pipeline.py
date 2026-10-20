@@ -109,48 +109,10 @@ class SubtitlePipeline(QObject):
             inline = {k: v for k, v in cfg.translate.glossary.items() if not k.startswith("_")}
             self._glossary.update(inline)
 
-        # 翻译通道
-        self.hub = TranslatorHub(cfg.translate, glossary=self._glossary)
-        notes: list[str] = []
-        provider = cfg.translate.provider
+        # 翻译通道（与离线字幕工具共用同一套构建逻辑，避免两边漂移）
+        from app.translate.setup import build_translator_hub
 
-        if provider == "llm" or provider.startswith("llm"):
-            from app.translate.openai_compat import OpenAICompatTranslator
-
-            llm = cfg.translate.llm
-            if not llm.enabled:
-                notes.append("LLM 通道未启用")
-            else:
-                t = OpenAICompatTranslator(
-                    base_url=llm.base_url, api_key=llm.api_key, model=llm.model,
-                    temperature=llm.temperature, max_tokens=llm.max_tokens,
-                    timeout_s=llm.timeout_s, proxy=cfg.proxy,
-                    verify_glossary=True, name="llm",
-                    prompt_style=getattr(llm, "prompt_style", "") or "",
-                    # 思考默认关（字幕翻译不需要思考，且会把预算烧光导致空译文）
-                    disable_thinking=getattr(llm, "disable_thinking", True),
-                )
-                self.hub.register(t, priority=10)
-                ok, msg = t.ping()
-                notes.append(f"LLM({llm.model}): {msg}")
-        elif provider != "none":
-            from app.translate.traditional.providers import ALL_PROVIDERS, build_provider
-
-            if provider not in ALL_PROVIDERS:
-                notes.append(f"未知通道: {provider}")
-            else:
-                # web_* 是免 key 的网页版内部接口（非官方，可能失效）
-                creds = cfg.translate.providers.get(provider, {})
-                t = build_provider(
-                    provider, creds, proxy=cfg.proxy, qps_limit=cfg.translate.qps_limit
-                )
-                if t is None:
-                    notes.append(f"无法构造通道: {provider}")
-                else:
-                    self.hub.register(t, priority=20 if provider.startswith("web_") else 10)
-                    ok, msg = t.ping()
-                    tag = "（非官方接口，可能失效）" if provider.startswith("web_") else ""
-                    notes.append(f"{provider}{tag}: {msg}")
+        self.hub, notes = build_translator_hub(cfg, self._glossary)
 
         # 识别路由器
         self.router = LanguageRouter(
