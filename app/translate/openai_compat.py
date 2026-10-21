@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import re
 import time
+from functools import lru_cache
 from urllib.parse import urlparse
 
 import httpx
@@ -85,6 +86,21 @@ def strip_thinking(text: str) -> str:
     return out.strip()
 
 
+_THINK_OFF_KEYS = (
+    "reasoning_effort",      # OpenAI 官方（gpt-5 / o 系列）
+    "thinking",              # DeepSeek 官方：{"thinking": {"type": "disabled"}}
+    "reasoning",             # OpenRouter：{"reasoning": {"enabled": false}}
+    "enable_thinking",       # 阿里 DashScope（OpenAI 兼容模式）
+    "chat_template_kwargs",  # vLLM / LM Studio / llama.cpp
+)
+"""所有用来「关掉思考」的请求字段名——各家叫法不一样，见 :func:`thinking_extras`。
+
+这是**唯一真源**：``_call`` 收到 400 时按这份清单逐个清掉再重试。
+新增一家只要改这里 + ``thinking_extras``，不要只改一边——
+漏掉一个键，重试就还是 400，功能表现为"整句翻不出来"。
+"""
+
+
 def thinking_extras(base_url: str, model: str = "") -> dict:
     """按服务端类型给出「关掉思考」的请求参数。
 
@@ -104,6 +120,14 @@ def thinking_extras(base_url: str, model: str = "") -> dict:
     host = urlparse(base_url).netloc.lower()
     if "openai.com" in host:
         return {"reasoning_effort": "minimal"}
+    if "deepseek.com" in host:
+        # DeepSeek 官方（2026 文档「思考模式」）：
+        #   开关 {"thinking": {"type": "enabled/disabled"}}
+        #   强度 {"reasoning_effort": "low/high/max"}（默认 high）
+        # 默认是**开着**的，翻译短句不需要思考；而且思考会把预算烧在
+        # reasoning_content 上，content 直接空串（字幕空白）。
+        # 用官方字段而不是 chat_template_kwargs——DeepSeek 对未知字段会 400。
+        return {"thinking": {"type": "disabled"}}
     if "openrouter" in host:
         return {"reasoning": {"enabled": False}}
     if "dashscope" in host or "aliyuncs" in host:
@@ -197,25 +221,37 @@ def _normalize_for_compare(text: str) -> str:
     return out.lower()
 
 
-# 常见繁→简对照（只覆盖术语表里最容易出现的字，不做完整转换表）
+# 常见繁→简对照（只覆盖术语表里最容易出现的字，**不是**完整转换表）。
+# 注意：这是"折叠比较"用的，不是给人看的转换器——所以只放会真的影响
+# 术语校验的字；像「西/南/北/黑/眼」这种简繁同形的恒等映射没必要出现。
 _TRAD_TO_SIMP = str.maketrans({
     "銅": "铜", "鑰": "钥", "鐵": "铁", "銀": "银", "劍": "剑", "龍": "龙",
     "門": "门", "馬": "马", "鳥": "鸟", "魚": "鱼", "風": "风", "雲": "云",
     "電": "电", "語": "语", "書": "书", "車": "车", "軍": "军", "國": "国",
     "學": "学", "醫": "医", "點": "点", "燈": "灯", "樹": "树", "葉": "叶",
-    "東": "东", "西": "西", "南": "南", "北": "北", "紅": "红", "綠": "绿",
-    "藍": "蓝", "黃": "黄", "黑": "黑", "愛": "爱", "夢": "梦", "話": "话",
-    "語": "语", "誰": "谁", "來": "来", "個": "个", "們": "们", "時": "时",
-    "間": "间", "現": "现", "實": "实", "體": "体", "聲": "声", "聽": "听",
-    "記": "记", "憶": "忆", "遠": "远", "過": "过", "讓": "让", "這": "这",
-    "們": "们", "麼": "么", "與": "与", "還": "还", "為": "为", "關": "关",
+    "東": "东", "紅": "红", "綠": "绿", "藍": "蓝", "黃": "黄", "愛": "爱",
+    "夢": "梦", "話": "话", "誰": "谁", "來": "来", "個": "个", "們": "们",
+    "時": "时", "間": "间", "現": "现", "實": "实", "體": "体", "聲": "声",
+    "聽": "听", "記": "记", "憶": "忆", "遠": "远", "過": "过", "讓": "让",
+    "這": "这", "麼": "么", "與": "与", "還": "还", "為": "为", "關": "关",
     "開": "开", "對": "对", "錯": "错", "長": "长", "張": "张", "發": "发",
-    "頭": "头", "臉": "脸", "眼": "眼", "腳": "脚", "體": "体", "氣": "气",
+    "頭": "头", "臉": "脸", "腳": "脚", "氣": "气",
 })
 
 
 def _fold_traditional(text: str) -> str:
     return text.translate(_TRAD_TO_SIMP)
+
+
+@lru_cache(maxsize=1024)
+def _normalized_term(term: str) -> tuple[str, str]:
+    """术语表里的译法预先规范化（规范化 + 繁简折叠）。
+
+    术语表最多几十条、每条每批都要被比较，而 NFKC + 正则 sub 并不便宜，
+    所以缓存住它（``glossary_violations`` 在批量翻译后对每条字幕都要跑一遍）。
+    """
+    want = _normalize_for_compare(term)
+    return want, _fold_traditional(want)
 
 
 def glossary_violations(
@@ -238,8 +274,8 @@ def glossary_violations(
             continue
         if src_term not in source:
             continue
-        want = _normalize_for_compare(dst_term)
-        if want in norm_translation or _fold_traditional(want) in folded_translation:
+        want, folded_want = _normalized_term(dst_term)
+        if want in norm_translation or folded_want in folded_translation:
             continue
         bad.append(f"{src_term}→{dst_term}")
     return bad
@@ -346,7 +382,7 @@ class OpenAICompatTranslator:
                 custom_prompt=request.custom_prompt,
             )
             try:
-                result.merge(self._translate_batch(sub, original=request))
+                result.merge(self._translate_batch(sub))
             except Exception as exc:  # noqa: BLE001 - 通道异常不能打断字幕流
                 msg = f"{type(exc).__name__}: {exc}"
                 log.error("翻译批次失败: %s", msg)
@@ -358,9 +394,7 @@ class OpenAICompatTranslator:
         return result
 
     # ------------------------------------------------------------------ #
-    def _translate_batch(
-        self, request: TranslateRequest, original: TranslateRequest
-    ) -> TranslateResult:
+    def _translate_batch(self, request: TranslateRequest) -> TranslateResult:
         """翻一批；内部按"批量 → 加大预算 → 逐条"逐级降级。"""
         batch = request.segments
         out = TranslateResult(provider=self.name, model=self.model)
@@ -388,7 +422,7 @@ class OpenAICompatTranslator:
                     out.note = "编号解析失败，已改为逐条翻译"
                     out.retries += 1
                     log.info("批量输出无法按编号解析，退回逐条（%d 条）", len(batch))
-                    return self._translate_one_by_one(request, original, base=out)
+                    return self._translate_one_by_one(request, base=out)
 
             out.prompt_tokens += usage.get("prompt_tokens", 0)
             out.completion_tokens += usage.get("completion_tokens", 0)
@@ -411,7 +445,7 @@ class OpenAICompatTranslator:
                                ("source_language", "target_language", "context",
                                 "glossary", "template", "custom_prompt")},
                         ),
-                        original, base=TranslateResult(provider=self.name, model=self.model),
+                        base=TranslateResult(provider=self.name, model=self.model),
                         # 只接受仍然违规的结果，避免更差的译文覆盖好译文
                         keep_original=dict(out.translations),
                     )
@@ -468,12 +502,11 @@ class OpenAICompatTranslator:
 
         # ---- 第 3 级：逐条 ----
         out.note = (out.note + "；" if out.note else "") + "批量失败，已逐条重试"
-        return self._translate_one_by_one(request, original, base=out)
+        return self._translate_one_by_one(request, base=out)
 
     def _translate_one_by_one(
         self,
         request: TranslateRequest,
-        original: TranslateRequest,
         base: TranslateResult,
         keep_original: dict[int, str] | None = None,
     ) -> TranslateResult:
@@ -555,15 +588,15 @@ class OpenAICompatTranslator:
         r = self._client.post(f"{self.base_url}/chat/completions", json=payload)
         if r.status_code == 400 and extras:
             # 严格网关（OpenAI / DeepSeek 官方）会因未知字段直接 400：
-            # 去掉关思考的参数重试一次，别让一句都翻不出来
+            # 去掉关思考的参数重试一次，别让一句都翻不出来。
+            # ⚠️ 必须把 _THINK_OFF_KEYS 里**每一个**键都清掉——漏一个（比如
+            # DeepSeek 的 thinking）重试还是 400，等于重试白做。
             log.warning(
                 "端点拒绝了关思考参数（HTTP 400），去掉 %s 重试一次",
                 ", ".join(extras),
             )
-            payload.pop("reasoning", None)
-            payload.pop("reasoning_effort", None)
-            payload.pop("enable_thinking", None)
-            payload.pop("chat_template_kwargs", None)
+            for key in _THINK_OFF_KEYS:
+                payload.pop(key, None)
             r = self._client.post(f"{self.base_url}/chat/completions", json=payload)
         r.raise_for_status()
         data = r.json()

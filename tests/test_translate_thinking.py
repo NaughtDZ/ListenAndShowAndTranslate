@@ -181,13 +181,17 @@ def test_config_defaults_to_no_thinking():
     assert AppConfig().translate.llm.disable_thinking is True
 
 
-def test_settings_checkbox_reflects_and_saves(qapp=None):
+def test_settings_checkbox_reflects_and_saves(monkeypatch):
     import os
 
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     from PySide6.QtWidgets import QApplication
 
     from app.ui.settings import SettingsWindow
+
+    # ⚠️ 必须掐掉 save()：这个测试以前直接 win._save()，会把真实的
+    # data/config.json 覆盖成默认值（测试隔离漏洞，已实际发生过一次）。
+    monkeypatch.setattr(AppConfig, "save", lambda self: None, raising=True)
 
     app = QApplication.instance() or QApplication([])
     cfg = AppConfig()

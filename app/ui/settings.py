@@ -23,6 +23,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Callable
 
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
@@ -83,11 +84,62 @@ PROVIDER_META: dict[str, tuple[str, dict[str, str]]] = {
     "deepl": ("DeepL", {"api_key": "API Key"}),
 }
 
+# ---- DeepSeek 官方 API 预设 ----
+# 文档（2026）：base_url 就是 https://api.deepseek.com，不要加 /v1
+# （SDK 会自己拼 /chat/completions；本项目的适配器也是手工拼这一段，所以保持一致）
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+
+# 文档"思考模式 / 多轮对话"里出现的模型。视觉型号
+# deepseek-v4-flash-vision-exp 没放：翻译用不上，还更贵。
+# 下拉框本身可编辑、旁边还有「列出模型」，所以以后改名也不怕。
+DEEPSEEK_MODELS: tuple[str, ...] = (
+    "deepseek-flash",
+    "deepseek-v4-flash",
+    "deepseek-v4-pro",
+)
+
+
+def guess_llm_preset(base_url: str) -> str:
+    """按接口地址猜"快捷预设"，用于重开设置时把下拉摆到正确位置。"""
+    from app.translate.openai_compat import is_local_url
+
+    url = (base_url or "").strip()
+    if "deepseek.com" in url:
+        return "deepseek"
+    if url and is_local_url(url):
+        return "local"
+    return "custom"
+
+
+@dataclass(frozen=True)
+class _ChannelProbe:
+    """「测试当前翻译通道」要用的全部输入。
+
+    **必须先在 UI 线程抄成快照**再交给后台线程：Qt 控件不是线程安全的，
+    跨线程去读 ``QLineEdit.text()`` / ``QComboBox.currentData()`` 属于未定义
+    行为（轻则读到半截字符串、重则崩在 Qt 内部）。以前的实现是把整个
+    ``self._test_translate`` 丢进 QThread，函数体里直接读控件——所以这个
+    快照是有必要的，不是过度设计。
+    """
+
+    provider: str
+    proxy: str
+    llm_base: str
+    llm_key: str
+    llm_model: str
+    llm_style: str
+    llm_no_think: bool
+    creds: dict[str, str]
+
 
 class _TestThread(QThread):
-    """在后台跑连通性测试，避免界面卡死（网络请求可能几秒）。"""
+    """在后台跑连通性测试，避免界面卡死（网络请求可能几秒）。
 
-    done = Signal(str)
+    只允许发信号、**不许碰任何控件**：返回值统一成
+    ``(报告文本, 要填进模型下拉框的模型名列表)``，由 UI 线程去更新界面。
+    """
+
+    done = Signal(str, list)
 
     def __init__(self, fn) -> None:
         super().__init__()
@@ -95,9 +147,14 @@ class _TestThread(QThread):
 
     def run(self) -> None:  # noqa: D102
         try:
-            self.done.emit(self._fn())
+            out = self._fn()
+            if isinstance(out, tuple):
+                text, models = str(out[0]), list(out[1] or [])
+            else:
+                text, models = str(out), []
+            self.done.emit(text, models)
         except Exception as exc:  # noqa: BLE001
-            self.done.emit(f"✗ 测试异常: {type(exc).__name__}: {exc}")
+            self.done.emit(f"✗ 测试异常: {type(exc).__name__}: {exc}", [])
 
 
 class SettingsWindow(QWidget):
@@ -378,9 +435,9 @@ class SettingsWindow(QWidget):
 
         row = QHBoxLayout()
         test_proxy = QPushButton("测试代理连通性")
-        test_proxy.clicked.connect(lambda: self._run_test(self._test_proxy))
+        test_proxy.clicked.connect(self._probe_proxy)
         test_all = QPushButton("测试全部通道")
-        test_all.clicked.connect(lambda: self._run_test(self._test_all))
+        test_all.clicked.connect(self._probe_all)
         row.addWidget(test_proxy)
         row.addWidget(test_all)
         row.addStretch(1)
@@ -469,7 +526,35 @@ class SettingsWindow(QWidget):
         # --- LLM 专用 ---
         self.llm_box = QGroupBox("大模型设置（OpenAI 兼容：LM Studio / Ollama / 云端）")
         lf = QFormLayout(self.llm_box)
+
+        # 通道没选到 LLM 时，这一整块**也要露出来**（只是禁用）。
+        # 以前是 setVisible(pid == "llm")：通道默认「不翻译」，于是接口地址/模型名
+        # 全被藏掉，用户根本不知道 LLM 要在这里配——还以为设置里没有。
+        self.llm_off_hint = QLabel()
+        self.llm_off_hint.setWordWrap(True)
+        self.llm_off_hint.setStyleSheet("color:#c0392b;")
+        lf.addRow("", self.llm_off_hint)
+        self.llm_switch_btn = QPushButton("就用「本地/在线大模型」通道")
+        self.llm_switch_btn.clicked.connect(self._switch_to_llm)
+        lf.addRow("", self.llm_switch_btn)
+
         llm = self.config.translate.llm
+
+        # 快捷预设：选 DeepSeek / 本地 时把地址和候选模型一起填好，
+        # 省得用户对着文档手抄 base_url（这是"添加 DeepSeek 接口"的入口）。
+        self.llm_preset = QComboBox()
+        self.llm_preset.addItem("自定义 / 其他 OpenAI 兼容服务", "custom")
+        self.llm_preset.addItem("本地（LM Studio / Ollama）", "local")
+        self.llm_preset.addItem("DeepSeek 官方 API", "deepseek")
+        preset = guess_llm_preset(llm.base_url)
+        self.llm_preset.setCurrentIndex(max(0, self.llm_preset.findData(preset)))
+        self.llm_preset.setToolTip(
+            "只是帮你填「接口地址 + 候选模型」，不会锁定什么。\n"
+            "选 DeepSeek 需要 API Key（platform.deepseek.com）；思考默认关闭。"
+        )
+        self.llm_preset.currentIndexChanged.connect(self._on_llm_preset_changed)
+        lf.addRow("快捷预设", self.llm_preset)
+
         self.llm_base = QLineEdit(llm.base_url)
         self.llm_base.setPlaceholderText("http://127.0.0.1:1234/v1")
         self.llm_key = QLineEdit(llm.api_key)
@@ -504,7 +589,7 @@ class SettingsWindow(QWidget):
         lf.addRow("", self.llm_no_think)
 
         model_hint = QLabel(
-            "**模型由你自己选**，程序不替你决定——不同模型显存占用差别巨大"
+            "<b>模型由你自己选</b>，程序不替你决定——不同模型显存占用差别巨大"
             "（2B 约 2~4GB，27B 能吃到 20GB+）。<br>"
             "点「列出模型」会把 LM Studio / Ollama 里已有的模型填进下拉框。"
             "听小说建议用小模型（快、省显存），翻译质量不够再换大的。"
@@ -546,7 +631,7 @@ class SettingsWindow(QWidget):
         form.addRow("自定义提示词", self.prompt_edit)
 
         test_btn = QPushButton("测试当前翻译通道")
-        test_btn.clicked.connect(lambda: self._run_test(self._test_translate))
+        test_btn.clicked.connect(self._probe_translate)
         form.addRow("", test_btn)
 
         lay.addWidget(box)
@@ -748,7 +833,7 @@ class SettingsWindow(QWidget):
         model_form.addRow("", reset_row)
         model_form.addRow("", self.model_hint)
         model_box_hint = QLabel(
-            "为什么不能任选？识别模型是**按语言写在注册表**里的："
+            "为什么不能任选？识别模型是<b>按语言写在注册表</b>里的："
             "流式模型只能吃它训练过的语言，Whisper turbo 才能通吃 99 种；"
             "语种识别模型和 VAD 更是根本不出字幕。所以这里只列能用的；"
             "选了但还没下载的，会提示你去下面补下。详见 docs/识别模型选择.md。"
@@ -1167,7 +1252,34 @@ class SettingsWindow(QWidget):
             self.cred_form.addRow(label, edit)
             self.cred_fields[key] = edit
         self.cred_box.setVisible(bool(self.cred_fields))
-        self.llm_box.setVisible(pid == "llm")
+
+        # LLM 设置：选它 → 可用；选「不翻译」→ 仍显示但禁用，并给解释与一键切换；
+        # 选别的传统通道 → 隐藏（那些通道有自己的凭据框）。
+        show_llm = pid in ("llm", "none")
+        is_llm = pid == "llm"
+        self.llm_box.setVisible(show_llm)
+        for widget in (
+            self.llm_base, self.llm_key, self.llm_model,
+            self.llm_style, self.llm_no_think, self.llm_preset,
+        ):
+            # 快捷预设也算输入控件：漏了它，通道选「不翻译」时上面全灰、
+            # 唯独它能点，用户会以为"点这里就能生效"。
+            widget.setEnabled(is_llm)
+        self.llm_off_hint.setVisible(pid == "none")
+        self.llm_switch_btn.setVisible(pid == "none")
+        if pid == "none":
+            self.llm_off_hint.setText(
+                "当前通道是「不翻译（只显示原文）」，下面这些设置<b>不会生效</b>。<br>"
+                "要翻译：点下面的按钮（或把上面的「通道」改成"
+                "「本地/在线大模型（OpenAI 兼容）」），再勾上「启用翻译」。"
+            )
+
+    def _switch_to_llm(self) -> None:
+        """一键把通道切成 LLM 并勾上「启用翻译」（省得用户在两处来回找）。"""
+        index = self.provider_combo.findData("llm")
+        if index >= 0:
+            self.provider_combo.setCurrentIndex(index)
+        self.enable_translate.setChecked(True)
 
     def _knob_value(self, knob) -> int:
         if knob.section == "asr":
@@ -1211,31 +1323,72 @@ class SettingsWindow(QWidget):
         self._threads.append(t)
         t.start()
 
-    def _on_test_done(self, text: str) -> None:
+    def _on_test_done(self, text: str, models: list) -> None:
         self.status.setText("测试完成")
         self.net_log.append(text)
+        # 模型列表必须在**这里**（UI 线程）填进下拉框；
+        # 后台线程只负责把名字带回来（见 _ChannelProbe 的说明）。
+        if models:
+            self._fill_models([str(m) for m in models])
 
-    # --- 具体测试 ---
-    def _test_proxy(self) -> str:
+    # --- 取快照 + 起后台测试 ------------------------------------------- #
+    # 这三个方法都在 UI 线程里被按钮回调调用，所以"读控件"发生在正确的线程。
+    def _probe_proxy(self) -> None:
+        proxy = self.proxy_edit.text().strip()
+        self._run_test(lambda: self._test_proxy(proxy))
+
+    def _probe_all(self) -> None:
+        proxy = self.proxy_edit.text().strip()
+        base = self.llm_base.text().strip()
+        key = self.llm_key.text().strip()
+        self._run_test(lambda: self._test_all(proxy, base, key))
+
+    def _probe_translate(self) -> None:
+        probe = _ChannelProbe(
+            provider=self.provider_combo.currentData() or "none",
+            proxy=self.proxy_edit.text().strip(),
+            llm_base=self.llm_base.text().strip(),
+            llm_key=self.llm_key.text().strip(),
+            llm_model=self.llm_model.currentText().strip(),
+            llm_style=self.llm_style.currentData() or "",
+            llm_no_think=self.llm_no_think.isChecked(),
+            creds={k: e.text().strip() for k, e in self.cred_fields.items()},
+        )
+        self._run_test(lambda: self._test_translate(probe))
+
+    # --- 具体测试（全部在后台线程里跑，只碰传进来的值）------------------ #
+    def _test_proxy(self, proxy: str) -> str:
         import socket
         from urllib.parse import urlparse
 
-        proxy = self.proxy_edit.text().strip()
         if not proxy:
             return "代理：未设置（直连）"
-        u = urlparse(proxy)
+        # 用户经常只填 "127.0.0.1:2333"（没有 scheme）——urlparse 会把整串当成
+        # path，hostname 就是 None，于是报"不可达"。先补一个默认 scheme。
+        raw = proxy if "://" in proxy else f"http://{proxy}"
+        u = urlparse(raw)
+        host = u.hostname or ""
+        if not host:
+            return f"❌ 代理地址看不懂：{proxy}（例：http://127.0.0.1:2333）"
+        port = u.port or (443 if (u.scheme or "").lower() == "https" else 80)
+        s = socket.socket()
         try:
-            s = socket.socket()
             s.settimeout(2.0)
-            s.connect((u.hostname or "", u.port or 0))
-            s.close()
-            return f"✅ 代理 {proxy} 端口可达"
-        except Exception as exc:  # noqa: BLE001
+            s.connect((host, port))
+        except OSError as exc:
             return f"❌ 代理 {proxy} 不可达：{exc}"
+        finally:
+            s.close()   # 异常路径也要关，否则探测几十次就漏掉几十个句柄
+        return f"✅ 代理 {proxy} 端口可达"
 
-    def _test_all(self) -> str:
-        out = [self._test_proxy()]
-        proxy = self.proxy_edit.text().strip()
+    def _test_all(self, proxy: str, llm_base: str, llm_key: str):
+        """测代理 + 两个网页版 + LLM 端点。
+
+        Returns:
+            ``(报告文本, 建议填进模型下拉框的模型名)`` —— 模型名由 UI 线程去填，
+            后台线程不能碰控件。
+        """
+        out = [self._test_proxy(proxy)]
         for pid in ("web_google", "web_bing"):
             try:
                 from app.translate.traditional.providers import build_provider
@@ -1247,27 +1400,54 @@ class SettingsWindow(QWidget):
                     t.close()
             except Exception as exc:  # noqa: BLE001
                 out.append(f"❌ {pid}：{exc}")
-        base = self.llm_base.text().strip()
-        if base:
+
+        models: list[str] = []
+        if llm_base:
             try:
                 from app.translate.openai_compat import probe_endpoint, split_model_list
 
-                ok, msg, models = probe_endpoint(base, self.llm_key.text().strip(), proxy)
-                chat_models, others = split_model_list(models)
-                out.append(f"{'✅' if ok else '❌'} 大模型 {base}：{msg}")
+                ok, msg, found = probe_endpoint(llm_base, llm_key, proxy)
+                chat_models, others = split_model_list(found)
+                out.append(f"{'✅' if ok else '❌'} 大模型 {llm_base}：{msg}")
                 if others:
                     out.append(
                         f"     已滤掉 {len(others)} 个嵌入/重排/语音模型"
                         "（它们不能用来翻译）"
                     )
                 if chat_models:
-                    self._fill_models(chat_models)
-                    out.append(f"     已把 {len(chat_models)} 个模型填进上面的下拉框，"
-                               "请自己挑一个（**不会再自动替你选**——"
-                               "以前自动选列表第一个，可能直接加载一个 20GB+ 的大模型把显存吃满）")
+                    models = chat_models
+                    out.append(
+                        f"     已把 {len(chat_models)} 个模型填进上面的下拉框，"
+                        "请自己挑一个（不会再自动替你选——"
+                        "以前自动选列表第一个，可能直接加载一个 20GB+ 的大模型把显存吃满）"
+                    )
             except Exception as exc:  # noqa: BLE001
                 out.append(f"❌ 大模型：{exc}")
-        return "\n".join(out)
+        return "\n".join(out), models
+
+    def _on_llm_preset_changed(self) -> None:
+        """快捷预设：只填「地址 + 候选模型」，不动用户已经填好的 Key。"""
+        preset = self.llm_preset.currentData()
+        if preset == "deepseek":
+            if "deepseek" not in self.llm_base.text():
+                self.llm_base.setText(DEEPSEEK_BASE_URL)
+            self.llm_key.setPlaceholderText("必填：platform.deepseek.com → API Keys")
+            # 之前选的本地模型（gemma/qwen 之类）在 DeepSeek 上没有意义，清掉
+            if self.llm_model.currentText().strip() not in DEEPSEEK_MODELS:
+                self.llm_model.blockSignals(True)
+                self.llm_model.clear()
+                self.llm_model.blockSignals(False)
+            self._fill_models(list(DEEPSEEK_MODELS))
+            chat = self.llm_style.findData("chat")
+            if chat >= 0:
+                self.llm_style.setCurrentIndex(chat)
+        elif preset == "local":
+            text = self.llm_base.text().strip()
+            if not text or "deepseek" in text or "openai.com" in text:
+                self.llm_base.setText("http://127.0.0.1:1234/v1")
+            self.llm_key.setPlaceholderText("本地模型通常留空")
+        else:
+            self.llm_key.setPlaceholderText("本地模型通常留空")
 
     def _fill_models(self, models: list[str]) -> None:
         """把可用模型填进下拉框，但**不改用户当前的选择**。"""
@@ -1284,12 +1464,14 @@ class SettingsWindow(QWidget):
             self.llm_model.setEditText("")
         self.llm_model.blockSignals(False)
 
-    def _test_llm_translate(self, translator) -> str:
+    def _test_llm_translate(self, translator, no_think: bool) -> str:
         """LLM 通道的真测试：**真的翻一句**，并报告思考情况。
 
         为什么不是只 ping：ping 只证明"端口通了"。用户真正会踩的坑是
         "模型在思考 → content 空 → 字幕空白"，所以这里跑一次真实翻译，
         把"服务端回了多少思考字符"直接报给用户看（关思考到底有没有生效）。
+
+        ``no_think`` 是**快照**（点按钮时从复选框抄的），不能在这里读控件。
         """
         import time as _time
 
@@ -1314,7 +1496,7 @@ class SettingsWindow(QWidget):
                     f"\n⚠️ 服务端仍然返回了 {think} 字思考内容——"
                     "说明这个服务端不吃关思考参数（译文本身没问题，但会慢一些）。"
                 )
-            elif self.llm_no_think.isChecked():
+            elif no_think:
                 head += "（已确认没有思考内容 ✓）"
             return head
         if think:
@@ -1324,32 +1506,31 @@ class SettingsWindow(QWidget):
             )
         return f"❌ {label}：{dt:.1f}s 没有译文（{res.note or '无说明'}）"
 
-    def _test_translate(self) -> str:
-        pid = self.provider_combo.currentData() or "none"
+    def _test_translate(self, probe: _ChannelProbe) -> str:
+        pid = probe.provider or "none"
         if pid == "none":
             return "当前选择的是「不翻译」"
         try:
-            from app.translate.traditional.providers import build_provider
-
-            if pid in ("llm",):
+            if pid == "llm":
                 from app.translate.openai_compat import OpenAICompatTranslator
 
                 t = OpenAICompatTranslator(
-                    base_url=self.llm_base.text().strip(),
-                    api_key=self.llm_key.text().strip(),
-                    model=self.llm_model.currentText().strip(),
-                    proxy=self.proxy_edit.text().strip(),
-                    prompt_style=self.llm_style.currentData() or "",
-                    disable_thinking=self.llm_no_think.isChecked(),
+                    base_url=probe.llm_base,
+                    api_key=probe.llm_key,
+                    model=probe.llm_model,
+                    proxy=probe.proxy,
+                    prompt_style=probe.llm_style,
+                    disable_thinking=probe.llm_no_think,
                 )
             else:
-                creds = {k: e.text().strip() for k, e in self.cred_fields.items()}
-                t = build_provider(pid, creds, proxy=self.proxy_edit.text().strip())
+                from app.translate.traditional.providers import build_provider
+
+                t = build_provider(pid, dict(probe.creds), proxy=probe.proxy)
             if t is None:
                 return f"无法构造通道 {pid}"
             try:
                 if pid == "llm":
-                    return self._test_llm_translate(t)
+                    return self._test_llm_translate(t, probe.llm_no_think)
                 ok, msg = t.ping()
                 return f"{'✅' if ok else '❌'} {PROVIDER_META.get(pid, (pid,))[0]}：{msg}"
             finally:
