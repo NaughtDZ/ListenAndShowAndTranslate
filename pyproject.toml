@@ -1,6 +1,6 @@
 [project]
 name = "listen-and-show-and-translate"
-version = "0.2.0"
+version = "0.2.1"
 description = "只监听指定程序音频、实时生成原文/译文/双语字幕的透明置顶悬浮窗（Windows）"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
