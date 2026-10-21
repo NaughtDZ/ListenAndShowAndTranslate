@@ -549,7 +549,6 @@ class OverlayConfig(BaseModel):
     """定时重申置顶，对抗游戏/其他软件抢置顶。"""
 
     show_in_taskbar: bool = False
-    lock_position: bool = True
     screen_index: int = -1
     """-1 = 自动跟随游戏所在屏幕；>=0 = 指定第 N 块屏。"""
 
@@ -686,22 +685,27 @@ class AppConfig(BaseModel):
         log.info("已导出脱敏配置到 %s", path)
 
 
-def _redact(value: Any, parent_key: str = "") -> Any:
+def _redact(value: Any) -> Any:
+    """递归把"键名像凭据"的字符串值换成掩码。"""
     if isinstance(value, dict):
         out: dict[str, Any] = {}
         for k, v in value.items():
             if any(h in k.lower() for h in _SENSITIVE_HINTS) and isinstance(v, str) and v:
                 out[k] = "<redacted>"
             else:
-                out[k] = _redact(v, k)
+                out[k] = _redact(v)
         return out
     if isinstance(value, list):
-        return [_redact(v, parent_key) for v in value]
+        return [_redact(v) for v in value]
     return value
 
 
-def _migrate(cfg: AppConfig, raw: dict[str, Any]) -> AppConfig:
-    """配置版本迁移钩子。当前只有 v1，保留骨架以便日后升级。"""
+def _migrate(cfg: AppConfig, _raw: dict[str, Any]) -> AppConfig:
+    """配置版本迁移钩子。当前只有 v1，保留骨架以便日后升级。
+
+    ``_raw`` 是磁盘上的原始 JSON（迁移逻辑通常要读"旧结构里才有的键"），
+    现在还用不上，所以加下划线标明是预留参数。
+    """
     log.warning("配置版本 %s != %s，按最新结构重载", cfg.version, CONFIG_VERSION)
     cfg.version = CONFIG_VERSION
     return cfg

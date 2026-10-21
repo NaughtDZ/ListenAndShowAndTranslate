@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -50,19 +51,30 @@ class SubtitleLine:
 
 
 class SubtitleState:
-    """字幕状态机。线程安全由外部保证（流水线里只在 UI 线程改）。"""
+    """字幕状态机。
+
+    **行内容只在 UI 线程改**（``add_final`` / ``set_translation`` / ``set_partial``）——
+    否则会出现"字幕串行/错位"这种极难查的问题。
+
+    唯一的例外是 :meth:`new_id`：它在**采集线程**里被调用（识别一出定稿就要
+    马上分配行号，再 emit 给 UI）。以前它是裸的 ``self._next_id += 1``，
+    靠 GIL 侥幸没出错；现在显式加锁，把这个约定写进代码里。
+    """
 
     def __init__(self, max_lines: int = 200) -> None:
         self.lines: deque[SubtitleLine] = deque(maxlen=max_lines)
         self._next_id = 0
+        self._id_lock = threading.Lock()
 
         self.partial_source = ""
         self.partial_language = ""
 
     # ------------------------------------------------------------------ #
     def new_id(self) -> int:
-        self._next_id += 1
-        return self._next_id
+        """分配下一个行号。**可从任意线程调用**（见类文档）。"""
+        with self._id_lock:
+            self._next_id += 1
+            return self._next_id
 
     # ---- 中间结果 ---- #
     def set_partial(self, text: str, language: str = "") -> None:

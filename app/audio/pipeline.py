@@ -241,9 +241,13 @@ class AudioPipeline:
             self.stats.silent_chunks = 0
 
     def _block_seconds(self, samples: np.ndarray) -> float:
+        """这一块的时长。
+
+        ``samples`` 此时已经降混过：无论原来几声道，第 0 维都是**帧数**，
+        所以直接除以采样率即可（以前这里有个 ``frames = frames`` 的空分支，
+        纯属误写）。
+        """
         frames = samples.shape[0] if samples.ndim > 0 else 0
-        if self.in_channels > 1 and not self.downmix:
-            frames = frames  # 已是帧数
         return frames / self.in_rate if self.in_rate else 0.0
 
 

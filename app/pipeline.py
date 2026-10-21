@@ -39,6 +39,12 @@ from app.utils.log import get_logger
 
 log = get_logger(__name__)
 
+BATCH_WAIT_S = 0.35
+"""攒一批最多等这么久（秒）。
+
+实测「批量比逐条省 70% token」，但也不能为了凑批让字幕干等——0.35 秒在
+人类的观感阈值内，而再长就会让译文明显落后于原文。"""
+
 
 class SubtitlePipeline(QObject):
     """把各模块接起来。所有对外信号都在 Qt 线程可用。"""
@@ -92,6 +98,8 @@ class SubtitlePipeline(QObject):
         self.asr_latency_ms: list[float] = []
         self.translate_latency_ms: list[float] = []
         self._lock = threading.Lock()
+        self._lang_reported = False
+        """识别语种落定后只报一次状态（restart 会复位）。"""
 
     # ------------------------------------------------------------------ #
     # 准备
@@ -297,6 +305,19 @@ class SubtitlePipeline(QObject):
         return self.start(self._target_spec)
 
     def stop(self, timeout: float = 8.0) -> None:
+        """停下采集、冲出最后一句、关掉引擎。
+
+        顺序很关键（以前是错的）：``_stop`` 一置上，翻译线程就准备退出了，
+        可那时候 ``router.finish()`` 里还压着**最后半句**没发出去——
+        先 join 翻译线程再 finish，这句字幕就永远拿不到译文（用户表现为
+        "最后一句话只有原文、没有翻译"）。现在改成：
+
+        1. 停采集（不再有新的 ``feed``）
+        2. ``router.finish()`` 冲出残留 → 投进翻译队列（翻译线程还活着）
+        3. 关识别引擎（否则 ``reload()`` 重建 router 时旧的 onnx session
+           要等 GC 才释放，模型几百 MB，切几次就顶内存）
+        4. 等翻译线程把队列消化完再退出（它的退出条件见 ``_translate_loop``）
+        """
         self._stop.set()
         if self.capture is not None:
             self.capture.stop()
@@ -312,16 +333,33 @@ class SubtitlePipeline(QObject):
                 log.warning("停止标签页通道出错（忽略）: %s", exc)
             finally:
                 self.tab_server = None
+
+        # 采集已停 → 把识别引擎里残留的最后一句冲出来（此时翻译线程还在跑）
+        if self.router is not None:
+            try:
+                for ev in self.router.finish():
+                    self._dispatch(ev)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("冲出残留识别结果失败（忽略）: %s", exc)
+            try:
+                self.router.close()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("关闭识别引擎失败（忽略）: %s", exc)
+            self.router = None
+
         t = self._trans_thread
         if t is not None and t.is_alive():
             t.join(timeout=timeout)
+            if t.is_alive():
+                log.warning("翻译线程 %.1fs 内没退出，不再等待", timeout)
         self._trans_thread = None
-        # 把最后一行未翻译的也冲出去
-        if self.router is not None:
-            for ev in self.router.finish():
-                self._dispatch(ev)
+
         if self.hub is not None:
-            self.hub.close()
+            try:
+                self.hub.close()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("关闭翻译通道失败（忽略）: %s", exc)
+            self.hub = None
 
     # ------------------------------------------------------------------ #
     # 状态
@@ -394,16 +432,18 @@ class SubtitlePipeline(QObject):
     # ------------------------------------------------------------------ #
     def _translate_loop(self) -> None:
         batch_size = max(1, min(8, self.config.translate.max_concurrency))
-        wait_s = max(0.05, self.config.translate.stale_drop_s and 0.35)
 
-        while not self._stop.is_set():
+        # 退出条件里**必须带上"队列是否还有货"**：
+        # stop() 会在置上 _stop 之后才冲出最后一句，若只看 _stop 就会
+        # 把最后一句丢在队列里不管（"最后一句话没翻译"就是这么来的）。
+        while not self._stop.is_set() or not self._queue.empty():
             try:
                 first = self._queue.get(timeout=0.2)
             except queue.Empty:
                 continue
 
             batch = [first]
-            deadline = time.time() + wait_s
+            deadline = time.time() + BATCH_WAIT_S
             while len(batch) < batch_size:
                 remain = deadline - time.time()
                 if remain <= 0:
@@ -414,6 +454,8 @@ class SubtitlePipeline(QObject):
                     break
 
             if self.hub is None:
+                for i, _, _ in batch:
+                    self.translationReceived.emit(i, "", "翻译通道未就绪")
                 continue
 
             segs = [Segment(id=i, text=t, language=lang) for i, t, lang in batch]

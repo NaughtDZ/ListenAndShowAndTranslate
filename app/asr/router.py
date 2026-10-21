@@ -65,16 +65,37 @@ class LanguageRouter:
         self._decided = config.language != "auto"
         self._language = "" if config.language == "auto" else config.language
         self._closed = False
+        self._failed_languages: set[str] = set()
+        """已经确认「这台机器上装不了」的语言。
+
+        不加这个集合会出事：引擎构建失败时 ``_engines`` 里没有条目，
+        于是**每一帧音频**（10ms 一块）都重跑一次完整的降级链——
+        构造 6 个引擎对象、6 次 start 抛异常、6 条 WARNING 日志。
+        实测表现为「日志每秒刷几千行、CPU 莫名跑满」。
+        失败一次就记住，等配置变了重建 router 再试。
+        """
 
     # ------------------------------------------------------------------ #
     def _auto_threads(self) -> int:
-        """默认用物理核数的一半，给游戏留资源。"""
-        import os
+        """默认用**物理核数的一半**，给游戏留资源。
 
+        不能用 ``os.cpu_count() // 4`` 糊弄：那是"逻辑核的四分之一"——
+        在有超线程的机器上恰好等于物理核的一半（碰巧对），
+        在**没有超线程**的机器上就变成物理核的四分之一
+        （4 核只给 1 线程，识别慢得让人莫名其妙）。
+        """
+        physical = 0
         try:
-            return max(1, (os.cpu_count() or 4) // 4)
-        except Exception:  # noqa: BLE001
-            return 2
+            import psutil
+
+            physical = psutil.cpu_count(logical=False) or 0
+        except Exception:  # noqa: BLE001 - 拿不到物理核就退回逻辑核估算
+            physical = 0
+        if not physical:
+            import os
+
+            physical = max(1, (os.cpu_count() or 4) // 2)
+        return max(1, physical // 2)
 
     @property
     def language(self) -> str:
@@ -224,12 +245,17 @@ class LanguageRouter:
         )
 
     def _ensure_engine(self, language: str) -> ASREngine | None:
+        """取（必要时创建）某语言的引擎；**失败过的语言不再重试**。"""
         eng = self._engines.get(language)
         if eng is not None:
             return eng
+        if language in self._failed_languages:
+            return None
         eng = self._create_engine_with_fallback(language)
         if eng is not None:
             self._engines[language] = eng
+        else:
+            self._failed_languages.add(language)
         return eng
 
     # ------------------------------------------------------------------ #
@@ -266,7 +292,9 @@ class LanguageRouter:
         if stable:
             self._log(f"识别到语种：{detected} → 使用 {stable}")
             return stable
-        # 只判到一次，先用它；稳定器后续会纠正
+        # 只判到一次，先用它。
+        # 注意：``auto`` 模式的语种判定是**一次性的**（判完就定了），
+        # 之后不会再用后续音频纠正——直播里换语言需要手动指定语言或重开。
         return detected if detected in allowed else "zh"
 
     # ------------------------------------------------------------------ #
@@ -290,6 +318,9 @@ class LanguageRouter:
             if eng is None:
                 self._pending.clear()
                 self._pending_samples = 0
+                # 标成已判定：否则每攒够 2 秒就重跑一遍 LID + 整条降级链，
+                # 又是一轮"日志刷屏 + CPU 白烧"（见 _failed_languages 的说明）。
+                self._decided = True
                 return [ASREvent(
                     type=ASREventType.ERROR, text="", segment_id=0,
                     error=f"无法为语言 {language} 加载模型",

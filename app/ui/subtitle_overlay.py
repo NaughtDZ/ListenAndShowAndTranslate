@@ -70,12 +70,20 @@ def wrap_text(
 
     lines: list[str] = []
     cur = ""
+    # 逐字符增量累计宽度，而不是每加一个字就把**整行**重新量一遍。
+    # 旧写法 ``fm.horizontalAdvance(cur + ch)`` 是 O(n²)：一句 200 字的字幕
+    # 要做约 2 万次字符宽度查询，而它每 200ms（partial 刷新）就要跑一次，
+    # 还要被 _fit_font_size 逐个字号重跑——实测这是"字幕越长越卡"的主因。
+    # QFontMetrics.horizontalAdvance(文本) 本来就是逐字形宽度相加（不含 kerning），
+    # 所以累加与整体度量等价；断行处再用一次整体度量校正。
+    cur_w = 0.0
     dropped = 0   # 断行时丢弃的空格数：算"已消费多少字符"必须把它算上，
                   # 否则省略号那一步会从错误的位置取剩余文本（实测出现过多一个字母）
     for ch in text:
-        trial = cur + ch
-        if fm.horizontalAdvance(trial) <= max_width:
-            cur = trial
+        ch_w = float(fm.horizontalAdvance(ch))
+        if cur_w + ch_w <= max_width:
+            cur += ch
+            cur_w += ch_w
             continue
 
         # 放不下了，决定从哪儿断
@@ -95,6 +103,7 @@ def wrap_text(
             if ch == " ":
                 dropped += 1
             new_line, cur = cur, ("" if ch == " " else ch)
+        cur_w = float(fm.horizontalAdvance(cur)) if cur else 0.0
 
         if new_line:
             lines.append(new_line)
@@ -304,6 +313,11 @@ class SubtitleOverlay(QWidget):
 
         **每次都从基准字号重新算**，不记"上次缩了多少"——这样长句一被顶走，
         下一帧字号就回到设置值（用户要的正是这个）。
+
+        用**二分**而不是从 base-1 逐个往下试：基准 34pt、下限 20pt 时旧写法要
+        跑 14 次完整换行，基准 60pt 时能跑 40 次；而 ``_relayout()`` 每次
+        partial 都会调用它。二分只要 ~5 次，最后再往上补验几档保证不因
+        非严格单调而选小了。
         """
         base = self.config.font_size
         if not getattr(self.config, "auto_shrink_font", True) or body_h <= 0:
@@ -312,10 +326,21 @@ class SubtitleOverlay(QWidget):
         if self._rows_height(wrap_w, base) <= body_h:
             return base
         floor = self._min_font_size()
-        for size in range(base - 1, floor - 1, -1):
+        lo, hi = floor, base - 1
+        best = floor
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if self._rows_height(wrap_w, mid) <= body_h:
+                best = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        # 二分假设了单调（字号小→占高小），但禁则/省略号可能让它非严格单调；
+        # 往上补验几档，确保拿到的是**最大**可放字号而不是保守解。
+        for size in range(min(base - 1, best + 3), best, -1):
             if self._rows_height(wrap_w, size) <= body_h:
                 return size
-        return floor
+        return best
 
     def _wrap_rows(
         self, width: int, font_size: int
@@ -414,26 +439,31 @@ class SubtitleOverlay(QWidget):
         total = len(visible_rows) * row_h
         y = PADDING + max(0, body_h - total)
 
+        # 字体与度量在循环外建一次：paintEvent 每帧都会跑，
+        # 每行都 `QFontMetrics(self._font(...))` 相当于每行新建一个 QFont
+        # 拷贝 + 一次度量对象初始化（字幕多、刷新快时这部分能占到绘制的可观比例）。
+        body_font = self._font(self._draw_font_size, cfg.bold)
+        body_fm = QFontMetrics(body_font)
+
         for text, is_translation, is_partial in visible_rows:
             if not text:
                 continue
             color = QColor(cfg.target_color if is_translation else cfg.source_color)
             if is_partial:
                 color.setAlphaF(0.6)   # 未定稿：半透明，一眼可辨
-            fm = QFontMetrics(self._font(self._draw_font_size, cfg.bold))
             self._draw_outlined_text(
                 p, text, PADDING, y, w - PADDING * 2, row_h,
-                self._font(self._draw_font_size, cfg.bold), color, cfg, fm,
+                body_font, color, cfg, body_fm,
             )
             y += row_h
 
         if self.show_status and self.status_text:
-            p.setFont(self._font(8, False))
+            status_font = self._font(8, False)
             sc = QColor(255, 255, 255, 140)
             self._draw_outlined_text(
                 p, self.status_text, PADDING, h - status_h - PADDING // 2,
                 w - PADDING * 2, status_h,
-                self._font(8, False), sc, cfg, QFontMetrics(self._font(8, False)),
+                status_font, sc, cfg, QFontMetrics(status_font),
                 outline_width=1,
             )
 

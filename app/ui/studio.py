@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSpinBox,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -102,6 +103,7 @@ class StudioWindow(QMainWindow):
         super().__init__(parent)
         self.config = config or AppConfig.load()
         self.worker: _Worker | None = None
+        self._settings_window = None
         self._paths: set[str] = set()
         self._last_dir = ""
         self.setWindowTitle("听·显·译 · 字幕工坊（离线转写）")
@@ -152,7 +154,7 @@ class StudioWindow(QMainWindow):
         form = QFormLayout(param_box)
 
         self.model_combo = QComboBox()
-        self.model_combo.setToolTip("只列**离线分块**模型：它们不吃流式，整句识别最准。")
+        self.model_combo.setToolTip("只列离线分块模型：它们不吃流式，整句识别最准。")
         self._fill_models()
         form.addRow("识别模型", self.model_combo)
 
@@ -238,12 +240,27 @@ class StudioWindow(QMainWindow):
             self.mode_combo.addItem(label, mode)
         out_form.addRow("输出内容", self.mode_combo)
 
-        self.translate_check = QCheckBox("调用 LLM 翻译字幕（用设置里已配置的翻译通道）")
+        trans_row = QHBoxLayout()
+        self.translate_check = QCheckBox("调用 LLM 翻译字幕")
         self.translate_check.setToolTip(
-            "识别完再用「设置 → 翻译」里配置的通道逐句翻译。\n"
+            "识别完再用已配置的翻译通道逐句翻译。\n"
             "翻译会按批送、走缓存，失败的行会保留原文并在日志里报告。"
         )
-        out_form.addRow("", self.translate_check)
+        self.settings_btn = QPushButton("翻译设置…")
+        self.settings_btn.setToolTip(
+            "配置翻译通道：LLM（LM Studio / Ollama / 在线 API）或传统翻译 API。\n"
+            "独立打开字幕工坊时，这里是唯一的配置入口。"
+        )
+        self.settings_btn.clicked.connect(self._open_translate_settings)
+        trans_row.addWidget(self.translate_check, 1)
+        trans_row.addWidget(self.settings_btn)
+        out_form.addRow("", self._wrap(trans_row))
+
+        self.translate_status = QLabel()
+        self.translate_status.setWordWrap(True)
+        self.translate_status.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        out_form.addRow("", self.translate_status)
+        self._refresh_translate_status()
 
         self.target_combo = QComboBox()
         for code, label in TARGET_LANGUAGES:
@@ -355,12 +372,41 @@ class StudioWindow(QMainWindow):
         self.file_list.addItem(item)
         return 1
 
+    MAX_DROPPED_FILES = 500
+    """一次拖放/选文件夹最多收几个文件。
+
+    以前是 ``rglob("*")`` 无上限：用户不小心把整个盘符或一个几万文件的素材库
+    拖进来，UI 线程会连着遍历几十秒，窗口假死（用户会以为程序崩了）。
+    """
+
+    MAX_SCANNED_ENTRIES = 20000
+    """遍历时最多看多少个目录项（防止全是非媒体文件的深目录把界面拖死）。"""
+
     def _add_path(self, path: Path) -> int:
         if path.is_dir():
             added = 0
-            for child in sorted(path.rglob("*")):
-                if child.is_file() and child.suffix.lower() in self._media_exts():
-                    added += self._add_file(child)
+            scanned = 0
+            try:
+                # 不用 sorted()：它会把整棵目录树先物化成列表，
+                # 大目录下这一下就够卡死界面了；队列顺序本来也不重要。
+                for child in path.rglob("*"):
+                    scanned += 1
+                    if added >= self.MAX_DROPPED_FILES:
+                        self._append_log(
+                            f"⚠️ 单次最多加入 {self.MAX_DROPPED_FILES} 个文件，"
+                            "其余已忽略（可以分批加，或先选更小的子目录）"
+                        )
+                        break
+                    if scanned > self.MAX_SCANNED_ENTRIES:
+                        self._append_log(
+                            f"⚠️ 这个文件夹太大（已看过 {self.MAX_SCANNED_ENTRIES} 项），"
+                            f"只加入了前 {added} 个媒体文件；建议分文件夹处理"
+                        )
+                        break
+                    if child.is_file() and child.suffix.lower() in self._media_exts():
+                        added += self._add_file(child)
+            except OSError as exc:
+                self._append_log(f"✗ 遍历文件夹出错：{exc}")
             return added
         return self._add_file(path)
 
@@ -403,6 +449,70 @@ class StudioWindow(QMainWindow):
         folder = QFileDialog.getExistingDirectory(self, "选择输出目录", self._last_dir)
         if folder:
             self.out_edit.setText(folder)
+
+    # ------------------------------------------------------------------ #
+    # 翻译通道
+    # ------------------------------------------------------------------ #
+    def _provider_summary(self) -> tuple[str, bool]:
+        """返回 ``(人话描述, 是否已配好)``。"""
+        cfg = self.config.translate
+        provider = (getattr(cfg, "provider", "") or "none").strip()
+        if provider == "none":
+            return "还没配置翻译通道", False
+        if provider.startswith("llm"):
+            llm = cfg.llm
+            if not getattr(llm, "enabled", False):
+                return "LLM 通道未启用", False
+            model = (getattr(llm, "model", "") or "").strip()
+            base = (getattr(llm, "base_url", "") or "").strip()
+            if not model or not base:
+                return "LLM 的地址或模型名没填", False
+            return f"翻译通道：LLM（{model}）", True
+        return f"翻译通道：{provider}", True
+
+    def _translate_ready(self) -> bool:
+        return self._provider_summary()[1]
+
+    def _refresh_translate_status(self) -> None:
+        text, ready = self._provider_summary()
+        if ready:
+            self.translate_status.setText(text)
+            self.translate_status.setStyleSheet("color:#2c7a4b;")
+        else:
+            self.translate_status.setText(
+                f"⚠️ {text} —— 点右边「翻译设置…」配一个，否则只会输出原文"
+            )
+            self.translate_status.setStyleSheet("color:#c0392b;")
+
+    def _open_translate_settings(self) -> None:
+        """打开主设置窗并直接落到「翻译」页。
+
+        独立打开字幕工坊时，这是**唯一**能配置翻译通道的入口——
+        之前界面只写了"用设置里已配置的通道"，却没地方打开设置。
+        """
+        from app.ui.settings import SettingsWindow
+
+        win = SettingsWindow(self.config)
+        win.setWindowTitle("设置 · 翻译通道")
+        win.setWindowModality(Qt.ApplicationModal)
+        win.saved.connect(self._on_settings_saved)
+
+        tabs = win.findChild(QTabWidget)
+        if tabs is not None:
+            for index in range(tabs.count()):
+                if "翻译" in tabs.tabText(index):
+                    tabs.setCurrentIndex(index)
+                    break
+
+        self._settings_window = win  # 持有引用，免得被回收
+        win.show()
+        win.raise_()
+        win.activateWindow()
+
+    def _on_settings_saved(self) -> None:
+        # 设置窗保存后从磁盘重读，确保拿到新配置（它可能改了 provider / llm 等）
+        self.config = AppConfig.load()
+        self._refresh_translate_status()
 
     # ------------------------------------------------------------------ #
     # 拖放
@@ -470,6 +580,16 @@ class StudioWindow(QMainWindow):
                 "这样导出会只有原文。要继续吗？",
             )
             if answer != QMessageBox.Yes:
+                return
+
+        if options.translate and not self._translate_ready():
+            answer = QMessageBox.question(
+                self, "翻译通道还没配好",
+                "勾了「调用 LLM 翻译」，但目前没有可用的翻译通道。\n\n"
+                "现在去配置吗？（不配也可以继续，只是只会输出原文）",
+            )
+            if answer == QMessageBox.Yes:
+                self._open_translate_settings()
                 return
 
         self.log_view.clear()

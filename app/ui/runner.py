@@ -13,7 +13,7 @@ from __future__ import annotations
 import time
 from typing import TYPE_CHECKING
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -505,10 +505,13 @@ def run_subtitles(
     elif not pipeline.start(spec):
         control.status_label.setText("状态: 启动失败")
 
-    # 字幕落定后滚动到底（累积模式下自动往下走）
-    scroll_timer = QTimer()
-    scroll_timer.timeout.connect(lambda: overlay.update())
-    scroll_timer.start(500)
+    # 字幕重绘是**事件驱动**的：`on_partial` / `on_final` / `on_translation`
+    # 都会调 overlay.update_state()，那里面已经 _relayout() + update()。
+    #
+    # 以前这里还有一个 500ms 的 QTimer 无条件 overlay.update()，本意是"累积模式下
+    # 自动滚动到底"，但它带来的效果是：**只要程序开着，悬浮窗每秒被强制重绘 2 次**，
+    # 哪怕一个字都没变——玩游戏时这就是白烧 GPU（无边框全屏下尤其明显）。
+    # 滚动本身由 _relayout() 里"底部对齐"的布局算出来，不靠定时器。
 
     if tab_mode:
         print("字幕已启动（浏览器标签页模式）。")
