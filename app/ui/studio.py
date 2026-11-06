@@ -256,6 +256,20 @@ class StudioWindow(QMainWindow):
         trans_row.addWidget(self.settings_btn)
         out_form.addRow("", self._wrap(trans_row))
 
+        self.keep_glossary_check = QCheckBox(
+            "专名表跨文件保持（整批任务共用，结束才丢）"
+        )
+        self.keep_glossary_check.setChecked(True)
+        self.keep_glossary_check.setToolTip(
+            "批量处理同一部剧的多集时勾上：第 1 集学到的人名，第 2 集直接沿用，\n"
+            "既省请求，也不会出现「第 1 集叫林凡、第 2 集叫林繁」。\n"
+            "不勾则每个文件单独建表（各集之间不共享）。\n"
+            "无论勾不勾，表都只在本次任务内存在，不落盘。"
+        )
+        self.keep_glossary_check.setEnabled(self.translate_check.isChecked())
+        out_form.addRow("", self.keep_glossary_check)
+        self.translate_check.toggled.connect(self.keep_glossary_check.setEnabled)
+
         self.translate_status = QLabel()
         self.translate_status.setWordWrap(True)
         self.translate_status.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -563,6 +577,7 @@ class StudioWindow(QMainWindow):
             max_line_width=float(self.width_spin.value()),
             out_dir=self.out_edit.text().strip(),
             translate=self.translate_check.isChecked(),
+            keep_glossary=self.keep_glossary_check.isChecked(),
             target_language=self.target_combo.currentData() or "zh",
             overwrite=self.overwrite_check.isChecked(),
         )

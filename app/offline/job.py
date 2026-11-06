@@ -63,7 +63,18 @@ class JobOptions:
     translate: bool = False
     target_language: str = "zh"
     translate_batch: int = 8
-    """一批送多少条去翻译（批量能显著省 token，见 docs/P4-翻译实测.md）。"""
+    """一批送多少条去翻译（批量能显著省 token，见 docs/P4-翻译实测.md）。
+
+    ⚠️ 只在"单次预算 = 不限"档时生效；选了 4k/8k/16k 预算时由预算决定批大小。
+    """
+
+    keep_glossary: bool = True
+    """批量任务里是否**跨文件**保持临时专名表（「边翻译边总结」）。
+
+    同一部剧的分集人名当然一样：每集重新学一遍既浪费请求，又会出现
+    "第 1 集叫林凡、第 2 集叫林繁"。勾上后整批任务共用一张表，
+    **批次结束（`run()` 返回）才丢弃**——仍然不落盘。
+    """
 
     overwrite: bool = True
 
@@ -129,24 +140,50 @@ class SubtitleJob:
         transcriber.load()
 
         hub = None
+        shared_glossary = None
         if options.translate:
-            hub = self._build_hub()
+            hub = self._build_hub()          # 它会确保 self.config 已加载
+            if options.keep_glossary:
+                shared_glossary = self._make_runtime_glossary(self._user_glossary())
+                if shared_glossary is not None and total > 1:
+                    self._log(
+                        f"专名表：整批 {total} 个文件共用一张（批次结束才丢弃）"
+                    )
 
         try:
             for index, path in enumerate(files):
                 if self.cancel.is_set():
                     self._log("已取消")
                     break
-                result.files.append(self._one_file(path, index, total, transcriber, hub))
+                result.files.append(
+                    self._one_file(
+                        path, index, total, transcriber, hub,
+                        shared_glossary=shared_glossary,
+                    )
+                )
         finally:
             transcriber.close()
+
+        if shared_glossary is not None and len(shared_glossary):
+            self._log(
+                f"批次结束，临时专名表丢弃（共 {len(shared_glossary)} 条）："
+                f"{shared_glossary.describe()}"
+            )
 
         result.elapsed_s = time.perf_counter() - started
         self._progress(1.0, f"完成（{len(result.outputs)} 个文件）")
         return result
 
     # ------------------------------------------------------------------ #
-    def _one_file(self, path: Path, index: int, total: int, transcriber: Transcriber, hub) -> FileResult:
+    def _one_file(
+        self,
+        path: Path,
+        index: int,
+        total: int,
+        transcriber: Transcriber,
+        hub,
+        shared_glossary=None,
+    ) -> FileResult:
         started = time.perf_counter()
         item = FileResult(source=path)
         base = index / total
@@ -181,7 +218,8 @@ class SubtitleJob:
 
             if self.options.translate and cues:
                 item.translated, item.failed = self._translate(
-                    cues, hub, base + span * TRANSCRIBE_SHARE, span * TRANSLATE_SHARE
+                    cues, hub, base + span * TRANSCRIBE_SHARE, span * TRANSLATE_SHARE,
+                    runtime=shared_glossary,
                 )
 
             if self.options.max_line_width and self.options.max_line_width > 0:
@@ -217,7 +255,14 @@ class SubtitleJob:
             self._log(f"翻译通道：{note}")
         return hub
 
-    def _translate(self, cues: list[Cue], hub, base: float, span: float) -> tuple[int, int]:
+    def _translate(
+        self,
+        cues: list[Cue],
+        hub,
+        base: float,
+        span: float,
+        runtime=None,
+    ) -> tuple[int, int]:
         """按 token 预算分批翻译。
 
         以前是固定 8 条一批，和模型的真实窗口毫无关系。现在从
@@ -226,6 +271,10 @@ class SubtitleJob:
         5090 上 32k 预算能到 :data:`~app.translate.openai_compat.MAX_BATCH_ITEMS`。
 
         预算为 0（"不限"档）时退回旧的固定 ``translate_batch`` 条。
+
+        Args:
+            runtime: **整个批次共用**的临时专名表（``keep_glossary`` 勾上时由
+                ``run()`` 建好传进来）；不传就在本文件内新建一张，文件处理完即丢。
         """
         from app.translate.base import Segment
         from app.translate.budget import estimate_overhead_tokens, plan_batches
@@ -244,13 +293,10 @@ class SubtitleJob:
         ]
 
         budget = 0
-        glossary: dict[str, str] = {}
+        glossary = self._user_glossary()
         cfg = self.config
         if cfg is not None:
             budget = int(getattr(cfg.translate.llm, "input_budget_tokens", 0) or 0)
-            raw_glossary = cfg.translate.glossary if isinstance(cfg.translate.glossary, dict) else {}
-            # 下划线开头的是元数据（_path 之类），不参与估值
-            glossary = {k: v for k, v in raw_glossary.items() if not k.startswith("_")}
 
         if budget > 0:
             batches = plan_batches(
@@ -263,7 +309,9 @@ class SubtitleJob:
             batches = [segments[i:i + size] for i in range(0, total, size)]
 
         done = 0
-        runtime = self._make_runtime_glossary(glossary)
+        # 没传共享表（单文件 / 没勾"跨文件保持"）就为本文件新建一张
+        if runtime is None:
+            runtime = self._make_runtime_glossary(glossary)
 
         for index, batch in enumerate(batches):
             if self.cancel.is_set():
@@ -306,10 +354,19 @@ class SubtitleJob:
             )
 
         if runtime is not None and len(runtime):
-            self._log(f"  · 临时术语表（任务结束即丢弃）：{runtime.describe()}")
+            self._log(f"  · 专名表：{runtime.describe()}")
         if failed:
             self._log(f"  ! {failed} 条没拿到译文（其余照常写出原文）")
         return ok, failed
+
+    # ------------------------------------------------------------------ #
+    def _user_glossary(self) -> dict[str, str]:
+        """用户手填的术语表（去掉 ``_path`` 之类的元数据键）。"""
+        cfg = self.config
+        if cfg is None:
+            return {}
+        raw = cfg.translate.glossary if isinstance(cfg.translate.glossary, dict) else {}
+        return {k: v for k, v in raw.items() if not k.startswith("_")}
 
     # ------------------------------------------------------------------ #
     def _make_runtime_glossary(self, user_glossary: dict[str, str]):

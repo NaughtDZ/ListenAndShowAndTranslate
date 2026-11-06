@@ -400,3 +400,147 @@ def test_job_refreshes_glossary_and_injects_it():
     assert hub.extract_calls >= 1, "应该至少问过一次译名"
     # 第一批时还没有可学的，所以第一批注入为空；后面某批必须带上
     assert any(g for g in hub.glossaries), hub.glossaries
+
+
+# --------------------------------------------------------------------------- #
+# 批量任务：专名表要不要跨文件
+# --------------------------------------------------------------------------- #
+def test_translate_reuses_shared_runtime():
+    """传入共享表时，`_translate` 直接用它，且它学到的词会注入后续批。"""
+    from app.config import AppConfig
+    from app.offline.cue import Cue
+    from app.offline.job import JobOptions, SubtitleJob
+
+    class _FakeHub:
+        def __init__(self) -> None:
+            self.glossaries: list[dict] = []
+
+        def translate(self, segments, **kw):
+            self.glossaries.append(dict(kw.get("extra_glossary") or {}))
+            out = TranslateResult()
+            for seg in segments:
+                out.translations[seg.id] = "译"
+            return out
+
+        def extract_names(self, candidates, samples):
+            return {}
+
+    cfg = AppConfig()
+    cfg.translate.provider = "llm"
+    cfg.translate.llm.input_budget_tokens = 0
+    job = SubtitleJob(JobOptions(translate=True, translate_batch=5), config=cfg)
+
+    shared = job._make_runtime_glossary({})
+    shared.learn({"リンファン": "林凡"})      # 模拟"上一个文件"学到的
+
+    hub = _FakeHub()
+    cues = [Cue(start_s=i, end_s=i + 1, text="リンファンは走った。") for i in range(10)]
+    job._translate(cues, hub, base=0.0, span=1.0, runtime=shared)
+
+    assert any(g.get("リンファン") == "林凡" for g in hub.glossaries), hub.glossaries
+
+
+def test_translate_creates_private_runtime_when_not_shared():
+    """不传共享表 → 本文件新建一张，**外面拿不到**（各文件互不影响）。"""
+    from app.config import AppConfig
+    from app.offline.cue import Cue
+    from app.offline.job import JobOptions, SubtitleJob
+
+    class _FakeHub:
+        def __init__(self) -> None:
+            self.glossaries: list[dict] = []
+
+        def translate(self, segments, **kw):
+            self.glossaries.append(dict(kw.get("extra_glossary") or {}))
+            out = TranslateResult()
+            for seg in segments:
+                out.translations[seg.id] = "译"
+            return out
+
+        def extract_names(self, candidates, samples):
+            return {}
+
+    cfg = AppConfig()
+    cfg.translate.provider = "llm"
+    cfg.translate.llm.input_budget_tokens = 0
+    job = SubtitleJob(JobOptions(translate=True, translate_batch=5), config=cfg)
+
+    hub = _FakeHub()
+    cues = [Cue(start_s=i, end_s=i + 1, text="短い。") for i in range(5)]
+    job._translate(cues, hub, base=0.0, span=1.0)      # 不传 runtime
+
+    # 私有表里没学到东西，所以注入为空；关键是调用没炸、也没往外泄漏
+    assert hub.glossaries == [{}]
+
+
+class _FakeTranscriber:
+    def __init__(self, *a, **kw) -> None:
+        pass
+
+    def load(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+def _run_with_fake_transcriber(monkeypatch, job, paths):
+    """跑 `run()`，但把识别器换掉、把 `_one_file` 换成记录器。"""
+    from app.offline.job import FileResult
+
+    seen: list = []
+
+    def fake_one_file(path, index, total, transcriber, hub, shared_glossary=None):
+        seen.append(shared_glossary)
+        return FileResult(source=path)
+
+    monkeypatch.setattr("app.offline.job.Transcriber", _FakeTranscriber)
+    monkeypatch.setattr(job, "_build_hub", lambda: object())
+    monkeypatch.setattr(job, "_one_file", fake_one_file)
+    job.run(paths)
+    return seen
+
+
+def test_run_shares_one_glossary_for_whole_batch(monkeypatch):
+    """勾上「跨文件保持」：整批任务共用**同一个**表对象。
+
+    同一部剧的分集人名当然一样——每集重新学既浪费请求，又会出现
+    "第 1 集叫林凡、第 2 集叫林繁"。
+    """
+    from app.offline.job import JobOptions, SubtitleJob
+
+    job, _cfg = _job_with_provider("llm")
+    job.options = JobOptions(translate=True, keep_glossary=True)
+
+    seen = _run_with_fake_transcriber(monkeypatch, job, ["a.mp3", "b.mp3", "c.mp3"])
+
+    assert len(seen) == 3
+    assert seen[0] is not None
+    assert seen[0] is seen[1] is seen[2], "三集必须是同一张表"
+
+
+def test_run_does_not_share_when_unchecked(monkeypatch):
+    """不勾：每个文件各自新建（`shared_glossary` 都是 None，由 `_translate` 自己建）。"""
+    from app.offline.job import JobOptions, SubtitleJob
+
+    job, _cfg = _job_with_provider("llm")
+    job.options = JobOptions(translate=True, keep_glossary=False)
+
+    seen = _run_with_fake_transcriber(monkeypatch, job, ["a.mp3", "b.mp3"])
+
+    assert seen == [None, None]
+
+
+def test_run_glossary_is_not_persisted(monkeypatch):
+    """批次结束后表就丢：不落盘、下一个批次是全新一张。"""
+    from app.offline.job import JobOptions, SubtitleJob
+
+    job, _cfg = _job_with_provider("llm")
+    job.options = JobOptions(translate=True, keep_glossary=True)
+
+    first = _run_with_fake_transcriber(monkeypatch, job, ["a.mp3"])[0]
+    first.learn({"甲": "甲某"})
+
+    second = _run_with_fake_transcriber(monkeypatch, job, ["b.mp3"])[0]
+    assert second is not first
+    assert second.entries == {}
