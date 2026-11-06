@@ -31,6 +31,13 @@ TRANSCRIBE_SHARE = 0.70
 TRANSLATE_SHARE = 0.20
 EXPORT_SHARE = 0.10
 
+MAX_TRANSLATE_BATCH = 400
+"""单批最多几条字幕（与 ``openai_compat.MAX_BATCH_ITEMS`` 对齐）。
+
+预算再大也不放开了：400 条的输出已经要 8000 token 量级，单次生成时间很长，
+中途失败整批白干；而且模型漏条的概率随条数线性上升。
+"""
+
 
 @dataclass
 class JobOptions:
@@ -208,45 +215,75 @@ class SubtitleJob:
         return hub
 
     def _translate(self, cues: list[Cue], hub, base: float, span: float) -> tuple[int, int]:
+        """按 token 预算分批翻译。
+
+        以前是固定 8 条一批，和模型的真实窗口毫无关系。现在从
+        ``config.translate.llm.input_budget_tokens`` 读预算（4096 / 8192 /
+        16384 / 32768），按预算算出一批送多少条——8G 小显存约 100 条，
+        5090 上 32k 预算能到 :data:`~app.translate.openai_compat.MAX_BATCH_ITEMS`。
+
+        预算为 0（"不限"档）时退回旧的固定 ``translate_batch`` 条。
+        """
         from app.translate.base import Segment
+        from app.translate.budget import estimate_overhead_tokens, plan_batches
 
         if hub is None:
             return 0, len(cues)
 
-        batch = max(1, int(self.options.translate_batch))
         source_language = self.options.transcribe.language or "auto"
         target = self.options.target_language
         ok = failed = 0
         total = len(cues)
 
-        for start in range(0, total, batch):
+        segments = [
+            Segment(id=i, text=cue.text, language=source_language)
+            for i, cue in enumerate(cues)
+        ]
+
+        budget = 0
+        glossary: dict[str, str] = {}
+        cfg = self.config
+        if cfg is not None:
+            budget = int(getattr(cfg.translate.llm, "input_budget_tokens", 0) or 0)
+            raw_glossary = cfg.translate.glossary if isinstance(cfg.translate.glossary, dict) else {}
+            # 下划线开头的是元数据（_path 之类），不参与估值
+            glossary = {k: v for k, v in raw_glossary.items() if not k.startswith("_")}
+
+        if budget > 0:
+            batches = plan_batches(
+                segments, budget,
+                overhead_tokens=estimate_overhead_tokens(glossary=glossary),
+                max_items=MAX_TRANSLATE_BATCH,
+            )
+        else:
+            size = max(1, int(self.options.translate_batch))
+            batches = [segments[i:i + size] for i in range(0, total, size)]
+
+        done = 0
+        for batch in batches:
             if self.cancel.is_set():
                 break
-            chunk = cues[start : start + batch]
-            segments = [
-                Segment(id=i, text=cue.text, language=source_language)
-                for i, cue in enumerate(chunk)
-            ]
             try:
                 result = hub.translate(
-                    segments, source_language=source_language, target_language=target
+                    batch, source_language=source_language, target_language=target
                 )
             except Exception as exc:  # noqa: BLE001 - hub 号称不抛，但别赌
                 log.exception("翻译失败")
                 result = None
                 self._log(f"  ! 翻译出错：{exc}")
 
-            for i, cue in enumerate(chunk):
-                text = result.translations.get(i, "") if result else ""
+            for seg in batch:
+                cue = cues[seg.id]
+                text = result.translations.get(seg.id, "") if result else ""
                 if text:
                     cue.translation = text
                     ok += 1
                 else:
                     failed += 1
-                    if result and i in result.failures:
-                        log.debug("翻译失败原因：%s", result.failures[i])
+                    if result and seg.id in result.failures:
+                        log.debug("翻译失败原因：%s", result.failures[seg.id])
 
-            done = min(total, start + len(chunk))
+            done = min(total, done + len(batch))
             self._progress(
                 base + span * (done / total),
                 f"翻译 {done}/{total}" + (f"（失败 {failed}）" if failed else ""),

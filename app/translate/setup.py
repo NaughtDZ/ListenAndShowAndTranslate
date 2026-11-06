@@ -47,6 +47,8 @@ def build_translator_hub(
                     prompt_style=getattr(llm, "prompt_style", "") or "",
                     # 思考默认关（字幕翻译不需要思考，且会把预算烧光导致空译文）
                     disable_thinking=getattr(llm, "disable_thinking", True),
+                    # 单次请求的输入预算：决定"一批送多少条 + 带多少前文"
+                    input_budget_tokens=getattr(llm, "input_budget_tokens", 0),
                 )
             except Exception as exc:  # noqa: BLE001 - 配错凭据不该让整个流程起不来
                 notes.append(f"LLM({llm.model}): 构造失败 {exc}")

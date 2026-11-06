@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import re
 import time
+from dataclasses import replace
 from functools import lru_cache
 from urllib.parse import urlparse
 
@@ -38,6 +39,13 @@ from app.translate.base import (
     TranslateResult,
     TranslatorStats,
 )
+from app.translate.budget import (
+    estimate_context_tokens,
+    estimate_overhead_tokens,
+    estimate_segments_tokens,
+    output_tokens_for,
+    plan_batches,
+)
 from app.translate.prompts import build_messages
 from app.utils.log import get_logger
 
@@ -45,6 +53,20 @@ log = get_logger(__name__)
 
 DEFAULT_BATCH_SIZE = 5
 MAX_RETRY_MULTIPLIER = 4
+
+MAX_BATCH_ITEMS = 400
+"""单批最多几条字幕（即使预算再大也别超过它）。
+
+为什么是 400：短字幕（约 20 字/条）400 条 ≈ 9000 token 输入、约 8000 token 输出，
+已经是主流模型单次生成的上限量级。再往上，单次生成时间会长到"中途失败就白干"，
+而且模型漏条的概率随条数线性上升（漏一条就触发二分重试，整批重来）。
+
+⚠️ 短字幕会**先撞到这个条数上限**（而不是撞 token 预算）——预算开到 16k/32k 的
+收益主要体现在长字幕（每条 50~100 字）上。
+"""
+
+MAX_SPLIT_DEPTH = 6
+"""编号解析失败时最多二分几层（200 → 3 条左右就够定位问题了）。"""
 
 _NUMBERED_RE = re.compile(r"^\s*(\d{1,3})\s*[.、)．:：]\s*(.*)$")
 
@@ -302,6 +324,7 @@ class OpenAICompatTranslator:
         verify_glossary: bool = True,
         prompt_style: str = "",
         name: str = "llm",
+        input_budget_tokens: int = 0,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
@@ -310,6 +333,8 @@ class OpenAICompatTranslator:
         self.max_tokens = max_tokens
         self.timeout_s = timeout_s
         self.batch_size = max(1, batch_size)
+        self.input_budget_tokens = max(0, int(input_budget_tokens))
+        """输入 token 预算；``0`` = 退回固定 ``batch_size`` 的老行为。"""
         self.disable_thinking = disable_thinking
         self.verify_glossary = verify_glossary
         # "chat" = 指令模型（走完整模板）；"plain" = 微调翻译模型（只喂原文）
@@ -359,6 +384,48 @@ class OpenAICompatTranslator:
         return False, "无法连接或没有可用模型"
 
     # ------------------------------------------------------------------ #
+    def _plan_batches(
+        self, segments: list[Segment], glossary: dict[str, str]
+    ) -> list[list[Segment]]:
+        """决定"这一批送多少条"。
+
+        有 token 预算就按预算算（4k 预算大约能塞 100~150 条短字幕，
+        32k 能塞到 ``MAX_BATCH_ITEMS`` 上限）；没预算才退回固定的
+        ``batch_size``（老行为，只为兼容）。
+        """
+        if self.input_budget_tokens <= 0:
+            return [
+                segments[i:i + self.batch_size]
+                for i in range(0, len(segments), self.batch_size)
+            ]
+        return plan_batches(
+            segments,
+            self.input_budget_tokens,
+            overhead_tokens=estimate_overhead_tokens(glossary=glossary),
+            max_items=MAX_BATCH_ITEMS,
+        )
+
+    def _out_tokens(self, request: TranslateRequest) -> int:
+        """这一批该给多少输出 token。
+
+        ``max_tokens=0``（默认）= 按这批实际大小推导；``>0`` 时按用户的硬上限，
+        但明显不够时会告警——宁可吵一句，也不要静默截断一半译文。
+        """
+        need = output_tokens_for(
+            estimate_segments_tokens(request.segments)
+            + estimate_context_tokens(request.context)
+            + estimate_overhead_tokens(glossary=request.glossary)
+        )
+        if self.max_tokens <= 0:
+            return need
+        if self.max_tokens < need // 2:
+            log.warning(
+                "输出上限 %d 对这批 %d 条来说偏小（建议 %d），译文可能被截断",
+                self.max_tokens, len(request.segments), need,
+            )
+        return self.max_tokens
+
+    # ------------------------------------------------------------------ #
     def translate(self, request: TranslateRequest) -> TranslateResult:
         """翻译一批字幕。**不抛异常**，失败写进 failures。"""
         t0 = time.monotonic()
@@ -369,9 +436,9 @@ class OpenAICompatTranslator:
 
         source_chars = sum(len(s.text) for s in segments)
 
-        # 按 batch_size 切批
-        for i in range(0, len(segments), self.batch_size):
-            batch = segments[i:i + self.batch_size]
+        # 切批：有预算时一批可能是几十上百条（省 token、上下文更好），
+        # 没预算时退回固定 5 条。
+        for batch in self._plan_batches(segments, request.glossary):
             sub = TranslateRequest(
                 segments=batch,
                 source_language=request.source_language,
@@ -394,13 +461,19 @@ class OpenAICompatTranslator:
         return result
 
     # ------------------------------------------------------------------ #
-    def _translate_batch(self, request: TranslateRequest) -> TranslateResult:
-        """翻一批；内部按"批量 → 加大预算 → 逐条"逐级降级。"""
+    def _translate_batch(
+        self, request: TranslateRequest, depth: int = 0
+    ) -> TranslateResult:
+        """翻一批；内部按"批量 → 二分 → 加大预算 → 逐条"逐级降级。
+
+        ``depth`` 是二分重试的层数（见 :data:`MAX_SPLIT_DEPTH`）。
+        """
         batch = request.segments
         out = TranslateResult(provider=self.name, model=self.model)
+        out_tokens = self._out_tokens(request)
 
         # ---- 第 1 级：批量 ----
-        content, usage, truncated = self._call(request, self.max_tokens)
+        content, usage, truncated = self._call(request, out_tokens)
         if content:
             if len(batch) == 1:
                 # 单条时模型偶尔还是会带"1. "前缀（我们提示词要求不加，但它不一定听）。
@@ -419,6 +492,25 @@ class OpenAICompatTranslator:
                     for idx, seg in enumerate(batch, start=1):
                         out.translations[seg.id] = parsed[idx]
                 else:
+                    # 解析不出来**先二分**，不要直接掉到逐条：
+                    # 一次送 100 条时只要模型漏了一条，逐条就是 100 次请求
+                    # （几分钟 + 100 倍的 token 开销）。二分能把问题迅速缩到
+                    # 很小一块，最多 MAX_SPLIT_DEPTH 层就到 1~3 条。
+                    if len(batch) > 1 and depth < MAX_SPLIT_DEPTH:
+                        mid = len(batch) // 2
+                        log.info(
+                            "编号解析失败（%d 条），二分重试：%d + %d",
+                            len(batch), mid, len(batch) - mid,
+                        )
+                        out.note = "编号解析失败，已二分重试"
+                        out.retries += 1
+                        for part in (batch[:mid], batch[mid:]):
+                            out.merge(
+                                self._translate_batch(
+                                    replace(request, segments=part), depth + 1
+                                )
+                            )
+                        return out
                     out.note = "编号解析失败，已改为逐条翻译"
                     out.retries += 1
                     log.info("批量输出无法按编号解析，退回逐条（%d 条）", len(batch))
@@ -458,7 +550,7 @@ class OpenAICompatTranslator:
             #     实测有的服务端不吃 chat_template_kwargs，但认这个软开关。
             log.warning("空译文（疑似思考占满预算），用 /no_think 硬关思考重试一次")
             out.retries += 1
-            content_nt, usage_nt, _ = self._call(request, self.max_tokens, no_think=True)
+            content_nt, usage_nt, _ = self._call(request, out_tokens, no_think=True)
             out.prompt_tokens += usage_nt.get("prompt_tokens", 0)
             out.completion_tokens += usage_nt.get("completion_tokens", 0)
             if content_nt:
@@ -483,10 +575,10 @@ class OpenAICompatTranslator:
                     return out
 
         if truncated:
-            bigger = min(self.max_tokens * MAX_RETRY_MULTIPLIER, 16384)
+            bigger = min(max(out_tokens * 2, 1024), 32768)
             log.warning(
                 "空译文且输出被截断（很可能是推理模型把预算用在思考上），"
-                "把 max_tokens 从 %d 提到 %d 重试", self.max_tokens, bigger,
+                "把 max_tokens 从 %d 提到 %d 重试", out_tokens, bigger,
             )
             out.retries += 1
             content2, usage2, _ = self._call(request, bigger)

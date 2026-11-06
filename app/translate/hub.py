@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 
 from app.config import TranslateConfig
 from app.translate.base import Segment, TranslateRequest, TranslateResult, Translator
+from app.translate.budget import trim_context
 from app.translate.cache import TranslationCache, cache_key
 from app.translate.glossary import Glossary
 from app.utils.log import get_logger
@@ -31,6 +32,15 @@ log = get_logger(__name__)
 FAILURE_THRESHOLD = 3
 # 熔断后多久再试（秒）
 COOLDOWN_S = 60.0
+
+CONTEXT_HARD_CAP = 512
+"""前文缓存最多留多少行。
+
+为什么不直接用 ``context_lines`` 当 maxlen：那个是"用户想要几行前文"，
+而在 token 预算模式下，**大窗口可以带更多**（32k 预算约能带 300+ 行）。
+所以缓存按 512 行的硬顶留着，真正送多少由 :meth:`TranslatorHub._budgeted_context`
+按预算裁。
+"""
 
 
 @dataclass
@@ -115,7 +125,7 @@ class TranslatorHub:
 
         self._providers: dict[str, ProviderSlot] = {}
         self._lock = threading.Lock()
-        self._context: deque[tuple[str, str]] = deque(maxlen=max(0, config.context_lines))
+        self._context: deque[tuple[str, str]] = deque(maxlen=CONTEXT_HARD_CAP)
         self._day = time.strftime("%Y-%m-%d")
         self._chars_today = 0
 
@@ -162,15 +172,36 @@ class TranslatorHub:
     # ------------------------------------------------------------------ #
     def set_context(self, pairs: list[tuple[str, str]]) -> None:
         self._context.clear()
-        for p in pairs[-self._context.maxlen:] if self._context.maxlen else []:
+        for p in pairs[-CONTEXT_HARD_CAP:]:
             self._context.append(p)
 
     def add_context(self, source: str, translation: str) -> None:
-        if self._context.maxlen and source and translation:
+        if source and translation:
             self._context.append((source, translation))
 
     def recent_context(self) -> list[tuple[str, str]]:
         return list(self._context)
+
+    def _budgeted_context(self) -> list[tuple[str, str]]:
+        """决定这次请求带多少前文。
+
+        * **预算模式**（``input_budget_tokens > 0``）：按预算裁，前文最多占
+          预算的 1/3。4k 约 40 行、16k 约 170 行、32k 约 340 行——
+          大窗口终于能用上"更多前文"这件事。
+        * **预算为 0**（"不限"档 / 老配置）：退回"只带 ``context_lines`` 行"。
+
+        以前前文固定 20 行（约 620 token）：4k 预算里它占 15%（挤掉正文），
+        32k 窗口里只占 2%（白白浪费）。1/3 是"够用来对齐译名、又不喧宾夺主"
+        的经验值，剩下 2/3 留给本批正文。
+        """
+        ctx = self.recent_context()
+        budget = int(getattr(self.config.llm, "input_budget_tokens", 0) or 0)
+        if budget <= 0:
+            lines = max(0, int(self.config.context_lines))
+            return ctx[-lines:] if lines else []
+        if not ctx:
+            return []
+        return trim_context(ctx, int(budget * 0.33))
 
     # ------------------------------------------------------------------ #
     # 成本护栏
@@ -266,7 +297,7 @@ class TranslatorHub:
                 segments=pending,
                 source_language=source_language,
                 target_language=target,
-                context=self.recent_context(),
+                context=self._budgeted_context(),
                 glossary=self._union_glossary(pending),
                 template=self.config.prompt_template,
                 custom_prompt=self.config.custom_prompt,

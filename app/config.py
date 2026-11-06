@@ -407,7 +407,32 @@ class LLMConfig(BaseModel):
     api_key: str = ""
     model: str = ""
     temperature: float = Field(default=0.3, ge=0.0, le=2.0)
-    max_tokens: int = Field(default=512, ge=16, le=8192)
+
+    input_budget_tokens: int = Field(default=4096, ge=0, le=131072)
+    """单次请求的**输入** token 预算：决定"一批送多少条字幕 + 带多少前文"。
+
+    以前这是写死的（离线 8 条、适配器 5 条），和模型的真实窗口毫无关系——
+    8k 窗口的小模型和 32k 窗口的云端模型送一样多的东西。
+
+    档位建议（``BUDGET_CHOICES`` 里有对应文案）：
+
+    * **4096**  —— 8G 显存 / 8k 窗口的本地模型，稳妥；
+    * **8192**  —— 12~16G 显存；
+    * **16384** —— 24G+（4090/5090），短文件可以把整份台词一次翻完；
+    * **32768** —— 32k 窗口的云端模型；
+    * **0**     —— 不限，退回"按固定条数切"的老行为（仅兼容用）。
+
+    ⚠️ 预算只管**输入**。输出由 :attr:`max_tokens` 自动推导，不会跟着无限涨。
+    """
+
+    max_tokens: int = Field(default=0, ge=0, le=32768)
+    """输出 token 上限；**0 = 按这一批的实际大小自动算**（推荐）。
+
+    以前写死 512：8 条字幕勉强够，可一批 40 条时译文必被截断——模型只吐一半、
+    编号解析失败、整批白送。现在按"本批输入 × 0.8"推导（下限 512），
+    见 ``app/translate/budget.output_tokens_for``。
+    """
+
     timeout_s: float = Field(default=60.0, gt=0)
     stream: bool = True
 
@@ -431,8 +456,23 @@ class LLMConfig(BaseModel):
     """
 
 
+BUDGET_CHOICES: tuple[tuple[int, str], ...] = (
+    (4096, "4k · 8G 显存 / 8k 窗口（稳妥）"),
+    (8192, "8k · 12~16G 显存"),
+    (16384, "16k · 24G+（短文件可一次翻完）"),
+    (32768, "32k · 云端 32k 窗口"),
+    (0, "不限 · 退回固定条数（仅兼容）"),
+)
+"""「单次翻译输入预算」的可选档位（GUI 直接渲染，与 :class:`LLMConfig` 同源）。
+
+写在这里而不是 GUI 里，是因为"哪些档位算合理"是**配置语义**，不是界面细节：
+以后要加 64k 档位，改这一处即可。
+"""
+
+
 class TranslateConfig(BaseModel):
     enabled: bool = True
+
     provider: str = "none"
     """当前生效的翻译通道 id，如 "baidu" / "youdao" / "azure" / "google" /
     "deepl" / "llm" / "none"。"""

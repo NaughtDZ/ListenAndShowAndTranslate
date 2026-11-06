@@ -49,7 +49,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.audio.levels import LevelState, LevelTracker, threshold_from_db
-from app.config import LATENCY_KNOBS, LATENCY_PRESETS, AppConfig
+from app.config import BUDGET_CHOICES, LATENCY_KNOBS, LATENCY_PRESETS, AppConfig
 from app.models.registry import LANGUAGE_LABELS
 from app.translate.prompts import list_templates
 from app.translate.traditional.providers import ALL_PROVIDERS, WEB_PROVIDERS
@@ -575,6 +575,32 @@ class SettingsWindow(QWidget):
         lf.addRow("API Key", self.llm_key)
         lf.addRow("模型名", self.llm_model)
         lf.addRow("提示词风格", self.llm_style)
+
+        # 单次输入预算：决定"一次请求塞多少内容"。
+        # 以前一批几条是写死的（离线 8 条 / 适配器 5 条），和模型真实窗口无关——
+        # 8k 窗口的本地小模型和 32k 窗口的云端模型送一样多的东西。
+        self.llm_budget = QComboBox()
+        for tokens, label in BUDGET_CHOICES:
+            self.llm_budget.addItem(label, tokens)
+        budget_index = self.llm_budget.findData(int(llm.input_budget_tokens))
+        self.llm_budget.setCurrentIndex(budget_index if budget_index >= 0 else 0)
+        self.llm_budget.setToolTip(
+            "一次请求最多塞多少 token。\n"
+            "预算越大 → 一次能翻的字幕越多、前文越完整（译名/语气更统一），\n"
+            "但也更吃显存与上下文窗口；超了会被服务端拒绝或截断。"
+        )
+        lf.addRow("单次预算", self.llm_budget)
+
+        budget_hint = QLabel(
+            "决定<b>一次请求塞多少内容</b>：预算越大，一批能翻的字幕越多、"
+            "带的前文也越多（人名/称谓更连贯），但更吃显存和上下文窗口。<br>"
+            "· <b>8G 显存 / 8k 窗口</b> → 4k（约 100 条一批）<br>"
+            "· <b>24G+（4090/5090）</b> → 16k，短文件可以把整份台词一次翻完<br>"
+            "· <b>云端 32k 窗口</b> → 32k<br>"
+            "输出上限会按这个预算<b>自动算</b>，不用另外调（想手动卡死再改配置里的 max_tokens）。"
+        )
+        budget_hint.setWordWrap(True)
+        lf.addRow("", budget_hint)
 
         # 思考开关：默认**关**。字幕翻译不需要思考，而且思考模型常把预算烧光、
         # content 返回空串（用户看到空白字幕）。
@@ -1260,7 +1286,7 @@ class SettingsWindow(QWidget):
         self.llm_box.setVisible(show_llm)
         for widget in (
             self.llm_base, self.llm_key, self.llm_model,
-            self.llm_style, self.llm_no_think, self.llm_preset,
+            self.llm_style, self.llm_no_think, self.llm_preset, self.llm_budget,
         ):
             # 快捷预设也算输入控件：漏了它，通道选「不翻译」时上面全灰、
             # 唯独它能点，用户会以为"点这里就能生效"。
@@ -1565,6 +1591,9 @@ class SettingsWindow(QWidget):
         c.translate.llm.enabled = True
         c.translate.llm.prompt_style = self.llm_style.currentData() or ""
         c.translate.llm.disable_thinking = self.llm_no_think.isChecked()
+        c.translate.llm.input_budget_tokens = int(
+            self.llm_budget.currentData() if self.llm_budget.currentData() is not None else 4096
+        )
 
         # 术语表：内联优先，同时把路径记下来（便于用户下次继续用文件）
         glossary: dict[str, str] = {}

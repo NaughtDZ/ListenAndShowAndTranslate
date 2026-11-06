@@ -327,13 +327,43 @@ def test_hub_maintains_context(hub):
     assert len(hub.recent_context()) == 2
 
 
-def test_hub_context_respects_maxlen(hub):
+def test_hub_context_respects_context_lines_without_budget(hub):
+    """**预算为 0**（"不限"档 / 老配置）时，前文只带 ``context_lines`` 行。
+
+    注意语义变化：``recent_context()`` 现在只是"缓存里有什么"（最多 512 行），
+    真正送多少由 ``_budgeted_context()`` 决定——因为 token 预算模式下，
+    大窗口可以带更多前文（见下面那条测试）。
+    """
     hub.config.context_lines = 2
+    hub.config.llm.input_budget_tokens = 0
     hub = TranslatorHub(hub.config, glossary=hub.glossary, cache=None)
     for i in range(5):
         hub.add_context(f"s{i}", f"t{i}")
-    assert len(hub.recent_context()) == 2
+    assert hub._budgeted_context() == [("s3", "t3"), ("s4", "t4")]
     hub.close()
+
+
+def test_hub_context_grows_with_token_budget(hub):
+    """预算越大，带的前文越多——这才是"16k 预算"该有的效果。
+
+    以前前文固定 20 行（约 620 token）：4k 预算里占 15%（挤掉正文），
+    32k 窗口里只占 2%（白白浪费）。
+    """
+    results = {}
+    for budget in (4096, 16384):
+        hub.config.context_lines = 2          # 故意设得很小：预算模式应当无视它
+        hub.config.llm.input_budget_tokens = budget
+        h = TranslatorHub(hub.config, glossary=hub.glossary, cache=None)
+        for i in range(120):
+            h.add_context(
+                f"这是一句大约二十个字的日文原文第{i}句内容。",
+                f"这是大约二十个字的中文译文第{i}句。",
+            )
+        results[budget] = len(h._budgeted_context())
+        h.close()
+
+    assert results[4096] > 2, results
+    assert results[16384] > results[4096] * 2, results
 
 
 def test_hub_tolerates_provider_exception(hub):

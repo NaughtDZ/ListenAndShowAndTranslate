@@ -467,7 +467,10 @@ class StudioWindow(QMainWindow):
             base = (getattr(llm, "base_url", "") or "").strip()
             if not model or not base:
                 return "LLM 的地址或模型名没填", False
-            return f"翻译通道：LLM（{model}）", True
+            # 让用户在这里就能看到"一次能塞多少"（设置页里可改）
+            budget = int(getattr(llm, "input_budget_tokens", 0) or 0)
+            tag = f" · 单次预算 {budget // 1024}k" if budget > 0 else " · 预算不限"
+            return f"翻译通道：LLM（{model}）{tag}", True
         return f"翻译通道：{provider}", True
 
     def _translate_ready(self) -> bool:
