@@ -38,6 +38,9 @@ MAX_TRANSLATE_BATCH = 400
 中途失败整批白干；而且模型漏条的概率随条数线性上升。
 """
 
+NAMES_SAMPLE_LINES = 8
+"""问模型译名时，附带几行「已译样本」当语境。"""
+
 
 @dataclass
 class JobOptions:
@@ -260,12 +263,25 @@ class SubtitleJob:
             batches = [segments[i:i + size] for i in range(0, total, size)]
 
         done = 0
-        for batch in batches:
+        runtime = self._make_runtime_glossary(glossary)
+
+        for index, batch in enumerate(batches):
             if self.cancel.is_set():
                 break
+            # 每翻完一批就用**已译内容**刷新一次临时专名表。
+            # 为什么不是"每 N 批"：候选统计是纯程序（不花 token），没有新候选时
+            # 直接返回；而"每 N 批"会让只有 2~3 批的短文件永远学不到东西。
+            if runtime is not None and index > 0:
+                self._refresh_runtime_glossary(
+                    runtime, cues, hub, done, source_language=source_language
+                )
+
             try:
                 result = hub.translate(
-                    batch, source_language=source_language, target_language=target
+                    batch,
+                    source_language=source_language,
+                    target_language=target,
+                    extra_glossary=runtime.as_dict() if runtime is not None else None,
                 )
             except Exception as exc:  # noqa: BLE001 - hub 号称不抛，但别赌
                 log.exception("翻译失败")
@@ -289,9 +305,60 @@ class SubtitleJob:
                 f"翻译 {done}/{total}" + (f"（失败 {failed}）" if failed else ""),
             )
 
+        if runtime is not None and len(runtime):
+            self._log(f"  · 临时术语表（任务结束即丢弃）：{runtime.describe()}")
         if failed:
             self._log(f"  ! {failed} 条没拿到译文（其余照常写出原文）")
         return ok, failed
+
+    # ------------------------------------------------------------------ #
+    def _make_runtime_glossary(self, user_glossary: dict[str, str]):
+        """按配置决定要不要开「边翻译边总结」。
+
+        只对 LLM 通道有意义（传统翻译 API 不会告诉你"这个词该译成什么"），
+        而且**只在本次任务内有效**——不落盘、不影响下一次。
+        """
+        cfg = self.config
+        if cfg is None or not getattr(cfg.translate, "auto_glossary", True):
+            return None
+        provider = getattr(cfg.translate, "provider", "") or "none"
+        if not provider.startswith("llm"):
+            return None
+
+        from app.translate.runtime_glossary import RuntimeGlossary
+
+        return RuntimeGlossary(user_entries=dict(user_glossary or {}))
+
+    def _refresh_runtime_glossary(
+        self,
+        runtime,
+        cues: list[Cue],
+        hub,
+        upto: int,
+        source_language: str = "",
+    ) -> None:
+        """从"已经翻译过的部分"里学一批新专名。
+
+        候选词由**程序**统计（零 token），只有"这些词的译名"要问模型一次。
+        """
+        upto = max(1, min(upto, len(cues)))
+        translated = [c for c in cues[:upto] if c.translation]
+        if len(translated) < 5:
+            return           # 还没翻出几行，候选统计没有意义
+
+        candidates = runtime.candidates(
+            [c.text for c in cues[:upto]], source_language=source_language
+        )
+        if not candidates:
+            return
+
+        samples = [(c.text, c.translation) for c in translated[-NAMES_SAMPLE_LINES:]]
+        pairs = hub.extract_names(candidates, samples)
+        added = runtime.learn(pairs)
+        # 问过但没拿到合格译名的，也标记一下，避免下一轮重复问
+        runtime.mark_asked(candidates)
+        if added:
+            self._log(f"  · 专名表 +{added} 条：{runtime.describe(limit=5)}")
 
     # ------------------------------------------------------------------ #
     def _export(self, source: Path, cues: list[Cue]) -> list[Path]:

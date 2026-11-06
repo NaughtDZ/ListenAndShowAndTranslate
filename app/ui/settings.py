@@ -614,6 +614,29 @@ class SettingsWindow(QWidget):
         )
         lf.addRow("", self.llm_no_think)
 
+        # 边翻译边总结：长文件靠它保持人名一致（见 app/translate/runtime_glossary.py）
+        self.auto_glossary = QCheckBox("边翻译边总结专名（长文件保持人名一致）")
+        self.auto_glossary.setChecked(
+            bool(getattr(self.config.translate, "auto_glossary", True))
+        )
+        self.auto_glossary.setToolTip(
+            "翻译长文件时会切成很多批，前面出现的人名一旦滚出前文，后面就可能换个译法。\n"
+            "勾上后：程序从已识别的原文里统计高频专名（不花 token），\n"
+            "再问模型一次「这些词该译成什么」，把结果注入后续批次。\n"
+            "只在本次任务内有效，任务结束就丢，不落盘。"
+        )
+        lf.addRow("", self.auto_glossary)
+        auto_glossary_hint = QLabel(
+            "长文件（电影/有声书）人名容易前后不一致——同一个角色一会儿「林凡」"
+            "一会儿「林繁」。勾上后会自动建一张<b>临时专名表</b>："
+            "候选词由程序统计（零 token），只把译名交给模型，"
+            "之后每批翻译都带上它。<br>"
+            "三道闸防污染：候选须出现 ≥3 次、译名要过形态检查、"
+            "<b>永不覆盖你手填的术语表</b>。表只活在这次任务里，结束即丢弃。"
+        )
+        auto_glossary_hint.setWordWrap(True)
+        lf.addRow("", auto_glossary_hint)
+
         model_hint = QLabel(
             "<b>模型由你自己选</b>，程序不替你决定——不同模型显存占用差别巨大"
             "（2B 约 2~4GB，27B 能吃到 20GB+）。<br>"
@@ -1287,6 +1310,7 @@ class SettingsWindow(QWidget):
         for widget in (
             self.llm_base, self.llm_key, self.llm_model,
             self.llm_style, self.llm_no_think, self.llm_preset, self.llm_budget,
+            self.auto_glossary,
         ):
             # 快捷预设也算输入控件：漏了它，通道选「不翻译」时上面全灰、
             # 唯独它能点，用户会以为"点这里就能生效"。
@@ -1594,6 +1618,7 @@ class SettingsWindow(QWidget):
         c.translate.llm.input_budget_tokens = int(
             self.llm_budget.currentData() if self.llm_budget.currentData() is not None else 4096
         )
+        c.translate.auto_glossary = self.auto_glossary.isChecked()
 
         # 术语表：内联优先，同时把路径记下来（便于用户下次继续用文件）
         glossary: dict[str, str] = {}

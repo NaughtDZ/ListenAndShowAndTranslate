@@ -228,8 +228,15 @@ class TranslatorHub:
         segments: list[Segment],
         source_language: str = "auto",
         target_language: str = "",
+        extra_glossary: dict[str, str] | None = None,
     ) -> TranslateResult:
-        """翻译一批字幕。**不抛异常**：失败写进 failures 并附上可读原因。"""
+        """翻译一批字幕。**不抛异常**：失败写进 failures 并附上可读原因。
+
+        Args:
+            extra_glossary: **只在这一次调用里生效**的额外术语
+                （「边翻译边总结」学到的临时专名表）。用户手填的术语表优先，
+                这里只补空缺。
+        """
         target = target_language or self.config.target_language
         clean = [s for s in segments if s.text]
         result = TranslateResult(provider="hub")
@@ -298,7 +305,7 @@ class TranslatorHub:
                 source_language=source_language,
                 target_language=target,
                 context=self._budgeted_context(),
-                glossary=self._union_glossary(pending),
+                glossary=self._union_glossary(pending, extra_glossary),
                 template=self.config.prompt_template,
                 custom_prompt=self.config.custom_prompt,
             )
@@ -368,17 +375,48 @@ class TranslatorHub:
             time.sleep(min_interval - elapsed)
         slot.last_call_at = time.time()
 
-    def _union_glossary(self, segments: list[Segment]) -> dict[str, str]:
+    def _union_glossary(
+        self, segments: list[Segment], extra: dict[str, str] | None = None
+    ) -> dict[str, str]:
         """把这一批里命中的术语取并集。
 
         只注入命中项：整表注入既浪费 token，又会让模型把无关词硬套上去。
+
+        ``extra`` 是运行时学到的临时专名表，**用户手填的优先**（同名词不覆盖）。
         """
-        if not self.glossary:
-            return {}
         merged: dict[str, str] = {}
         for s in segments:
             merged.update(self.glossary.subset_for(s.text))
+        if extra:
+            for s in segments:
+                for src, dst in extra.items():
+                    if src and src in s.text and src not in merged:
+                        merged[src] = dst
         return merged
+
+    # ------------------------------------------------------------------ #
+    def extract_names(
+        self,
+        candidates: list[str],
+        samples: list[tuple[str, str]],
+    ) -> dict[str, str]:
+        """让当前通道给"这些专名的译名"（「边翻译边总结」用）。
+
+        只有 OpenAI 兼容通道实现了它（传统翻译 API 没有这种能力）；
+        没有可用实现时返回空 dict——调用方据此跳过，不影响翻译。
+        """
+        for slot in sorted(self._providers.values(), key=lambda s: s.priority):
+            if not slot.is_available:
+                continue
+            fn = getattr(slot.translator, "extract_names", None)
+            if fn is None:
+                continue
+            try:
+                return fn(candidates, samples) or {}
+            except Exception as exc:  # noqa: BLE001 - 提取失败不能影响主流程
+                log.warning("专名提取失败（忽略）：%s", exc)
+                return {}
+        return {}
 
     def _store_cache(
         self,

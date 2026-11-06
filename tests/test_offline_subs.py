@@ -173,7 +173,7 @@ def test_translate_fills_cues_and_counts_failures():
     class _HalfBrokenHub:
         """只翻译第一条，第二条算失败——模拟通道抽风。"""
 
-        def translate(self, segments, source_language="", target_language=""):
+        def translate(self, segments, source_language="", target_language="", **_kw):
             out = TranslateResult()
             for i, segment in enumerate(segments):
                 if i == 0:

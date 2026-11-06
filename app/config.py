@@ -503,6 +503,19 @@ class TranslateConfig(BaseModel):
     glossary: dict[str, str] = Field(default_factory=dict)
     """术语强制映射：人名/地名/功法名。小说场景刚需。"""
 
+    auto_glossary: bool = True
+    """是否「边翻译边总结」：自动从原文里找专名、问模型一次译名、注入后续批次。
+
+    只对 **LLM 通道**有效（传统翻译 API 没有这种能力），且**只在单次任务内**：
+    字幕工坊处理一部片子时建一张临时表，任务结束就丢，不落盘、不影响下次。
+
+    为什么需要它：长片会切成很多批，前文只能带几十到几百行——前面出现的人名
+    一旦滚出前文，后面就可能换个译法（同一个人一会儿"林凡"一会儿"林繁"）。
+
+    三道闸防"错误译名污染全片"：候选必须在原文出现 ≥3 次、模型给的译名要过
+    形态检查、**永不覆盖用户手填的术语表**。见 ``app/translate/runtime_glossary.py``。
+    """
+
     cache_enabled: bool = True
     max_concurrency: int = Field(default=4, ge=1, le=32)
     qps_limit: float = Field(default=5.0, gt=0)

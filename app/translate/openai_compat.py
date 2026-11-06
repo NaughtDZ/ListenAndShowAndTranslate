@@ -69,6 +69,9 @@ MAX_SPLIT_DEPTH = 6
 """编号解析失败时最多二分几层（200 → 3 条左右就够定位问题了）。"""
 
 _NUMBERED_RE = re.compile(r"^\s*(\d{1,3})\s*[.、)．:：]\s*(.*)$")
+_LEADING_INDEX_RE = re.compile(r"^\s*\d{1,3}\s*[.、)．:：]\s*")
+
+_QUOTES = " \t\"'“”「」『』"
 
 # 我们自己提示词里的标记。译文里出现这些，说明模型把提示词原样吐回来了。
 #
@@ -169,6 +172,38 @@ def parse_lines(text: str, expected: int) -> dict[int, str] | None:
     if len(lines) != expected:
         return None
     return {i + 1: ln for i, ln in enumerate(lines)}
+
+
+def _parse_name_pairs(text: str) -> dict[str, str]:
+    """解析专名表回答（``原文<TAB>译名`` 每行一条）。
+
+    模型不一定老老实实用 TAB——所以按优先级依次尝试：TAB、全角空格、``→``、
+    ``->``，最后退一步按**最后一个空格**切（``リンファン 林凡`` 这种）。
+
+    解析不出来的行直接跳过：这是锦上添花的功能，宁可少学几个词，
+    也不能因为它出错而影响字幕翻译。
+    """
+    out: dict[str, str] = {}
+    for raw in (text or "").splitlines():
+        line = _LEADING_INDEX_RE.sub("", raw.strip()).strip()
+        if not line or line.startswith(("#", "【", "原文", "候选")):
+            continue
+
+        parts: list[str] | None = None
+        for sep in ("\t", "\u3000", "→", "->"):
+            if sep in line:
+                parts = line.split(sep, 1)
+                break
+        if parts is None and " " in line:
+            parts = line.rsplit(" ", 1)
+        if not parts:
+            continue
+
+        src = parts[0].strip(_QUOTES)
+        dst = parts[1].strip(_QUOTES)
+        if src and dst and src != dst:
+            out[src] = dst
+    return out
 
 
 # 已知需要"纯文本输入"的模型（微调翻译模型，不是指令模型）。
@@ -638,8 +673,77 @@ class OpenAICompatTranslator:
         return base
 
     # ------------------------------------------------------------------ #
+    def extract_names(
+        self,
+        candidates: list[str],
+        samples: list[tuple[str, str]],
+    ) -> dict[str, str]:
+        """问一次"这些专有名词该译成什么"。
+
+        这是「边翻译边总结」的第二步：候选词由**程序**从原文里统计出来
+        （零 token），这里只需要模型给出译名。
+
+        Args:
+            candidates: 待定的原文词（人名/地名/道具名之类）。
+            samples: 已翻译的 ``(原文, 译文)`` 对，给模型看语境。
+
+        Returns:
+            ``{原文: 译名}``。**失败一律返回空 dict**——这是锦上添花的功能，
+            绝不能因为它挂掉而影响字幕翻译主流程。
+        """
+        words = [w.strip() for w in (candidates or []) if w and w.strip()]
+        if not words or self.prompt_style == "plain":
+            # 纯翻译模型（sakura 之类）不吃指令，问了也只会把提示词吐回来
+            return {}
+
+        sample_block = "\n".join(
+            f"原文：{src}\n译文：{dst}" for src, dst in (samples or [])[-8:]
+        )
+        word_block = "\n".join(words)
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "你是字幕翻译的术语整理助手。"
+                    "根据给出的译文样本和候选词，给出这些专有名词的统一译名。"
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "下面这些词在同一段字幕里反复出现，可能是人名、地名、组织名、"
+                    "道具或招式。请根据语境给出它们在这次翻译中的**统一译名**。\n\n"
+                    "只输出「原文<TAB>译名」，每行一条。不要编号、不要解释、不要加引号。\n"
+                    "不是专有名词的（普通动词、语气词、通用名词）直接跳过，不要输出。\n\n"
+                    + (f"【译文样本】\n{sample_block}\n\n" if sample_block else "")
+                    + f"【候选词】\n{word_block}"
+                ),
+            },
+        ]
+
+        # 输出量：每行约「原文+译名」，按候选数估，再留余量
+        want = max(256, len(words) * 24 + 128)
+        cap = self.max_tokens if self.max_tokens > 0 else 2048
+        try:
+            content, _usage, _trunc = self._call(
+                TranslateRequest(segments=[]),
+                min(want, max(cap, 256)),
+                no_think=True,           # 整理术语不需要思考，省时间省钱
+                messages_override=messages,
+            )
+        except Exception as exc:  # noqa: BLE001 - 提取失败不能影响翻译
+            log.warning("专名提取请求失败（忽略）：%s", exc)
+            return {}
+
+        return _parse_name_pairs(content)
+
+    # ------------------------------------------------------------------ #
     def _call(
-        self, request: TranslateRequest, max_tokens: int, no_think: bool = False
+        self,
+        request: TranslateRequest,
+        max_tokens: int,
+        no_think: bool = False,
+        messages_override: list[dict[str, str]] | None = None,
     ) -> tuple[str, dict, bool]:
         """发一次请求。
 
@@ -652,8 +756,14 @@ class OpenAICompatTranslator:
         ``no_think=True`` 时把 ``/no_think`` 追加到最后一条 user 消息末尾
         （Qwen 系的软开关，实测对部分模型有效）；这只在"思考吃光了预算、
         content 为空"的兜底重试里用，正常请求不加。
+
+        ``messages_override`` 用于"不走翻译模板"的请求（目前只有专名提取）：
+        给了它就不再用 ``build_messages`` 渲染，但 400 重试、思考剥离、
+        回显检测这些保护**照常生效**。
         """
-        if self.prompt_style == "plain":
+        if messages_override is not None:
+            messages = [dict(m) for m in messages_override]
+        elif self.prompt_style == "plain":
             joined = "\n".join(seg.text for seg in request.segments)
             messages = [{"role": "user", "content": joined}]
         else:
