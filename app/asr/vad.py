@@ -87,7 +87,10 @@ class VadSegmenter:
                 threshold=self.threshold,
                 speech_pad_ms=self.speech_pad_ms,
                 hop_ms=self.hop_ms,
-                num_threads=self.num_threads,
+                # ⚠️ Whisper-VAD 是 whisper-base encoder（88M 参数、30 秒窗口），
+                # 单线程实测 588ms/次、RTF 0.59；8 线程降到 184ms（RTF 0.18）。
+                # 所以它**必须**吃多线程——这是它和 Silero 最大的区别。
+                num_threads=max(1, self.num_threads),
                 provider=self.provider,
                 models_dir=self.models_dir,
                 buffer_seconds=self.buffer_seconds,
@@ -105,7 +108,8 @@ class VadSegmenter:
         cfg.silero_vad.min_speech_duration = max(0.05, self.min_speech_ms / 1000.0)
         cfg.silero_vad.max_speech_duration = max(1.0, self.max_speech_ms / 1000.0)
         cfg.sample_rate = SAMPLE_RATE
-        cfg.num_threads = self.num_threads
+        # Silero 只有 0.6MB、单次只算 32ms，多线程反而被线程调度拖慢，固定 1。
+        cfg.num_threads = 1
 
         self._vad = sherpa_onnx.VoiceActivityDetector(cfg, self.buffer_seconds)
         log.info(

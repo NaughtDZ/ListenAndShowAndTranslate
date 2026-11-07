@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
@@ -100,6 +101,15 @@ class TranscribeOptions:
     provider: str = "cpu"
     use_itn: bool = True
 
+    vad_threads: int = 0
+    """VAD 推理线程数；``0`` = 自动（CPU 逻辑核的 1/4）。
+
+    对 Silero 没影响（它固定 1 线程，模型太小、多线程反而被调度拖慢）；
+    对 **Whisper-VAD ASMR 影响巨大**——它是 whisper-base encoder，
+    实测单线程 588ms/次（RTF 0.59，24 分钟音频要 14 分钟），
+    8 线程 184ms（RTF 0.18，4.4 分钟）。
+    """
+
     merge_fragments: bool = True
     """是否把"被 VAD 切出去的尾巴几个字"并回前一句。
 
@@ -158,7 +168,10 @@ class Transcriber:
             speech_pad_ms=o.speech_pad_ms,
             hop_ms=o.hop_ms,
             vad_model=o.vad_model,
-            num_threads=1,
+            # 以前硬编码 1：Silero 够用，但 Whisper-VAD 是 88M 参数的
+            # encoder，单线程 RTF 0.59（24 分钟音频要 14 分钟）。
+            # 传 CPU 的 1/4（9950X 32 线程 → 8 线程，RTF 降到 0.18）。
+            num_threads=o.vad_threads or max(1, (os.cpu_count() or 4) // 4),
             provider=o.provider,
             models_dir=self.models_dir,
         )
