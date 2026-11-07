@@ -70,7 +70,87 @@ def test_web_google_language_mapping():
 def test_web_google_low_default_qps():
     """免费端点限流严，默认 QPS 要压低，别把 IP 打黑。"""
     t = GoogleWebTranslator()
-    assert t.qps_limit <= 3.0
+    assert t.qps_limit <= 0.5, "实测 3 QPS 立刻 429，0.5 才稳"
+
+
+# --------------------------------------------------------------------------- #
+# 429 限流：识别 + 熔断（别让一批 300 条空转几小时）
+# --------------------------------------------------------------------------- #
+def test_429_is_reported_as_rate_limited():
+    """429 要变成 RateLimited（带 Retry-After），不是普通的请求失败。"""
+    from app.translate.traditional.base import RateLimited
+
+    t = GoogleWebTranslator(retry_times=0)
+    t._client.close()
+    t._client = httpx.Client(transport=httpx.MockTransport(
+        lambda r: httpx.Response(429, headers={"Retry-After": "3"})
+    ))
+
+    with pytest.raises(RateLimited) as exc:
+        t._translate_one("hello", "en", "zh-CN")
+    assert exc.value.retry_after == 3.0
+
+
+def test_429_message_tells_user_what_to_do():
+    """错误信息要能指导用户，而不是只丢一个 429。"""
+    t = GoogleWebTranslator(retry_times=0)
+    t._client.close()
+    t._client = httpx.Client(transport=httpx.MockTransport(
+        lambda r: httpx.Response(429)
+    ))
+    r = t.translate(TranslateRequest(
+        segments=[Segment(id=1, text="a")],
+        source_language="ja", target_language="zh",
+    ))
+    msg = r.failures[1]
+    assert "429" in msg or "限流" in msg
+    assert "LLM" in msg, f"要指出替代方案，实际：{msg}"
+
+
+def test_consecutive_429_trips_the_circuit():
+    """连续 429 后熔断：后续条目**不再发请求**，直接记失败。
+
+    没有这个的话：一批 300 条，每条重试 2 次且退避到 20 秒，
+    就是几小时的空转——用户只会看到"卡住不动"。
+    """
+    t = GoogleWebTranslator(retry_times=2, qps_limit=0)
+    calls = {"n": 0}
+
+    def handler(r: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(429)
+
+    t._client.close()
+    t._client = httpx.Client(transport=httpx.MockTransport(handler))
+
+    segments = [Segment(id=i, text=f"句{i}") for i in range(30)]
+    r = t.translate(TranslateRequest(
+        segments=segments, source_language="ja", target_language="zh"
+    ))
+
+    assert r.fail_count == 30, "限流时应该整批失败（而不是部分成功）"
+    # 熔断要生效：不可能对 30 条都发请求
+    assert calls["n"] < 10, f"熔断没生效，实际发了 {calls['n']} 次请求"
+    assert any("限流中" in msg for msg in r.failures.values()), r.failures
+
+
+def test_success_resets_the_429_counter():
+    """成功一次就把连续限流计数清零，别让偶发 429 累积成熔断。"""
+    t = GoogleWebTranslator(retry_times=0, qps_limit=0)
+    seq = iter([
+        httpx.Response(429),                                      # 1: 限流
+        httpx.Response(200, json=[[["ok", "x", None, None, 1]]]),  # 2: 成功
+        httpx.Response(429),                                      # 3: 限流
+    ])
+    t._client.close()
+    t._client = httpx.Client(transport=httpx.MockTransport(lambda r: next(seq)))
+
+    r = t.translate(TranslateRequest(
+        segments=[Segment(id=i, text=f"句{i}") for i in range(3)],
+        source_language="ja", target_language="zh",
+    ))
+    assert r.ok_count == 1
+    assert t._circuit_open_s() == 0, "中间成功过，不该熔断"
 
 
 def test_web_google_translate_result_and_failure_recording():

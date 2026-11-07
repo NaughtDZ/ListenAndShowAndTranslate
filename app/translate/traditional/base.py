@@ -29,6 +29,19 @@ class UnsupportedLanguage(ValueError):
     """该通道不支持这对语言。"""
 
 
+class RateLimited(RuntimeError):
+    """服务端明确限流（HTTP 429）。
+
+    免费网页端点（Google gtx / Bing）最容易触发。和一般网络错误不同：
+    **重试要等更久**（服务端会用 ``Retry-After`` 告诉我们等多久），
+    而且等太久就不值得等了——一条字幕晚 5 分钟没意义，交给上层熔断更合理。
+    """
+
+    def __init__(self, message: str = "服务端限流（429）", retry_after: float | None = None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
 class TraditionalTranslatorBase(ABC):
     """传统 API 通道基类：子类只需实现 :meth:`_translate_one`。"""
 
@@ -57,6 +70,11 @@ class TraditionalTranslatorBase(ABC):
         self.stats = TranslatorStats()
         self._lock = threading.Lock()
         self._last_call_at = 0.0
+        # 限流熔断：连续几次 429 就停手一段时间。
+        # 不加这个的话，一批 300 条 = 300 × (2 次退避) ≈ 几小时空转，
+        # 用户只会看到"卡住不动"。
+        self._consecutive_429 = 0
+        self._open_until = 0.0
         self._client = httpx.Client(
             timeout=timeout_s,
             proxy=self.proxy or None,
@@ -97,6 +115,15 @@ class TraditionalTranslatorBase(ABC):
                 time.sleep(wait)
             self._last_call_at = time.time()
 
+    # ------------------------------------------------------------------ #
+    def _circuit_open_s(self) -> float:
+        """通道还要熔断多少秒（0 = 正常）。"""
+        return max(0.0, self._open_until - time.time())
+
+    def _trip(self, seconds: float) -> None:
+        self._open_until = time.time() + seconds
+        log.warning("[%s] 连续限流，熔断 %.0f 秒", self.name, seconds)
+
     def translate(self, request: TranslateRequest) -> TranslateResult:
         """逐条调用并合并。**不抛异常**，失败写进 failures。"""
         result = TranslateResult(provider=self.name, model=self.model_name())
@@ -108,6 +135,15 @@ class TraditionalTranslatorBase(ABC):
         for seg in request.segments:
             if not seg.text:
                 continue
+
+            blocked = self._circuit_open_s()
+            if blocked > 0:
+                # 已经熔断：不再发请求，直接记失败（快，不空转）
+                result.failures[seg.id] = (
+                    f"通道限流中，已跳过（约 {blocked:.0f} 秒后重试）"
+                )
+                continue
+
             text = ""
             last_err = ""
             for attempt in range(self.retry_times + 1):
@@ -115,10 +151,23 @@ class TraditionalTranslatorBase(ABC):
                     self._throttle()
                     text = self._translate_one(seg.text, src, dst)
                     if text:
+                        self._consecutive_429 = 0
                         break
                     last_err = "通道返回空译文"
                 except UnsupportedLanguage:
                     raise
+                except RateLimited as exc:
+                    # 限流单独处理：等太久（>30s）就直接放弃这一条，
+                    # 让上层熔断切通道——一条字幕等 5 分钟没有意义。
+                    last_err = f"{type(exc).__name__}: {exc}"
+                    self._consecutive_429 += 1
+                    if self._consecutive_429 >= 3:
+                        self._trip(120.0)
+                        break
+                    wait = exc.retry_after if exc.retry_after else min(20.0, 2.0 ** attempt)
+                    if wait > 30 or attempt >= self.retry_times:
+                        break
+                    time.sleep(wait * (0.8 + 0.4 * random.random()))
                 except Exception as exc:  # noqa: BLE001 - 网络/配额问题都要重试
                     last_err = f"{type(exc).__name__}: {exc}"
                     if attempt < self.retry_times:

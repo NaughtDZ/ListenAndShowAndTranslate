@@ -63,7 +63,7 @@ import re
 import threading
 import time
 
-from app.translate.traditional.base import TraditionalTranslatorBase
+from app.translate.traditional.base import RateLimited, TraditionalTranslatorBase
 from app.utils.log import get_logger
 
 log = get_logger(__name__)
@@ -115,8 +115,10 @@ class GoogleWebTranslator(TraditionalTranslatorBase):
         "id": "id", "tr": "tr", "nl": "nl", "pl": "pl", "hi": "hi",
     }
 
-    def __init__(self, proxy: str = "", qps_limit: float = 3.0, **kw) -> None:
-        # 免费端点限流严，默认压低 QPS，别把 IP 打黑
+    def __init__(self, proxy: str = "", qps_limit: float = 0.5, **kw) -> None:
+        # 免费端点限流很严：实测 3 QPS 会立刻 429——
+        # **注意这条路径只适合"实时字幕"（几十条/小时）**，批量跑几百条必然被限流。
+        # 0.5 QPS（每 2 秒一条）是实测能稳住的上限。
         super().__init__(proxy=proxy, qps_limit=qps_limit, **kw)
 
     def model_name(self) -> str:
@@ -131,6 +133,17 @@ class GoogleWebTranslator(TraditionalTranslatorBase):
             "q": text,
         }
         r = self._client.get(self.ENDPOINT, params=params)
+        if r.status_code == 429:
+            raw = r.headers.get("Retry-After")
+            try:
+                seconds = float(raw) if raw else None
+            except ValueError:
+                seconds = None
+            raise RateLimited(
+                "谷歌网页接口限流（429）——免费端点每分钟只有几十次，"
+                "批量字幕会被卡住；实时字幕请调低 QPS，批量任务请改用本地 LLM",
+                retry_after=seconds,
+            )
         r.raise_for_status()
         data = r.json()
         # 返回结构：[[[译文片段, 原文片段, ...], ...], ...]
@@ -150,6 +163,10 @@ class GoogleWebTranslator(TraditionalTranslatorBase):
             out = self._translate_one("hello", "en", "zh-CN")
             dt = (time.time() - t0) * 1000
             return (True, f"可用（{dt:.0f}ms），测试译文：{out}") if out else (False, "返回空译文")
+        except RateLimited as exc:
+            # 限流不是"坏配置"，返回 False 会让用户以为通道没配好；
+            # 这里照实说清楚原因，调用方只当"不可用"处理即可。
+            return False, str(exc)
         except Exception as exc:  # noqa: BLE001
             msg = str(exc)[:150]
             if "proxy" in msg.lower() or "connect" in msg.lower() or "timeout" in msg.lower():

@@ -465,7 +465,7 @@ class TranslatePage(QWizardPage):
 
         self.provider = QComboBox()
         self.provider.addItem("本地大模型（LM Studio / Ollama，免费离线，推荐）", "llm")
-        self.provider.addItem("谷歌网页版（免 key，必须有代理）", "web_google")
+        self.provider.addItem("谷歌网页版（免 key，必须有代理；批量会 429）", "web_google")
         self.provider.addItem("必应网页版（免 key，日译中质量好，必须有代理）", "web_bing")
         self.provider.addItem("先不翻译（只显示原文）", "none")
         self.provider.currentIndexChanged.connect(self._sync)

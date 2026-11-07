@@ -75,8 +75,8 @@ LevelSource = Callable[[], "tuple[float, float] | None"]
 PROVIDER_META: dict[str, tuple[str, dict[str, str]]] = {
     "none": ("不翻译（只显示原文）", {}),
     "llm": ("本地/在线大模型（OpenAI 兼容）", {}),
-    "web_google": ("谷歌网页版（免 key·需代理）", {}),
-    "web_bing": ("必应网页版（免 key·需代理）", {}),
+    "web_google": ("谷歌网页版（免 key·需代理·批量子幕会 429）", {}),
+    "web_bing": ("必应网页版（免 key·需代理·限流更紧）", {}),
     "baidu": ("百度翻译 API", {"app_id": "APP ID", "secret_key": "密钥"}),
     "youdao": ("有道智云 API", {"app_key": "应用 ID", "app_secret": "应用密钥"}),
     "azure": ("微软 Azure 翻译", {"api_key": "密钥", "region": "区域（如 eastasia）"}),
