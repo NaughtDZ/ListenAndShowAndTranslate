@@ -183,6 +183,30 @@ class WhisperVadOnnx:
             str(self.model_path), providers=providers, sess_options=opts
         )
         self._input_name = self._session.get_inputs()[0].name
+
+        # 非 CPU provider 先跑一次空推理验证，失败就回退 CPU。
+        # 实测：DirectML 在这个模型的 **Reshape 节点**上直接报
+        # ``E_INVALIDARG (80070057)``——换 4 种 session option 都一样，
+        # 是 DML 对 whisper encoder 动态形状的支持问题，不是配置问题。
+        # 提前验证比跑到一半才崩强。
+        if providers[0] != "CPUExecutionProvider":
+            try:
+                self._session.run(
+                    None, {self._input_name: np.zeros((1, N_MELS, MEL_FRAMES), np.float32)}
+                )
+            except Exception as exc:  # noqa: BLE001 - 任何 provider 失败都回退
+                log.warning(
+                    "VAD 的 %s 不可用（%s），已回退 CPU。"
+                    "DirectML 对 whisper encoder 的 Reshape 支持不佳，属已知限制。",
+                    providers[0], type(exc).__name__,
+                )
+                providers = ["CPUExecutionProvider"]
+                self._session = ort.InferenceSession(
+                    str(self.model_path), providers=providers, sess_options=opts
+                )
+                self._input_name = self._session.get_inputs()[0].name
+                self.provider = "cpu"
+
         log.info(
             "耳语 VAD 就绪（provider=%s threads=%d）", providers[0], self.num_threads
         )
