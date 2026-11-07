@@ -94,3 +94,6 @@ $RECYCLE.BIN/
 # --- 打包产物 ---
 *.spec.bak
 !*.spec
+
+# DSH chorography 生成的仓库地志（工具产物，不入库）
+.chorography/

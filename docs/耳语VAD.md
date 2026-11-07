@@ -146,3 +146,57 @@ sherpa-onnx 的 `VoiceActivityDetector` **只认 silero / ten-vad 两种结构**
 > 踩坑：下载这个模型时**直连 hf-mirror 只有 0.3 MB/s**（119 MB 要几分钟到十几分钟），
 > 挂上本机代理后 41 MB 只用了 4.3 秒。程序内下载会读 `config.proxy`，
 > 记得在设置里填 `http://127.0.0.1:2333`。
+
+
+---
+
+## 7. 加速：多线程最优，DirectML / CUDA 都不如它
+
+2026-11 实测（同一段 30 秒音频，单次前向耗时）：
+
+| 方案 | 单次耗时 | RTF（hop=1000ms） | 一集 24 分钟 |
+|---|---|---|---|
+| 单线程 CPU | 588 ms | 0.79 | 19 分钟 |
+| **CPU 8 线程（现默认）** | **131~184 ms** | **0.13~0.18** | **3~4 分钟** |
+| DirectML | ❌ 跑不起来 | — | — |
+| CUDA（onnxruntime-gpu 1.31.1） | **535 ms** | 0.54 | 12.8 分钟 |
+
+### 为什么 GPU 反而更慢
+
+单次推理是 **batch=1、30 秒输入**，只有约 960KB 的 float32。5090 算这点量几毫秒就完了，
+但固定开销压不住：
+
+- 输入 H2D 拷贝 + 输出 D2H 拷贝（每帧都要来一遍）
+- kernel launch 排队
+
+而 CPU 8 线程走 oneDNN 的大矩阵乘，对这种"固定形状、批量小"的负载效率已经很高。
+**这是典型的"GPU 不一定快"场景**，别被"有显卡就该用 GPU"带偏。
+
+### DirectML 为什么不行
+
+```
+[ONNXRuntimeError] 6 RUNTIME_EXCEPTION:
+Non-zero status code while running Reshape node 'node_view_1'
+MLOperatorAuthorImpl.cpp(2853) E_INVALIDARG (80070057)
+```
+
+试过默认 / `enable_mem_pattern=False` / `ORT_SEQUENTIAL` / 两者都关，四种全一样。
+是 DML 对 whisper encoder 动态形状的算子支持问题，配置绕不过去。
+另外 `onnxruntime-directml` 最新只到 1.24.4（比 CPU 版落后一个大版本）。
+
+### 依赖策略：CPU 版是硬依赖，GPU 是可选
+
+代码里 `_PROVIDERS` 支持 `cuda` / `directml` / `auto`，但只要**不装**对应包，
+`get_available_providers()` 里就没有它们，会自动回退 CPU——
+`WhisperVadOnnx.load()` 还会先跑一次空推理验证，失败也回退。
+
+所以：
+
+- `requirements.txt` / `pyproject.toml` **永远只写 `onnxruntime`**，别人 clone 下来开箱即用；
+- 想折腾 GPU 的自己 `pip install onnxruntime-gpu`，再把 `provider` 设成 `cuda`；
+- **但实测都不如 CPU 多线程**，所以默认值不动、文档也不推荐。
+
+> ⚠️ 装 `onnxruntime-gpu` / `onnxruntime-directml` 会**替换** `onnxruntime` 包
+> （同名模块），且安装时 DLL 被运行中的程序锁住会报 `WinError 5`——
+> 先关程序，或先用 `pip install --target <临时目录>` 隔离测试。
+> sherpa-onnx 不受影响（它在 `sherpa-onnx-core` 里静态链接）。
