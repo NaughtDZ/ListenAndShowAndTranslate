@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 
 from app.config import TranslateConfig
 from app.translate.base import Segment, TranslateRequest, TranslateResult, Translator
-from app.translate.budget import trim_context
+from app.translate.budget import CONTEXT_BUDGET_SHARE, trim_context
 from app.translate.cache import TranslationCache, cache_key
 from app.translate.glossary import Glossary
 from app.utils.log import get_logger
@@ -201,7 +201,7 @@ class TranslatorHub:
             return ctx[-lines:] if lines else []
         if not ctx:
             return []
-        return trim_context(ctx, int(budget * 0.33))
+        return trim_context(ctx, int(budget * CONTEXT_BUDGET_SHARE))
 
     # ------------------------------------------------------------------ #
     # 成本护栏

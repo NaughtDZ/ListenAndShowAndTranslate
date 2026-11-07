@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import pytest
 
+from app.offline.cue import Cue
 from app.translate.base import Segment, TranslateRequest, TranslateResult
 from app.translate.budget import (
     MIN_OUTPUT_TOKENS,
@@ -304,3 +305,141 @@ def test_offline_job_falls_back_to_fixed_size_without_budget():
     job._translate(cues, hub, base=0.0, span=1.0)
 
     assert hub.batches == [8, 8, 4]
+
+
+# --------------------------------------------------------------------------- #
+# 回归：v0.4.0 的"第二个文件起翻译全失败"
+# --------------------------------------------------------------------------- #
+def test_overhead_is_estimated_as_chinese_not_ascii():
+    """提示词是中文，1 字 ≈ 1 token；按 ASCII 的 4 字符/token 会低估 4 倍。
+
+    v0.4.0 就是这样：``estimate_tokens("x" * 400)`` 算出 115 token，
+    而真实的中文提示词约 460 token——每次请求凭空多出 350 token。
+    """
+    from app.translate.budget import estimate_overhead_tokens, estimate_tokens
+
+    ascii_guess = estimate_tokens("x" * 400)      # 旧算法的错误答案
+    real_guess = estimate_overhead_tokens()        # 按中文估
+
+    assert real_guess > ascii_guess * 3, (
+        f"中文提示词估算 {real_guess} 与 ASCII 估算 {ascii_guess} 差得太少，"
+        "说明又退回按英文估了"
+    )
+
+
+def test_batches_plus_context_reserve_stay_within_budget():
+    """**核心回归**：正文 + 提示词 + 前文预留 ≤ 单次预算。
+
+    v0.4.0 的 bug：job 只把提示词/术语表算进 overhead，前文由 hub 另按
+    1/3 预算加进去，实际请求 = 预算 × 1.33。症状是第一个文件（还没有前文）
+    正常，第二个文件起整批失败。
+    """
+    from app.translate.base import Segment
+    from app.translate.budget import (
+        CONTEXT_BUDGET_SHARE,
+        estimate_overhead_tokens,
+        estimate_tokens,
+        plan_batches,
+    )
+
+    budget = 4096
+    reserve = int(budget * CONTEXT_BUDGET_SHARE)
+    fixed = estimate_overhead_tokens() + reserve
+
+    segments = [Segment(id=i, text="あ" * 20) for i in range(500)]
+    batches = plan_batches(segments, budget, overhead_tokens=fixed, max_items=400)
+
+    assert len(batches) > 1, "这个规模应该切出多批"
+    for idx, batch in enumerate(batches):
+        if len(batch) == 1:
+            continue          # 单条超预算时允许独占一批
+        body = sum(estimate_tokens(s.text) for s in batch)
+        assert body + fixed <= budget, (
+            f"第 {idx + 1} 批超预算：正文 {body} + 固定 {fixed} = {body + fixed} > {budget}"
+        )
+
+
+def test_job_reserves_context_budget(monkeypatch):
+    """job 调 plan_batches 时，overhead 必须包含前文预留。"""
+    from app.config import AppConfig
+    from app.offline.job import JobOptions, SubtitleJob
+    from app.translate import budget as budget_mod
+    from app.translate.base import TranslateResult
+
+    captured: dict = {}
+
+    real_plan = budget_mod.plan_batches
+
+    def spy(segments, budget_tokens, overhead_tokens=0, max_items=0):
+        captured["budget"] = budget_tokens
+        captured["overhead"] = overhead_tokens
+        return real_plan(segments, budget_tokens, overhead_tokens, max_items)
+
+    monkeypatch.setattr(budget_mod, "plan_batches", spy)
+
+    class _Hub:
+        def translate(self, segments, **kw):
+            out = TranslateResult()
+            for seg in segments:
+                out.translations[seg.id] = "译"
+            return out
+
+    cfg = AppConfig()
+    cfg.translate.provider = "llm"
+    cfg.translate.llm.input_budget_tokens = 4096
+    job = SubtitleJob(JobOptions(translate=True), config=cfg)
+    cues = [Cue(start_s=i, end_s=i + 1, text="短句。") for i in range(20)]
+    job._translate(cues, _Hub(), base=0.0, span=1.0)
+
+    reserve = int(4096 * budget_mod.CONTEXT_BUDGET_SHARE)
+    assert captured["overhead"] >= reserve, captured
+    assert captured["overhead"] + 0 < 4096
+
+
+def test_hub_context_never_exceeds_its_share():
+    """hub 裁出来的前文，实际 token 不超过 0.33 × 预算。"""
+    from app.config import TranslateConfig
+    from app.translate.budget import CONTEXT_BUDGET_SHARE, estimate_context_tokens
+    from app.translate.glossary import Glossary
+    from app.translate.hub import TranslatorHub
+
+    cfg = TranslateConfig(provider="llm", cache_enabled=False)
+    cfg.llm.input_budget_tokens = 4096
+    hub = TranslatorHub(cfg, Glossary(), None)
+    for i in range(200):
+        hub.add_context(f"这是一句二十个字左右的日语原文第{i}句。", f"这是二十个字左右的中文译文第{i}句。")
+
+    ctx = hub._budgeted_context()
+    used = estimate_context_tokens(ctx)
+    assert used <= int(4096 * CONTEXT_BUDGET_SHARE) * 1.05, (used, len(ctx))
+    hub.close()
+
+
+def test_translate_reports_failure_reasons():
+    """失败原因必须打出来——用户看到"301 条失败"却不知道为啥，无从下手。"""
+    from app.config import AppConfig
+    from app.offline.job import JobOptions, SubtitleJob
+    from app.translate.base import TranslateResult
+
+    logs: list[str] = []
+
+    class _BrokenHub:
+        def translate(self, segments, **kw):
+            out = TranslateResult()
+            for seg in segments:
+                out.failures[seg.id] = "Error 400: context length exceeded"
+            return out
+
+    cfg = AppConfig()
+    cfg.translate.provider = "llm"
+    cfg.translate.llm.input_budget_tokens = 4096
+    job = SubtitleJob(
+        JobOptions(translate=True), config=cfg, on_log=logs.append
+    )
+    cues = [Cue(start_s=i, end_s=i + 1, text="短句。") for i in range(10)]
+    ok, failed = job._translate(cues, _BrokenHub(), base=0.0, span=1.0)
+
+    assert ok == 0 and failed == 10
+    joined = "\n".join(logs)
+    assert "context length exceeded" in joined, logs
+    assert "单次预算" in joined, "整批失败时要提示用户调小预算"

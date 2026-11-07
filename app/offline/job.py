@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -277,7 +278,11 @@ class SubtitleJob:
                 ``run()`` 建好传进来）；不传就在本文件内新建一张，文件处理完即丢。
         """
         from app.translate.base import Segment
-        from app.translate.budget import estimate_overhead_tokens, plan_batches
+        from app.translate.budget import (
+            CONTEXT_BUDGET_SHARE,
+            estimate_overhead_tokens,
+            plan_batches,
+        )
 
         if hub is None:
             return 0, len(cues)
@@ -299,16 +304,25 @@ class SubtitleJob:
             budget = int(getattr(cfg.translate.llm, "input_budget_tokens", 0) or 0)
 
         if budget > 0:
+            # ⚠️ 必须把"前文预留"算进 overhead。
+            # 以前只算了提示词和术语表，前文由 hub 另按 1/3 预算加进去，
+            # 于是实际请求 = 预算 × 1.33 —— 第一个文件（无前文）正常，
+            # 第二个文件起整批失败。见 budget.CONTEXT_BUDGET_SHARE。
+            context_reserve = int(budget * CONTEXT_BUDGET_SHARE)
             batches = plan_batches(
                 segments, budget,
-                overhead_tokens=estimate_overhead_tokens(glossary=glossary),
+                overhead_tokens=estimate_overhead_tokens(glossary=glossary) + context_reserve,
                 max_items=MAX_TRANSLATE_BATCH,
+            )
+            self._log(
+                f"分批：{len(batches)} 批 · 预算 {budget}（前文预留 {context_reserve}）"
             )
         else:
             size = max(1, int(self.options.translate_batch))
             batches = [segments[i:i + size] for i in range(0, total, size)]
 
         done = 0
+        fail_reasons: Counter[str] = Counter()
         # 没传共享表（单文件 / 没勾"跨文件保持"）就为本文件新建一张
         if runtime is None:
             runtime = self._make_runtime_glossary(glossary)
@@ -344,8 +358,8 @@ class SubtitleJob:
                     ok += 1
                 else:
                     failed += 1
-                    if result and seg.id in result.failures:
-                        log.debug("翻译失败原因：%s", result.failures[seg.id])
+                    reason = (result.failures.get(seg.id, "") if result else "") or "（通道没给原因）"
+                    fail_reasons[reason] += 1
 
             done = min(total, done + len(batch))
             self._progress(
@@ -357,6 +371,15 @@ class SubtitleJob:
             self._log(f"  · 专名表：{runtime.describe()}")
         if failed:
             self._log(f"  ! {failed} 条没拿到译文（其余照常写出原文）")
+            # 失败原因必须打出来。以前只写进 log.debug，用户看到"301 条失败"
+            # 完全无从下手——而真正的原因（上下文超限 / 400 / 超时）就藏在里面。
+            for reason, count in fail_reasons.most_common(3):
+                self._log(f"    {count} 条：{reason[:200]}")
+            if failed == total and total:
+                self._log(
+                    "    提示：整批复读失败时，多半是「单次预算」超过了模型的上下文窗口——"
+                    "到 设置 → 翻译 → 大模型设置 把它调小一档再试"
+                )
         return ok, failed
 
     # ------------------------------------------------------------------ #

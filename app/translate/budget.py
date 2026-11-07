@@ -38,6 +38,21 @@ MIN_OUTPUT_TOKENS = 512
 MAX_OUTPUT_TOKENS = 32768
 """输出预算硬上限（大多数模型达不到，超了会被服务端拒）。"""
 
+CONTEXT_BUDGET_SHARE = 0.33
+"""前文最多占**总输入预算**的比例。
+
+⚠️ 这个值两边必须用同一个：
+
+* ``hub._budgeted_context()`` 按它裁前文；
+* ``job._translate()`` 按它给 ``plan_batches`` 预留 overhead。
+
+以前只有 hub 用、job 没有（``estimate_overhead_tokens`` 只算了提示词和术语表），
+结果正文按满预算切、前文又额外加 1/3 —— **实际请求达到预算的 1.33 倍**，
+把模型上下文窗口撑爆。症状很有辨识度：**第一个文件正常，第二个文件开始
+整批整批失败**（第一个文件还没有前文，从第二个文件起才带），而模型端日志里
+能看到输出——它收到请求了，只是输入超长被截断/拒绝。
+"""
+
 OUTPUT_RATIO = 0.8
 """输出预算 = 输入预算 × 这个比例。
 
@@ -75,17 +90,25 @@ def estimate_context_tokens(context: list[tuple[str, str]] | None) -> int:
 
 
 def estimate_overhead_tokens(
-    template_chars: int = 0,
+    template_chars: int = 180,
     glossary: dict[str, str] | None = None,
     system_chars: int = 400,
 ) -> int:
-    """估算提示词骨架的开销（系统提示 + 模板 + 术语表）。
+    """估算提示词骨架的开销（系统提示 + 用户模板 + 术语表）。
 
-    默认 ``system_chars=400`` 是按内置模板的实际长度取的（``prompts.py``
-    里那几段中文指令约 300~500 字）。
+    默认值按内置模板的实际长度取：
+
+    * ``system_chars=400``：``prompts.py`` 里那几段中文指令约 300~500 字；
+    * ``template_chars=180``：user 模板本身（"请把下面的…翻译成…【待翻译（共 N 条）】"）
+      加上末尾那句"请按相同编号逐条输出…"约 150~200 字。
+
+    ⚠️ **按中文估（1 字 ≈ 1 token），不是按 ASCII 的 4 字符/token**。
+    这里以前写成 ``estimate_tokens("x" * system_chars)``——那是在算 400 个
+    英文字母，得到 115 token；而实际的提示词是中文，约 460 token。
+    **低估 4 倍**，直接导致每次请求都比预算多几百 token。
     """
-    total = estimate_tokens("x" * max(0, system_chars))
-    total += estimate_tokens("x" * max(0, template_chars))
+    total = int(max(0, system_chars) * SAFETY)
+    total += int(max(0, template_chars) * SAFETY)
     if glossary:
         # 术语表按"原文→译法"成对出现，粗略按每对 3 个 token
         total += 3 * len(glossary) + 16
@@ -143,7 +166,9 @@ def plan_batches(
     used = overhead_tokens
 
     for seg in segments:
-        cost = estimate_tokens(seg.text)
+        # 编号开销：批量输出带「1. 」前缀，约 1 token/条。
+        # 几百条时这不是零头（400 条 ≈ 400 token），漏算会让每批都超一点。
+        cost = estimate_tokens(seg.text) + 1
         over_budget = budget_tokens > 0 and current and used + cost > budget_tokens
         over_items = len(current) >= cap_items
         if over_budget or over_items:
