@@ -180,8 +180,12 @@ class StudioWindow(QMainWindow):
         self.silence_spin.setRange(200, 3000)
         self.silence_spin.setSingleStep(50)
         self.silence_spin.setSuffix(" ms")
-        self.silence_spin.setValue(500)
-        self.silence_spin.setToolTip("静多久算一句说完。调大 → 句子更完整、翻译上下文更好；调小 → 切得更碎。")
+        self.silence_spin.setValue(800)
+        self.silence_spin.setToolTip(
+            "静多久算一句说完。调大 → 句子更完整、翻译上下文更好；调小 → 切得更碎。\n"
+            "离线默认 800ms（比实时的 350ms 大）：实测 500ms 会把「聞き取れ|ている」切开，\n"
+            "1200ms 最完整但快速对话有并句风险。"
+        )
         form.addRow("断句静音", self.silence_spin)
 
         self.speech_spin = QSpinBox()
@@ -201,6 +205,23 @@ class StudioWindow(QMainWindow):
             "⚠️ 不要为了“句子完整”调得很大：超过最长连续语音时 VAD 会一直不出结果。"
         )
         form.addRow("最长成句", self.maxseg_spin)
+
+        self.diarize_check = QCheckBox("区分角色（说话人分离）")
+        self.diarize_check.setChecked(False)
+        self.diarize_check.setToolTip(
+            "把台词按「谁说的」标上 [S1] / [S2]。\n"
+            "⚠️ 编号是聚类出来的**匿名**编号（同一文件内稳定，跨文件不保证），\n"
+            "不是「哥哥」「老师」这种角色名。\n"
+            "代价：多跑一遍分离推理（一小时约 1 分钟），并要把整段音频留在内存里。"
+        )
+        try:
+            from app.offline.diarize import models_available
+
+            if not models_available():
+                self.diarize_check.setText("区分角色（模型未下载，勾了也会跳过）")
+        except Exception:  # noqa: BLE001 - 探测失败不该拦住界面
+            pass
+        form.addRow("", self.diarize_check)
 
         self.width_spin = QSpinBox()
         self.width_spin.setRange(0, 120)
@@ -571,6 +592,8 @@ class StudioWindow(QMainWindow):
                 min_speech_ms=self.speech_spin.value(),
                 max_segment_ms=self.maxseg_spin.value(),
                 num_threads=self.threads_spin.value(),
+                merge_fragments=True,
+                diarize=self.diarize_check.isChecked(),
             ),
             formats=formats,
             mode=self.mode_combo.currentData() or "source",

@@ -111,6 +111,19 @@ class TranscribeOptions:
     细节见 :func:`app.offline.cue.merge_fragments`。
     """
 
+    diarize: bool = False
+    """是否做**说话人分离**（区分角色）。
+
+    ⚠️ 需要两个模型（pyannote-segmentation-3-0 约 5.7MB + campplus-sv 约 27MB），
+    缺模型时自动跳过、不影响识别。
+
+    成本：整段音频要多跑一遍 diarization（实测 RTF ≈ 0.018，一小时约 65 秒），
+    并且**要把整段 PCM 留在内存里**（按 int16 存，一小时约 115MB）。
+
+    产出的是 `S0 / S1 / S2` 这样的**匿名编号**（聚类结果，同一文件内稳定，
+    跨文件不保证），不是角色名。细节见 :mod:`app.offline.diarize`。
+    """
+
 
 class Transcriber:
     """一个可复用的离线识别器（模型只加载一次，连续处理多个文件）。"""
@@ -174,8 +187,16 @@ class Transcriber:
         processed = 0.0
         block = max(160, int(SAMPLE_RATE * VAD_BLOCK_SECONDS))
 
+        # 做说话人分离时要把整段音频留住（diarization 是全局聚类的，不能流式）。
+        # 按 int16 存：一小时约 115MB，float32 要 230MB。
+        pcm_parts: list[np.ndarray] | None = [] if self.options.diarize else None
+
         for chunk in chunks:
             processed += chunk.size / SAMPLE_RATE
+            if pcm_parts is not None:
+                pcm_parts.append(
+                    (np.clip(chunk, -1.0, 1.0) * 32767.0).astype(np.int16)
+                )
             # ⚠️ 必须切小片：大块会让 silero 的断句直接失效（见 VAD_BLOCK_SECONDS 的实测表）
             for piece in _iter_slices(chunk, block):
                 self._vad.accept(piece)
@@ -193,8 +214,40 @@ class Transcriber:
             cues = merge_fragments(cues)
             if len(cues) < before:
                 self._log(f"碎片合并：{before} → {len(cues)} 条（尾巴被切走的已并回）")
+        if pcm_parts:
+            self._assign_speakers(cues, pcm_parts)
         self._log(f"识别完成：{len(cues)} 句 / 音频 {processed:.1f}s")
         return cues
+
+    # ------------------------------------------------------------------ #
+    def _assign_speakers(self, cues: list[Cue], pcm_parts: list[np.ndarray]) -> None:
+        """跑说话人分离并给每条字幕标角色。
+
+        **任何失败都只是"没有角色"**，绝不影响已经识别出来的文本。
+        """
+        from app.offline.diarize import SpeakerDiarizer, assign_speakers, find_models
+
+        if not cues:
+            return
+        if find_models(self.models_dir) is None:
+            self._log(
+                "说话人分离：模型缺失，已跳过"
+                "（需要 data/models/pyannote-segmentation-3-0 + campplus-sv）"
+            )
+            return
+        try:
+            audio = np.concatenate(pcm_parts).astype(np.float32) / 32767.0
+            diarizer = SpeakerDiarizer(
+                models_dir=self.models_dir,
+                num_threads=max(1, self.options.num_threads),
+            )
+            spans = diarizer.run(audio)
+            diarizer.close()
+            assign_speakers(cues, spans)
+            n = len({c.speaker for c in cues if c.speaker >= 0})
+            self._log(f"说话人分离：{len(spans)} 段 / 识别出 {n} 个角色")
+        except Exception as exc:  # noqa: BLE001 - 分离失败不能影响字幕
+            self._log(f"说话人分离失败（已跳过）：{type(exc).__name__}: {exc}")
 
     # ------------------------------------------------------------------ #
     def _take(

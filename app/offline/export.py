@@ -66,8 +66,23 @@ def _prepare(cues: list[Cue], mode: str) -> list[Cue]:
         if not cue.text_for(mode).strip():
             continue
         end = max(cue.end_s, cue.start_s + MIN_CUE_S)
-        cleaned.append(Cue(cue.start_s, end, cue.text, cue.translation))
+        cleaned.append(
+            Cue(cue.start_s, end, cue.text, cue.translation, speaker=cue.speaker)
+        )
     return cleaned
+
+
+def speaker_prefix(cue: Cue) -> str:
+    """说话人前缀：``[S1] ``。
+
+    编号从 **1** 起（``cue.speaker`` 内部是 0 起）——给人看的编号从 0 开始很别扭。
+    ``speaker < 0``（没做分离 / 没匹配上）时返回空串，输出与以前完全一致。
+    """
+    return f"[S{cue.speaker + 1}] " if cue.speaker >= 0 else ""
+
+
+def _text_with_speaker(cue: Cue, mode: str) -> str:
+    return speaker_prefix(cue) + cue.text_for(mode)
 
 
 # --------------------------------------------------------------------------- #
@@ -78,7 +93,7 @@ def to_srt(cues: list[Cue], mode: str = "source") -> str:
     for idx, cue in enumerate(_prepare(cues, mode), start=1):
         blocks.append(str(idx))
         blocks.append(f"{fmt_srt(cue.start_s)} --> {fmt_srt(cue.end_s)}")
-        blocks.append(cue.text_for(mode))
+        blocks.append(_text_with_speaker(cue, mode))
         blocks.append("")
     return "\n".join(blocks)
 
@@ -87,7 +102,7 @@ def to_vtt(cues: list[Cue], mode: str = "source") -> str:
     blocks: list[str] = ["WEBVTT", ""]
     for cue in _prepare(cues, mode):
         blocks.append(f"{fmt_vtt(cue.start_s)} --> {fmt_vtt(cue.end_s)}")
-        blocks.append(cue.text_for(mode))
+        blocks.append(_text_with_speaker(cue, mode))
         blocks.append("")
     return "\n".join(blocks)
 
@@ -97,11 +112,12 @@ def to_lrc(cues: list[Cue], mode: str = "source") -> str:
     lines: list[str] = []
     for cue in _prepare(cues, mode):
         stamp = fmt_lrc(cue.start_s)
+        prefix = speaker_prefix(cue)
         if mode == "bilingual" and cue.translation and cue.translation != cue.text:
-            lines.append(f"{stamp}{cue.text}")
-            lines.append(f"{stamp}{cue.translation}")
+            lines.append(f"{stamp}{prefix}{cue.text}")
+            lines.append(f"{stamp}{prefix}{cue.translation}")
         else:
-            lines.append(f"{stamp}{cue.text_for(mode)}")
+            lines.append(f"{stamp}{_text_with_speaker(cue, mode)}")
     return "\n".join(lines) + ("\n" if lines else "")
 
 

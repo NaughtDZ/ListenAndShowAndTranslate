@@ -50,6 +50,12 @@ class Cue:
     end_s: float
     text: str
     translation: str = ""
+    speaker: int = -1
+    """说话人编号（0 起）；``-1`` = 没做分离或没匹配上。
+
+    编号是**聚类出来的**，同一文件内稳定（S0 始终是同一个人），
+    但跨文件不保证（每集独立聚类）。
+    """
 
     @property
     def duration_s(self) -> float:
@@ -193,7 +199,7 @@ def split_cue(cue: Cue, max_width: float = DEFAULT_MAX_WIDTH) -> list[Cue]:
             end = cursor + span * (width / total)
         if end <= cursor:
             end = cursor + 0.01
-        out.append(Cue(cursor, end, chunk, translations[idx]))
+        out.append(Cue(cursor, end, chunk, translations[idx], speaker=cue.speaker))
         cursor = end
     return out
 
@@ -265,6 +271,7 @@ def merge_fragments(
                     end_s=max(prev.end_s, cue.end_s),
                     text=_join_text(prev.text, cue.text),
                     translation=prev.translation,
+                    speaker=prev.speaker,
                 )
                 continue
         out.append(cue)
