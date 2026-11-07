@@ -18,7 +18,7 @@ import sherpa_onnx
 from app.asr.postprocess import clean_text
 from app.asr.sherpa_offline import build_offline_recognizer
 from app.asr.vad import SAMPLE_RATE, VadSegmenter
-from app.offline.cue import Cue
+from app.offline.cue import Cue, merge_fragments
 from app.utils.log import get_logger
 
 log = get_logger(__name__)
@@ -74,13 +74,42 @@ class TranscribeOptions:
     language: str = "auto"
     vad_model: str = "silero-vad"
     hop_ms: int = 1000
-    min_silence_ms: int = 500
+
+    min_silence_ms: int = 800
+    """断句静音：静多久算一句话说完。
+
+    **离线默认 800ms，比实时的 350ms 大**——离线不用跟手，而"句子被切碎"
+    的代价比"字幕长一点"大得多（切碎会让翻译丢掉主语/谓语）。
+
+    实测 ``real_ja_2.wav``（连续朗读）：
+
+    =========  ======  ==================================================
+    500ms      3 段    「日本語をちゃんと聞き取れ」「ているかどうかを」被切开
+    800ms      3 段    靠碎片合并拼回来了
+    **1200ms**  2 段    「…聞き取れているかどうかを図ります。」完整一句
+    =========  ======  ==================================================
+
+    但调太大也有风险：两人快速对话（停顿 0.8~1.2s）会被并成一句。
+    建议 800 起步，分句还是碎就往上调，字幕长得离谱就往下调。
+    """
+
     min_speech_ms: int = 250
     max_segment_ms: int = 8000
     speech_pad_ms: int = 120
     num_threads: int = 2
     provider: str = "cpu"
     use_itn: bool = True
+
+    merge_fragments: bool = True
+    """是否把"被 VAD 切出去的尾巴几个字"并回前一句。
+
+    实测 ``real_ja_2.wav``：VAD 在「日本語をちゃんと聞き取れ」和「ているかどうか」
+    之间切了一刀，后一段只有 1.19 秒——用户看到的就是"一句话最后几个字被单独
+    打了个时间点"。合并后原文恢复完整，翻译也能拿到完整谓语。
+
+    规则是"短（≤1.2s）+ 紧邻（≤0.6s）"，纯声学事实，不依赖语言。
+    细节见 :func:`app.offline.cue.merge_fragments`。
+    """
 
 
 class Transcriber:
@@ -159,6 +188,11 @@ class Transcriber:
             cues.append(cue)
 
         cues.sort(key=lambda c: c.start_s)
+        if self.options.merge_fragments:
+            before = len(cues)
+            cues = merge_fragments(cues)
+            if len(cues) < before:
+                self._log(f"碎片合并：{before} → {len(cues)} 条（尾巴被切走的已并回）")
         self._log(f"识别完成：{len(cues)} 句 / 音频 {processed:.1f}s")
         return cues
 

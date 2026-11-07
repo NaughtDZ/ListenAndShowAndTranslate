@@ -22,6 +22,21 @@ SENTENCE_ENDS = "。！？!?…"
 SOFT_BREAKS = "，、,；;：:"
 CLOSERS = "」』）)】》〉"
 
+FRAGMENT_MAX_S = 1.2
+"""短于这个时长的段落，会被当成"上一句的尾巴"。
+
+实测（``real_ja_2.wav``，11.2s）：VAD 在「日本語をちゃんと聞き取れ」和
+「ているかどうかを」之间切了一刀，后一段只有 **1.19 秒**——而它其实是
+动词「聞き取れている」的延续部分。用户看到的就是"一句话最后几个字被
+单独打了个时间点"。
+"""
+
+FRAGMENT_GAP_S = 0.6
+"""碎片与前一句的间隔小于这个值才合并（间隔大说明真的是两个句子）。"""
+
+FRAGMENT_LIMIT_S = 8.0
+"""合并后总时长上限（和 VAD 的 max_segment_ms 对齐，别合出一个超长句）。"""
+
 # 一行最多多少"全角字宽"
 DEFAULT_MAX_WIDTH = 24.0
 MIN_WIDTH = 6.0
@@ -31,7 +46,6 @@ MIN_WIDTH = 6.0
 @dataclass
 class Cue:
     """一条字幕（一条 = 播放器里的一行/一块）。"""
-
     start_s: float
     end_s: float
     text: str
@@ -188,4 +202,70 @@ def split_all(cues: list[Cue], max_width: float = DEFAULT_MAX_WIDTH) -> list[Cue
     out: list[Cue] = []
     for cue in cues:
         out.extend(split_cue(cue, max_width))
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# 碎片合并：把"被切出去的尾巴几个字"并回前一句
+# --------------------------------------------------------------------------- #
+def _join_text(left: str, right: str) -> str:
+    """拼两段文本：中日文直接连（不加空格），英文之间补一个空格。"""
+    if not left:
+        return right
+    if not right:
+        return left
+    a, b = left[-1], right[0]
+    if a.isascii() and a.isalnum() and b.isascii() and b.isalnum():
+        return f"{left} {right}"
+    return left + right
+
+
+def merge_fragments(
+    cues: list[Cue],
+    max_duration_s: float = FRAGMENT_MAX_S,
+    max_gap_s: float = FRAGMENT_GAP_S,
+    limit_s: float = FRAGMENT_LIMIT_S,
+) -> list[Cue]:
+    """把"很短 + 紧挨着前一句"的段落并回前一句。
+
+    解决的是**VAD 在词中间切一刀**的问题：实测 ``real_ja_2.wav`` 里
+    「日本語をちゃんと聞き取れ」和「ているかどうかを」（只有 1.19s、间隔
+    0.41s）被拆成两条字幕——用户看到的就是"一句话最后几个字被单独打了个
+    时间点"。合并后原文变回完整一句，翻译也能拿到完整谓语。
+
+    为什么用"短 + 间隔小"而不是语法规则（比如"以て/た开头就并"）：
+
+    * 日语「て/で/た」开头的独立句并不少见（「で、どうする？」「ただ…」）；
+    * 反而"短 + 紧邻"是纯粹的声学事实，跨语言都成立，也不用维护词表。
+
+    纯文本拼接：两段是分别识别的，拼起来就是完整句子（不需要重跑识别）。
+
+    Args:
+        cues: 按时间排好序的字幕。
+        max_duration_s: 短于这个时长才算"碎片"。
+        max_gap_s: 与前一句的间隔小于这个值才合并。
+        limit_s: 合并后总时长上限，防止把一句话合到离谱长。
+
+    Returns:
+        新的列表（不修改入参）。
+    """
+    if not cues:
+        return []
+
+    out: list[Cue] = []
+    for cue in cues:
+        if out:
+            prev = out[-1]
+            is_fragment = cue.end_s - cue.start_s <= max_duration_s
+            is_close = cue.start_s - prev.end_s <= max_gap_s
+            fits = cue.end_s - prev.start_s <= limit_s
+            if is_fragment and is_close and fits:
+                out[-1] = Cue(
+                    start_s=prev.start_s,
+                    end_s=max(prev.end_s, cue.end_s),
+                    text=_join_text(prev.text, cue.text),
+                    translation=prev.translation,
+                )
+                continue
+        out.append(cue)
     return out

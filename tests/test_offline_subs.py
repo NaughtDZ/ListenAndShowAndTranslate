@@ -17,6 +17,7 @@ import pytest
 from app.offline.cue import (
     Cue,
     display_width,
+    merge_fragments,
     slice_by_weights,
     split_cue,
     split_text,
@@ -241,3 +242,77 @@ def test_decode_chunking():
     total = sum(c.size for c in chunks)
     assert total == pytest.approx(info.duration_s * 16000, rel=0.02)
     assert all(c.dtype.name == "float32" for c in chunks)
+
+
+# --------------------------------------------------------------------------- #
+# 碎片合并：尾巴几个字不许单独成段
+# --------------------------------------------------------------------------- #
+def test_merge_fragment_back_into_previous_sentence():
+    """实测 real_ja_2.wav 的精确复现：VAD 在动词中间切了一刀。
+
+    原音频里「日本語をちゃんと聞き取れ」和「ているかどうかを」被拆成两条，
+    后者只有 1.19 秒、间隔 0.41 秒——用户看到的就是"一句话最后几个字被
+    单独打了个时间点"。
+    """
+    cues = [
+        Cue(5.38, 7.28, "日本語をちゃんと聞き取れ。"),
+        Cue(7.69, 8.88, "ているかどうかを。"),
+    ]
+    merged = merge_fragments(cues)
+
+    assert len(merged) == 1
+    assert merged[0].text == "日本語をちゃんと聞き取れ。ているかどうかを。"
+    assert merged[0].start_s == pytest.approx(5.38)
+    assert merged[0].end_s == pytest.approx(8.88)
+
+
+def test_short_but_far_apart_is_not_merged():
+    """短段但间隔大 → 是真独立的短句（「はい。」这种），不能并。"""
+    cues = [Cue(0.0, 2.0, "前言"), Cue(3.5, 4.0, "はい。")]   # 间隔 1.5s
+    assert len(merge_fragments(cues)) == 2
+
+
+def test_long_segment_is_not_merged():
+    """段本身不短（2.5s）→ 不是"尾巴几个字"，不并。"""
+    cues = [Cue(0.0, 2.0, "第一句"), Cue(2.2, 4.7, "第二句很长很长")]
+    assert len(merge_fragments(cues)) == 2
+
+
+def test_merge_respects_total_limit():
+    """合并后超过上限就不合——否则会把两句话拼成一个超长句。"""
+    cues = [Cue(0.0, 7.6, "很长的第一句"), Cue(7.7, 8.4, "尾巴")]   # 合并后 8.4s > 8
+    assert len(merge_fragments(cues)) == 2
+
+
+def test_merge_adds_space_for_english_only():
+    """英文之间拼接要补空格；中日文直接连（加了空格反而错）。"""
+    en = merge_fragments([Cue(0.0, 2.0, "The quick"), Cue(2.1, 2.8, "brown fox")])
+    assert en[0].text == "The quick brown fox"
+
+    ja = merge_fragments([Cue(0.0, 2.0, "聞き取れ"), Cue(2.1, 2.8, "ている")])
+    assert ja[0].text == "聞き取れている"
+
+
+def test_merge_does_not_mutate_input():
+    cues = [Cue(0.0, 2.0, "甲"), Cue(2.1, 2.8, "乙")]
+    merge_fragments(cues)
+    assert [c.text for c in cues] == ["甲", "乙"], "入参不能被就地改掉"
+
+
+def test_merge_empty_and_single():
+    assert merge_fragments([]) == []
+    assert len(merge_fragments([Cue(0.0, 1.0, "单独一句")])) == 1
+
+
+def test_merge_keeps_translation_of_previous():
+    """合并时保留前一段的译文（后一段还没翻，译名为空不影响）。"""
+    cues = [Cue(0.0, 2.0, "甲", translation="甲译"), Cue(2.1, 2.8, "乙")]
+    merged = merge_fragments(cues)
+    assert merged[0].translation == "甲译"
+
+
+def test_transcribe_options_merge_on_by_default():
+    """默认开启：用户报的就是这个毛病，不该还要手动打开。"""
+    from app.offline.transcribe import TranscribeOptions
+
+    assert TranscribeOptions().merge_fragments is True
