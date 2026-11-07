@@ -75,8 +75,9 @@ def test_non_asr_models_are_never_offered():
 
 def test_models_for_language_contents():
     ja = {m.id for m in models_for_language("ja")}
-    assert ja == {"sensevoice-int8", "parakeet-ja-int8", "dolphin-base-ctc-int8",
-                  "omnilingual-300m-ctc-int8", "whisper-turbo-int8"}
+    assert ja == {"sensevoice-int8", "sensevoice-fp32", "parakeet-ja-int8",
+                  "dolphin-base-ctc-int8", "omnilingual-300m-ctc-int8",
+                  "whisper-turbo-int8"}
     zh = {m.id for m in models_for_language("zh")}
     assert {"zipformer-zh-int8", "zipformer-zh-en-int8", "fire-red-asr2-ctc-zh_en-int8",
             "dolphin-base-ctc-int8", "omnilingual-300m-ctc-int8",
@@ -216,8 +217,8 @@ def test_ui_only_offers_models_that_support_the_language(qapp, no_save, monkeypa
                 assert supports_language(model_id, lang), (lang, model_id)
         ja = [win.model_combos["ja"].itemData(i) for i in range(win.model_combos["ja"].count())]
         assert ja == [
-            "", "sensevoice-int8", "parakeet-ja-int8", "dolphin-base-ctc-int8",
-            "omnilingual-300m-ctc-int8", "whisper-turbo-int8",
+            "", "sensevoice-int8", "sensevoice-fp32", "parakeet-ja-int8",
+            "dolphin-base-ctc-int8", "omnilingual-300m-ctc-int8", "whisper-turbo-int8",
         ]
     finally:
         win.hide()

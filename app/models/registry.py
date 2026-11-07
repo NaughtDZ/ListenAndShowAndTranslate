@@ -173,6 +173,26 @@ MODELS: dict[str, ModelSpec] = {
             "（输出恒为粤语解码），详见 docs/P2-ASR实测.md"
         ),
     ),
+    "sensevoice-fp32": ModelSpec(
+        id="sensevoice-fp32",
+        display_name="SenseVoice Small（中英日韩粤，fp32 未量化）",
+        kind="asr_offline",
+        engine="sherpa_offline",
+        factory="sense_voice",
+        languages=("zh", "en", "ja", "ko", "yue"),
+        repo=_HF + "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17",
+        files=(
+            ModelFile("model.onnx", 937086361),
+            ModelFile("tokens.txt", 315894),
+        ),
+        note=(
+            "和 int8 版**同一个模型**，只是没量化。2026-11 实测（3 段日语素材）："
+            "平均 CER int8 9.3% / fp32 8.5%，**只差 0.8 个百分点**；"
+            "速度 int8 快 1.4~1.6 倍；体积 228MB → 894MB。"
+            "结论：**默认用 int8 就行**——量化不是「识别不出来」的原因。"
+            "只有在你已经排除 VAD 漏检、换过模型、仍然差那一点点时才值得换它。"
+        ),
+    ),
     "parakeet-ja-int8": ModelSpec(
         id="parakeet-ja-int8",
         display_name="NVIDIA Parakeet TDT-CTC 0.6B 日语（int8）",

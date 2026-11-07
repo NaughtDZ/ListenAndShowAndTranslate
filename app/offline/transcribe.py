@@ -216,7 +216,24 @@ class Transcriber:
                 self._log(f"碎片合并：{before} → {len(cues)} 条（尾巴被切走的已并回）")
         if pcm_parts:
             self._assign_speakers(cues, pcm_parts)
-        self._log(f"识别完成：{len(cues)} 句 / 音频 {processed:.1f}s")
+
+        # 诊断：检出的语音占总时长的比例。
+        # 轻声/耳语/ASMR 最常见的问题**不是识别错，而是压根没送进识别器**——
+        # 默认 silero VAD 按正常音量训练，低电平人声会被判成静音。
+        # 有个具体数字，用户就不用猜"是我耳朵灵还是模型瞎"。
+        speech_s = sum(c.end_s - c.start_s for c in cues)
+        ratio = (speech_s / processed) if processed > 0 else 0.0
+        self._log(
+            f"识别完成：{len(cues)} 句 / 音频 {processed:.1f}s"
+            f"（检出语音 {speech_s:.0f}s，占 {ratio:.0%}）"
+        )
+        if processed >= 60 and ratio < 0.15:
+            self._log(
+                "  ⚠️ 检出的语音占比很低。如果素材是轻声/耳语/ASMR，"
+                "请把「VAD 模型」换成 Whisper-VAD ASMR——"
+                "默认 Silero 按正常音量训练，会把低电平人声判成静音，"
+                "那些话根本没送进识别器（换 ASR 模型没用）。"
+            )
         return cues
 
     # ------------------------------------------------------------------ #
